@@ -22,14 +22,17 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 ## Example
 
 ```asm
+const stdout = 1
+
 .data
 msg: string "Hello from CommonASM\n"
+colors: bytes 255, 80, 40
 
 .text
 global _start
 
 _start:
-  syscall write, 1, msg, 21
+  syscall write, stdout, msg, msg_len
   syscall exit, 0
 ```
 
@@ -57,6 +60,12 @@ Sections:
 Data:
 
 - `name: string "text\n"`
+- `name: bytes 1, 2, 255`
+
+Constants:
+
+- `const stdout = 1`
+- String data automatically creates `name_len`.
 
 Text:
 
@@ -67,6 +76,9 @@ Text:
 - `load_addr r0, label`
 - `add r0, r1`
 - `sub r0, 1`
+- `cmp r0, 10`
+- `je label`
+- `jne label`
 - `jmp label`
 - `call label`
 - `ret`

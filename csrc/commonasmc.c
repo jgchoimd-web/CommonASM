@@ -13,6 +13,8 @@ typedef struct {
 
 static const char *x86_regs[] = {"rbx", "r12", "r13", "r14", "r15", "r8", "r9", "r10"};
 static const char *rv_regs[] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6", "s1"};
+static char known_constants[128][64];
+static int known_constant_count = 0;
 
 static void die(const char *message) {
     fprintf(stderr, "commonasmc: error: %s\n", message);
@@ -151,6 +153,23 @@ static bool is_int(const char *text) {
     return errno == 0 && end && *end == '\0' && end != text;
 }
 
+static void remember_constant(const char *name) {
+    if (known_constant_count >= 128) {
+        die("too many constants");
+    }
+    snprintf(known_constants[known_constant_count], sizeof(known_constants[known_constant_count]), "%s", name);
+    known_constant_count++;
+}
+
+static bool is_known_constant(const char *name) {
+    for (int i = 0; i < known_constant_count; i++) {
+        if (strcmp(known_constants[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int virtual_reg_index(const char *name) {
     if (name[0] == 'r' && name[1] >= '0' && name[1] <= '7' && name[2] == '\0') {
         return name[1] - '0';
@@ -201,7 +220,7 @@ static int split_args(char *arg_text, char **args, int max_args) {
     return count;
 }
 
-static void emit_data(Buffer *data, char *line, int line_no, const char *target) {
+static void emit_data(Buffer *data, Buffer *constants, char *line, int line_no, const char *target) {
     char *colon = strchr(line, ':');
     char *kind;
     char *quote;
@@ -213,6 +232,13 @@ static void emit_data(Buffer *data, char *line, int line_no, const char *target)
     *colon = '\0';
     name = trim(line);
     kind = trim(colon + 1);
+    if (strncmp(kind, "bytes", 5) == 0 && isspace((unsigned char)kind[5])) {
+        char *values = trim(kind + 5);
+        buf_appendf(data, "%s: %s ", name, strcmp(target, "x86_64-nasm") == 0 ? "db" : ".byte", NULL);
+        buf_append(data, values);
+        buf_append(data, "\n");
+        return;
+    }
     if (strncmp(kind, "string", 6) != 0 || !isspace((unsigned char)kind[6])) {
         fprintf(stderr, "commonasmc: error: line %d: expected string data\n", line_no);
         exit(1);
@@ -224,6 +250,7 @@ static void emit_data(Buffer *data, char *line, int line_no, const char *target)
     }
     buf_appendf(data, "%s: %s ", name, strcmp(target, "x86_64-nasm") == 0 ? "db" : ".byte", NULL);
     quote++;
+    int byte_count = 0;
     for (size_t i = 0; quote[i] && quote[i] != '"'; i++) {
         unsigned char ch = (unsigned char)quote[i];
         char num[32];
@@ -237,10 +264,21 @@ static void emit_data(Buffer *data, char *line, int line_no, const char *target)
                 ch = (unsigned char)quote[i];
             }
         }
-        snprintf(num, sizeof(num), "%s%u", i == 0 ? "" : ", ", ch);
+        snprintf(num, sizeof(num), "%s%u", byte_count == 0 ? "" : ", ", ch);
         buf_append(data, num);
+        byte_count++;
     }
     buf_append(data, "\n");
+    char len_value[32];
+    char len_name[128];
+    snprintf(len_value, sizeof(len_value), "%d", byte_count);
+    snprintf(len_name, sizeof(len_name), "%s_len", name);
+    remember_constant(len_name);
+    if (strcmp(target, "x86_64-nasm") == 0) {
+        buf_appendf(constants, "%s_len equ %s\n", name, len_value, NULL);
+    } else {
+        buf_appendf(constants, ".equ %s_len, %s\n", name, len_value, NULL);
+    }
 }
 
 static void emit_x86_syscall(Buffer *text, char **args, int argc, int line_no) {
@@ -286,7 +324,7 @@ static void emit_rv_syscall(Buffer *text, char **args, int argc, int line_no) {
         int reg = virtual_reg_index(args[i]);
         if (reg >= 0) {
             buf_appendf(text, "  mv %s, %s\n", arg_regs[i - 1], rv_regs[reg], NULL);
-        } else if (is_int(args[i])) {
+        } else if (is_int(args[i]) || is_known_constant(args[i])) {
             buf_appendf(text, "  li %s, %s\n", arg_regs[i - 1], args[i], NULL);
         } else {
             buf_appendf(text, "  la %s, %s\n", arg_regs[i - 1], args[i], NULL);
@@ -331,6 +369,12 @@ static void emit_text(Buffer *text, char *line, int line_no, const char *target)
             buf_appendf(text, "  %s %s, ", op, x86_reg(args[0], line_no), NULL);
             buf_append(text, x86_operand(args[1]));
             buf_append(text, "\n");
+        } else if (strcmp(op, "cmp") == 0 && argc == 2) {
+            buf_appendf(text, "  cmp %s, ", x86_reg(args[0], line_no), NULL, NULL);
+            buf_append(text, x86_operand(args[1]));
+            buf_append(text, "\n");
+        } else if ((strcmp(op, "je") == 0 || strcmp(op, "jne") == 0) && argc == 1) {
+            buf_appendf(text, "  %s %s\n", op, args[0], NULL);
         } else if (strcmp(op, "jmp") == 0 && argc == 1) {
             buf_appendf(text, "  jmp %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "call") == 0 && argc == 1) {
@@ -368,6 +412,21 @@ static void emit_text(Buffer *text, char *line, int line_no, const char *target)
                 buf_append(text, args[1]);
                 buf_append(text, "\n");
             }
+        } else if (strcmp(op, "cmp") == 0 && argc == 2) {
+            int src = virtual_reg_index(args[1]);
+            if (src >= 0) {
+                buf_appendf(text, "  sub t6, %s, ", rv_reg(args[0], line_no), NULL, NULL);
+                buf_append(text, rv_regs[src]);
+                buf_append(text, "\n");
+            } else {
+                buf_appendf(text, "  addi t6, %s, -", rv_reg(args[0], line_no), NULL, NULL);
+                buf_append(text, args[1]);
+                buf_append(text, "\n");
+            }
+        } else if (strcmp(op, "je") == 0 && argc == 1) {
+            buf_appendf(text, "  beqz t6, %s\n", args[0], NULL, NULL);
+        } else if (strcmp(op, "jne") == 0 && argc == 1) {
+            buf_appendf(text, "  bnez t6, %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "jmp") == 0 && argc == 1) {
             buf_appendf(text, "  j %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "call") == 0 && argc == 1) {
@@ -384,12 +443,14 @@ static void emit_text(Buffer *text, char *line, int line_no, const char *target)
 }
 
 static Buffer compile_source(char *source, const char *target) {
+    Buffer constants;
     Buffer data;
     Buffer text;
     Buffer out;
     char *cursor = source;
     char *section = NULL;
     int line_no = 0;
+    buf_init(&constants);
     buf_init(&data);
     buf_init(&text);
     while (*cursor) {
@@ -411,12 +472,30 @@ static Buffer compile_source(char *source, const char *target) {
             section = line + 1;
             continue;
         }
+        if (strncmp(line, "const ", 6) == 0) {
+            char *name = trim(line + 6);
+            char *eq = strchr(name, '=');
+            if (!eq) {
+                fprintf(stderr, "commonasmc: error: line %d: expected const NAME = VALUE\n", line_no);
+                exit(1);
+            }
+            *eq = '\0';
+            name = trim(name);
+            char *value = trim(eq + 1);
+            remember_constant(name);
+            if (strcmp(target, "x86_64-nasm") == 0) {
+                buf_appendf(&constants, "%s equ %s\n", name, value, NULL);
+            } else {
+                buf_appendf(&constants, ".equ %s, %s\n", name, value, NULL);
+            }
+            continue;
+        }
         if (!section) {
             fprintf(stderr, "commonasmc: error: line %d: expected .data or .text\n", line_no);
             exit(1);
         }
         if (strcmp(section, "data") == 0) {
-            emit_data(&data, line, line_no, target);
+            emit_data(&data, &constants, line, line_no, target);
         } else {
             emit_text(&text, line, line_no, target);
         }
@@ -424,12 +503,14 @@ static Buffer compile_source(char *source, const char *target) {
     buf_init(&out);
     if (strcmp(target, "x86_64-nasm") == 0) {
         buf_append(&out, "default rel\n");
+        buf_append(&out, constants.data);
         if (data.len) {
             buf_append(&out, "\nsection .data\n");
             buf_append(&out, data.data);
         }
         buf_append(&out, "\nsection .text\n");
     } else if (strcmp(target, "riscv64-gnu") == 0) {
+        buf_append(&out, constants.data);
         if (data.len) {
             buf_append(&out, ".section .data\n");
             buf_append(&out, data.data);

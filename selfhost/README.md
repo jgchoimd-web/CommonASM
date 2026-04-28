@@ -11,6 +11,5 @@ Bootstrapping stages:
 5. Self-host: the generated compiler compiles future versions of itself.
 
 Current status: `compiler.cal` is a concrete source sketch for the self-hosted compiler.
-The language is intentionally small at first: functions, variables, strings, arrays, `if`,
-`while`, and calls into a tiny runtime.
-
+The CommonASM language now has constants, byte arrays, automatic string length symbols,
+and simple compare/branch operations.

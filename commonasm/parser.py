@@ -1,10 +1,12 @@
 import ast
 import re
 
-from .ir import DataString, Global, Instruction, Label, Program
+from .ir import Constant, DataBytes, DataString, Global, Instruction, Label, Program
 
 
+_CONST_RE = re.compile(r"^const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?(?:0x[0-9A-Fa-f]+|\d+))$")
 _DATA_STRING_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*):\s*string\s+(".*")$')
+_DATA_BYTES_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*bytes\s+(.+)$")
 _LABEL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):$")
 
 
@@ -23,6 +25,11 @@ def parse(source: str) -> Program:
 
         if line in {".data", ".text"}:
             section = line[1:]
+            continue
+
+        constant = _parse_const(line)
+        if constant:
+            program.constants.append(constant)
             continue
 
         if section is None:
@@ -55,18 +62,48 @@ def _strip_comment(line: str) -> str:
     return line
 
 
-def _parse_data(line: str, line_no: int) -> DataString:
-    match = _DATA_STRING_RE.match(line)
+def _parse_const(line: str) -> Constant | None:
+    match = _CONST_RE.match(line)
     if not match:
-        raise ParseError(f"line {line_no}: expected data like: name: string \"text\"")
+        return None
     name, raw_value = match.groups()
+    return Constant(name=name, value=int(raw_value, 0))
+
+
+def _parse_data(line: str, line_no: int) -> DataString | DataBytes:
+    string_match = _DATA_STRING_RE.match(line)
+    if string_match:
+        name, raw_value = string_match.groups()
+        return DataString(name=name, value=_parse_string(raw_value, line_no))
+
+    bytes_match = _DATA_BYTES_RE.match(line)
+    if bytes_match:
+        name, raw_values = bytes_match.groups()
+        values: list[int] = []
+        for raw_value in raw_values.split(","):
+            raw_value = raw_value.strip()
+            try:
+                value = int(raw_value, 0)
+            except ValueError as exc:
+                raise ParseError(f"line {line_no}: invalid byte value: {raw_value}") from exc
+            if not 0 <= value <= 255:
+                raise ParseError(f"line {line_no}: byte value must be 0-255: {raw_value}")
+            values.append(value)
+        if not values:
+            raise ParseError(f"line {line_no}: bytes data needs at least one value")
+        return DataBytes(name=name, values=values)
+
+    raise ParseError(f"line {line_no}: expected data like: name: string \"text\" or name: bytes 1, 2")
+
+
+def _parse_string(raw_value: str, line_no: int) -> str:
     try:
         value = ast.literal_eval(raw_value)
     except (SyntaxError, ValueError) as exc:
         raise ParseError(f"line {line_no}: invalid string literal") from exc
     if not isinstance(value, str):
         raise ParseError(f"line {line_no}: string data must be a string literal")
-    return DataString(name=name, value=value)
+    return value
 
 
 def _parse_text(line: str, line_no: int) -> Label | Global | Instruction:
@@ -86,4 +123,3 @@ def _parse_text(line: str, line_no: int) -> Label | Global | Instruction:
     else:
         op, args = line, []
     return Instruction(op=op, args=args, line=line_no)
-

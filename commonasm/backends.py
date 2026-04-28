@@ -1,4 +1,4 @@
-from .ir import DataString, Global, Instruction, Label, Program, TextItem
+from .ir import Constant, DataBytes, DataItem, DataString, Global, Instruction, Label, Program, TextItem
 
 
 class CompileError(Exception):
@@ -43,7 +43,10 @@ def compile_program(program: Program, target: str) -> str:
 
 class X86Backend:
     def compile(self, program: Program) -> str:
+        self.constants = {item.name for item in program.constants}
         lines = ["default rel"]
+        lines.extend(self.emit_constant(item) for item in program.constants)
+        lines.extend(self.emit_auto_lengths(item, "equ") for item in program.data if isinstance(item, DataString))
         if program.data:
             lines.extend(["", "section .data"])
             lines.extend(self.emit_data(item) for item in program.data)
@@ -52,8 +55,15 @@ class X86Backend:
             lines.extend(self.emit_text(item))
         return "\n".join(lines) + "\n"
 
-    def emit_data(self, item: DataString) -> str:
-        bytes_list = ", ".join(str(byte) for byte in item.value.encode("utf-8"))
+    def emit_constant(self, item: Constant) -> str:
+        return f"{item.name} equ {item.value}"
+
+    def emit_auto_lengths(self, item: DataString, directive: str) -> str:
+        return f"{item.name}_len {directive} {len(item.value.encode('utf-8'))}"
+
+    def emit_data(self, item: DataItem) -> str:
+        values = item.value.encode("utf-8") if isinstance(item, DataString) else item.values
+        bytes_list = ", ".join(str(byte) for byte in values)
         if bytes_list:
             return f"{item.name}: db {bytes_list}"
         return f"{item.name}: db 0"
@@ -73,6 +83,10 @@ class X86Backend:
             return [f"lea {self.reg(args[0], ins)}, [rel {args[1]}]"]
         if op in {"add", "sub"} and len(args) == 2:
             return [f"{op} {self.reg(args[0], ins)}, {self.operand(args[1], ins)}"]
+        if op == "cmp" and len(args) == 2:
+            return [f"cmp {self.reg(args[0], ins)}, {self.operand(args[1], ins)}"]
+        if op in {"je", "jne"} and len(args) == 1:
+            return [f"{op} {args[0]}"]
         if op == "jmp" and len(args) == 1:
             return [f"jmp {args[0]}"]
         if op == "call" and len(args) == 1:
@@ -113,7 +127,11 @@ class X86Backend:
 
 class RISCVBackend:
     def compile(self, program: Program) -> str:
+        self.constants = {item.name for item in program.constants}
+        self.constants.update(f"{item.name}_len" for item in program.data if isinstance(item, DataString))
         lines = []
+        lines.extend(self.emit_constant(item) for item in program.constants)
+        lines.extend(self.emit_auto_lengths(item, ".equ") for item in program.data if isinstance(item, DataString))
         if program.data:
             lines.append(".section .data")
             lines.extend(self.emit_data(item) for item in program.data)
@@ -123,8 +141,15 @@ class RISCVBackend:
             lines.extend(self.emit_text(item))
         return "\n".join(lines) + "\n"
 
-    def emit_data(self, item: DataString) -> str:
-        bytes_list = ", ".join(str(byte) for byte in item.value.encode("utf-8"))
+    def emit_constant(self, item: Constant) -> str:
+        return f".equ {item.name}, {item.value}"
+
+    def emit_auto_lengths(self, item: DataString, directive: str) -> str:
+        return f"{directive} {item.name}_len, {len(item.value.encode('utf-8'))}"
+
+    def emit_data(self, item: DataItem) -> str:
+        values = item.value.encode("utf-8") if isinstance(item, DataString) else item.values
+        bytes_list = ", ".join(str(byte) for byte in values)
         if bytes_list:
             return f"{item.name}: .byte {bytes_list}"
         return f"{item.name}: .byte 0"
@@ -155,6 +180,15 @@ class RISCVBackend:
             if op == "sub":
                 immediate = f"-{immediate}" if not immediate.startswith("-") else immediate[1:]
             return [f"{native_op} {dst}, {dst}, {immediate}"]
+        if op == "cmp" and len(args) == 2:
+            dst = self.reg(args[0], ins)
+            if args[1] in RISCV_REGS:
+                return [f"sub t6, {dst}, {RISCV_REGS[args[1]]}"]
+            return [f"addi t6, {dst}, -{self.operand(args[1], ins)}"]
+        if op == "je" and len(args) == 1:
+            return [f"beqz t6, {args[0]}"]
+        if op == "jne" and len(args) == 1:
+            return [f"bnez t6, {args[0]}"]
         if op == "jmp" and len(args) == 1:
             return [f"j {args[0]}"]
         if op == "call" and len(args) == 1:
@@ -177,7 +211,7 @@ class RISCVBackend:
         for reg, value in zip(arg_regs, args[1:]):
             if value in RISCV_REGS:
                 lines.append(f"mv {reg}, {RISCV_REGS[value]}")
-            elif _is_int(value):
+            elif _is_int(value) or value in self.constants:
                 lines.append(f"li {reg}, {value}")
             else:
                 lines.append(f"la {reg}, {value}")
@@ -187,6 +221,8 @@ class RISCVBackend:
 
     def operand(self, value: str, ins: Instruction) -> str:
         if _is_int(value):
+            return value
+        if value in self.constants:
             return value
         raise CompileError(f"line {ins.line}: RISC-V immediate expected, got {value}")
 

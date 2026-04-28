@@ -5,6 +5,5 @@ msg: string "Hello from CommonASM\n"
 global _start
 
 _start:
-  syscall write, 1, msg, 21
+  syscall write, 1, msg, msg_len
   syscall exit, 0
-

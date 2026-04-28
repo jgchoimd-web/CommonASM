@@ -19,8 +19,13 @@ type TextItem =
   Inst(value: Instruction)
 
 type Program =
+  constants: array<Constant>
   data: array<DataString>
   text: array<TextItem>
+
+type Constant =
+  name: string
+  value: int
 
 fn main(args: array<string>) -> int {
   let input = arg_value(args, 0)
@@ -57,7 +62,7 @@ fn parse_target(name: string) -> Target {
 }
 
 fn parse_program(source: string) -> Program {
-  let program = Program(data: [], text: [])
+  let program = Program(constants: [], data: [], text: [])
   let section = ""
   let lines = split_lines(source)
   let line_no = 0
@@ -78,6 +83,10 @@ fn parse_program(source: string) -> Program {
       section = "text"
       continue
     }
+    if starts_with(line, "const ") {
+      push(program.constants, parse_constant(line, line_no))
+      continue
+    }
     if section == "data" {
       push(program.data, parse_data_string(line, line_no))
       continue
@@ -91,6 +100,17 @@ fn parse_program(source: string) -> Program {
   }
 
   return program
+}
+
+fn parse_constant(line: string, line_no: int) -> Constant {
+  let eq = index_of(line, "=")
+  if eq < 0 {
+    fail_at(line_no, "expected const NAME = VALUE")
+  }
+
+  let name = trim(slice(line, 6, eq))
+  let value = parse_int(trim(slice(line, eq + 1, len(line))))
+  return Constant(name: name, value: value)
 }
 
 fn parse_data_string(line: string, line_no: int) -> DataString {
@@ -131,12 +151,14 @@ fn emit_program(program: Program, target: Target) -> string {
 
   if target == X86_64Nasm {
     out = out + "default rel\n"
+    out = out + emit_constants(program.constants, "equ", target)
     if len(program.data) > 0 {
       out = out + "\nsection .data\n"
       out = out + emit_data(program.data, "db")
     }
     out = out + "\nsection .text\n"
   } else {
+    out = out + emit_constants(program.constants, ".equ", target)
     if len(program.data) > 0 {
       out = out + ".section .data\n"
       out = out + emit_data(program.data, ".byte")
@@ -150,6 +172,20 @@ fn emit_program(program: Program, target: Target) -> string {
     i = i + 1
   }
 
+  return out
+}
+
+fn emit_constants(items: array<Constant>, directive: string, target: Target) -> string {
+  let out = ""
+  let i = 0
+  while i < len(items) {
+    if target == X86_64Nasm {
+      out = out + items[i].name + " " + directive + " " + int_to_string(items[i].value) + "\n"
+    } else {
+      out = out + directive + " " + items[i].name + ", " + int_to_string(items[i].value) + "\n"
+    }
+    i = i + 1
+  }
   return out
 }
 
@@ -202,6 +238,12 @@ fn emit_x86_instruction(ins: Instruction) -> string {
   if ins.op == "add" or ins.op == "sub" {
     return "  " + ins.op + " " + x86_reg(ins.args[0]) + ", " + x86_operand(ins.args[1]) + "\n"
   }
+  if ins.op == "cmp" {
+    return "  cmp " + x86_reg(ins.args[0]) + ", " + x86_operand(ins.args[1]) + "\n"
+  }
+  if ins.op == "je" or ins.op == "jne" {
+    return "  " + ins.op + " " + ins.args[0] + "\n"
+  }
   if ins.op == "jmp" or ins.op == "call" {
     return "  " + ins.op + " " + ins.args[0] + "\n"
   }
@@ -252,4 +294,3 @@ fn emit_syscall(ins: Instruction, target: Target) -> string {
   }
   fail_at(ins.line, "unknown syscall")
 }
-
