@@ -14,3 +14,5 @@ The CommonASM language now has constants, byte arrays, automatic string length s
 arithmetic, stack operations, memory load/store, and compare/branch operations.
 It also sketches portable data sizes, `.rodata`/`.bss`, functions, bit operations,
 and Linux syscall names shared by the C compiler.
+Experimental minority targets include MMIXAL, DCPU-16, FRACTRAN source encoding,
+and Cellular Automaton Rule 110 seed output.

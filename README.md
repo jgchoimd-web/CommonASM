@@ -12,6 +12,16 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 
 - `x86_64-nasm`: Linux x86-64, NASM syntax
 - `riscv64-gnu`: Linux RISC-V 64, GNU assembler syntax
+- `mmixal`: experimental MMIXAL-style output
+- `dcpu16`: experimental DCPU-16-style output
+- `fractran`: experimental FRACTRAN source-encoding output
+- `cellular-automaton`: experimental Rule 110 seed output
+
+MMIX and DCPU-16 are real assembly backends for the portable subset. FRACTRAN and
+Cellular Automaton targets encode the CommonASM source as esolang artifacts rather
+than modeling Linux syscalls or random-access machine memory directly.
+DCPU-16 directly maps `r0` through `r7`; wider virtual registers are kept for the
+other targets.
 
 ## Compiler implementations
 
@@ -41,6 +51,10 @@ Compile it:
 gcc csrc/commonasmc.c -o build/commonasmc.exe
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
 build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
+build/commonasmc.exe examples/hello.cas --target mmixal -o build/hello_mmix.mms
+build/commonasmc.exe examples/hello.cas --target dcpu16 -o build/hello_dcpu.dasm
+build/commonasmc.exe examples/hello.cas --target fractran -o build/hello.fractran
+build/commonasmc.exe examples/hello.cas --target cellular-automaton -o build/hello.ca
 ```
 
 ## Language sketch

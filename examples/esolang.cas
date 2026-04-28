@@ -1,0 +1,11 @@
+const stdout = 1
+
+.rodata
+msg: string "encoded for esolang targets\n"
+
+.text
+global _start
+
+_start:
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0

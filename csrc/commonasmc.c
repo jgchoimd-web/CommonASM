@@ -39,6 +39,14 @@ static const char *rv_regs[] = {
     "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s1",
     "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"
 };
+static const char *mmix_regs[] = {
+    "$32", "$33", "$34", "$35", "$36", "$37", "$38", "$39",
+    "$40", "$41", "$42", "$43", "$44", "$45", "$46", "$47"
+};
+static const char *dcpu_regs[] = {
+    "A", "B", "C", "X", "Y", "Z", "I", "J",
+    "A", "B", "C", "X", "Y", "Z", "I", "J"
+};
 static char known_constants[256][64];
 static int known_constant_count = 0;
 
@@ -272,6 +280,25 @@ static const char *rv_reg(const char *value, int line_no, const char *op) {
     return rv_regs[reg];
 }
 
+static const char *mmix_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error(line_no, op, "expected virtual register r0-r15");
+    }
+    return mmix_regs[reg];
+}
+
+static const char *dcpu_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error(line_no, op, "expected virtual register r0-r15");
+    }
+    if (reg >= 8) {
+        line_error(line_no, op, "DCPU-16 maps only r0-r7 directly");
+    }
+    return dcpu_regs[reg];
+}
+
 static const char *size_suffix_or_default(const char *op, char *base_op, size_t base_size) {
     const char *dot = strchr(op, '.');
     if (!dot) {
@@ -438,9 +465,15 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     char *name;
     char *kind;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
+    const bool rv = strcmp(target, "riscv64-gnu") == 0;
+    const bool mmix = strcmp(target, "mmixal") == 0;
+    const bool dcpu = strcmp(target, "dcpu16") == 0;
     if (strncmp(line, "align ", 6) == 0) {
         const char *value = trim(line + 6);
-        buf_appendf(out, x86 ? "align %s\n" : ".balign %s\n", value, NULL, NULL);
+        if (x86) buf_appendf(out, "align %s\n", value, NULL, NULL);
+        else if (rv) buf_appendf(out, ".balign %s\n", value, NULL, NULL);
+        else if (mmix) buf_appendf(out, "        %% align %s\n", value, NULL, NULL);
+        else if (dcpu) buf_appendf(out, "        ; align %s\n", value, NULL, NULL);
         return;
     }
     if (!colon) {
@@ -455,7 +488,8 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         if (*quote != '"') {
             line_error(line_no, "string", "expected string literal");
         }
-        buf_appendf(out, "%s: %s ", name, x86 ? "db" : ".byte", NULL);
+        if (dcpu) buf_appendf(out, ":%s DAT ", name, NULL, NULL);
+        else buf_appendf(out, "%s: %s ", name, x86 ? "db" : (mmix ? "BYTE" : ".byte"), NULL);
         quote++;
         for (size_t i = 0; quote[i] && quote[i] != '"'; i++) {
             unsigned char ch = (unsigned char)quote[i];
@@ -477,12 +511,21 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         snprintf(len_value, sizeof(len_value), "%d", byte_count);
         snprintf(len_name, sizeof(len_name), "%s_len", name);
         remember_constant(len_name);
-        buf_appendf(constants, x86 ? "%s_len equ %s\n" : ".equ %s_len, %s\n", name, len_value, NULL);
+        if (x86) buf_appendf(constants, "%s_len equ %s\n", name, len_value, NULL);
+        else if (rv) buf_appendf(constants, ".equ %s_len, %s\n", name, len_value, NULL);
+        else if (mmix) buf_appendf(constants, "%s_len IS %s\n", name, len_value, NULL);
+        else if (dcpu) buf_appendf(constants, "%s_len EQU %s\n", name, len_value, NULL);
         return;
     }
     if (strncmp(kind, "zero", 4) == 0 && isspace((unsigned char)kind[4])) {
         const char *value = trim(kind + 4);
-        if (x86 && strcmp(section, "bss") == 0) {
+        if (dcpu) {
+            buf_appendf(out, ":%s DAT ", name, NULL, NULL);
+            buf_append(out, value);
+            buf_append(out, " DUP(0)\n");
+        } else if (mmix) {
+            buf_appendf(out, "%s LOC @+%s\n", name, value, NULL);
+        } else if (x86 && strcmp(section, "bss") == 0) {
             buf_appendf(out, "%s: resb %s\n", name, value, NULL);
         } else if (x86) {
             buf_appendf(out, "%s: times %s db 0\n", name, value, NULL);
@@ -508,7 +551,14 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     if (!cas_dir) {
         line_error(line_no, "data", "expected string, bytes, byte, word, dword, qword, zero, or align");
     }
-    buf_appendf(out, "%s: %s ", name, x86 ? x86_dir : rv_dir, NULL);
+    if (dcpu) {
+        buf_appendf(out, ":%s DAT ", name, NULL, NULL);
+    } else if (mmix) {
+        const char *mmix_dir = strcmp(cas_dir, "word") == 0 ? "WYDE" : (strcmp(cas_dir, "dword") == 0 ? "TETRA" : (strcmp(cas_dir, "qword") == 0 ? "OCTA" : "BYTE"));
+        buf_appendf(out, "%s: %s ", name, mmix_dir, NULL);
+    } else {
+        buf_appendf(out, "%s: %s ", name, x86 ? x86_dir : rv_dir, NULL);
+    }
     buf_append(out, kind);
     buf_append(out, "\n");
 }
@@ -552,6 +602,143 @@ static void emit_rv_syscall(Buffer *text, char **args, int argc, int line_no) {
     snprintf(num, sizeof(num), "%d", number);
     buf_appendf(text, "  li a7, %s\n", num, NULL, NULL);
     buf_append(text, "  ecall\n");
+}
+
+static const char *mmix_operand(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return mmix_regs[reg];
+    if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
+    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    return value;
+}
+
+static const char *dcpu_operand(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return dcpu_reg(value, line_no, op);
+    if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
+    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    return value;
+}
+
+static void mmix_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(text, &addr)) line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+    if (addr.has_base) snprintf(out, out_size, "%ld,%s", addr.offset, mmix_reg(addr.base, line_no, op));
+    else snprintf(out, out_size, "%s%+ld", addr.symbol, addr.offset);
+}
+
+static void dcpu_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(text, &addr)) line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+    if (addr.has_base) {
+        if (addr.offset == 0) snprintf(out, out_size, "[%s]", dcpu_reg(addr.base, line_no, op));
+        else snprintf(out, out_size, "[%s%+ld]", dcpu_reg(addr.base, line_no, op), addr.offset);
+    } else {
+        if (addr.offset == 0) snprintf(out, out_size, "[%s]", addr.symbol);
+        else snprintf(out, out_size, "[%s%+ld]", addr.symbol, addr.offset);
+    }
+}
+
+static void emit_mmix_syscall(Buffer *text, char **args, int argc, int line_no) {
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    buf_appendf(text, "        %% syscall %s lowered as MMIX TRAP placeholder\n", args[0], NULL, NULL);
+    if (strcmp(args[0], "exit") == 0) buf_append(text, "        TRAP 0,Halt,0\n");
+    else buf_append(text, "        TRAP 0,Fputs,StdOut\n");
+}
+
+static void emit_dcpu_syscall(Buffer *text, char **args, int argc, int line_no) {
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    buf_appendf(text, "        ; syscall %s lowered as DCPU software interrupt placeholder\n", args[0], NULL, NULL);
+    buf_append(text, "        INT 0\n");
+}
+
+static void emit_mmix_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+    (void)size;
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "        SUBU $254,$254,%s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "leave") == 0 && argc == 0) return;
+    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "        SET %s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op), NULL); return; }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "        LDA %s,%s\n", mmix_reg(args[0], line_no, op), args[1], NULL); return; }
+    if (strcmp(op, "load") == 0 && argc == 2) {
+        char addr[256]; mmix_format_address(args[1], addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "        LDO %s,%s\n", mmix_reg(args[0], line_no, op), addr, NULL); return;
+    }
+    if (strcmp(op, "store") == 0 && argc == 2) {
+        char addr[256]; mmix_format_address(args[0], addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "        STO %s,%s\n", mmix_operand(args[1], line_no, op), addr, NULL); return;
+    }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
+         strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) && argc == 2) {
+        const char *native = strcmp(op, "add") == 0 ? "ADD" : strcmp(op, "sub") == 0 ? "SUB" : strcmp(op, "mul") == 0 ? "MUL" : strcmp(op, "div") == 0 ? "DIV" : strcmp(op, "and") == 0 ? "AND" : strcmp(op, "or") == 0 ? "OR" : "XOR";
+        buf_appendf(text, "        %s %s,%s,", native, mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+        buf_append(text, mmix_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
+    }
+    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        const char *native = strcmp(op, "shl") == 0 ? "SL" : "SR";
+        buf_appendf(text, "        %s %s,%s,", native, mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+        buf_append(text, mmix_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+        if (strcmp(op, "neg") == 0) buf_appendf(text, "        NEG %s,0,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op), NULL);
+        else if (strcmp(op, "not") == 0) buf_appendf(text, "        NOR %s,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+        else buf_appendf(text, strcmp(op, "inc") == 0 ? "        ADD %s,%s,1\n" : "        SUB %s,%s,1\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op), NULL);
+        return;
+    }
+    if (strcmp(op, "mod") == 0 && argc == 2) { buf_append(text, "        % mod is target-runtime dependent on MMIX; quotient/remainder omitted\n"); return; }
+    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "        CMP $48,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op), NULL); return; }
+    if (strcmp(op, "je") == 0 && argc == 1) { buf_appendf(text, "        BZ $48,%s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "jne") == 0 && argc == 1) { buf_appendf(text, "        BNZ $48,%s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jg") == 0 || strcmp(op, "ja") == 0) && argc == 1) { buf_appendf(text, "        BP $48,%s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jl") == 0 || strcmp(op, "jb") == 0) && argc == 1) { buf_appendf(text, "        BN $48,%s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jge") == 0 || strcmp(op, "jae") == 0) && argc == 1) { buf_appendf(text, "        BNN $48,%s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jle") == 0 || strcmp(op, "jbe") == 0) && argc == 1) { buf_appendf(text, "        BNP $48,%s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "        STO %s,0,$254\n        SUBU $254,$254,8\n", mmix_operand(args[0], line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "        ADDU $254,$254,8\n        LDO %s,0,$254\n", mmix_reg(args[0], line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "        JMP %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "        PUSHJ $15,%s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "        POP 0,0\n"); return; }
+    if (strcmp(op, "syscall") == 0) { emit_mmix_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for MMIX");
+}
+
+static void emit_dcpu_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+    (void)size;
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, ":%s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "        SUB SP, %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "leave") == 0 && argc == 0) return;
+    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op), NULL); return; }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), args[1], NULL); return; }
+    if (strcmp(op, "load") == 0 && argc == 2) { char addr[256]; dcpu_format_address(args[1], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), addr, NULL); return; }
+    if (strcmp(op, "store") == 0 && argc == 2) { char addr[256]; dcpu_format_address(args[0], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", addr, dcpu_operand(args[1], line_no, op), NULL); return; }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
+         strcmp(op, "mod") == 0 || strcmp(op, "and") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0) && argc == 2) {
+        const char *native = strcmp(op, "or") == 0 ? "BOR" : strcmp(op, "shl") == 0 ? "SHL" : strcmp(op, "shr") == 0 ? "SHR" : strcmp(op, "and") == 0 ? "AND" : strcmp(op, "xor") == 0 ? "XOR" : strcmp(op, "mod") == 0 ? "MOD" : strcmp(op, "mul") == 0 ? "MUL" : strcmp(op, "div") == 0 ? "DIV" : strcmp(op, "sub") == 0 ? "SUB" : "ADD";
+        buf_appendf(text, "        %s %s, %s\n", native, dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return;
+    }
+    if (strcmp(op, "or") == 0 && argc == 2) { buf_appendf(text, "        BOR %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op), NULL); return; }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 || strcmp(op, "sar") == 0) && argc >= 1) {
+        if (strcmp(op, "neg") == 0) { buf_appendf(text, "        XOR %s, 0xffff\n        ADD %s, 1\n", dcpu_reg(args[0], line_no, op), dcpu_reg(args[0], line_no, op), NULL); return; }
+        if (strcmp(op, "not") == 0) { buf_appendf(text, "        XOR %s, 0xffff\n", dcpu_reg(args[0], line_no, op), NULL, NULL); return; }
+        if (strcmp(op, "inc") == 0) { buf_appendf(text, "        ADD %s, 1\n", dcpu_reg(args[0], line_no, op), NULL, NULL); return; }
+        if (strcmp(op, "dec") == 0) { buf_appendf(text, "        SUB %s, 1\n", dcpu_reg(args[0], line_no, op), NULL, NULL); return; }
+        line_error(line_no, op, "DCPU-16 has no portable arithmetic right shift");
+    }
+    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "        SET EX, %s\n        SUB EX, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op), NULL); return; }
+    if (strcmp(op, "je") == 0 && argc == 1) { buf_appendf(text, "        IFE EX, 0\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "jne") == 0 && argc == 1) { buf_appendf(text, "        IFN EX, 0\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jg") == 0 || strcmp(op, "ja") == 0) && argc == 1) { buf_appendf(text, "        IFG EX, 0\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jl") == 0 || strcmp(op, "jb") == 0) && argc == 1) { buf_appendf(text, "        IFL EX, 0\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jge") == 0 || strcmp(op, "jae") == 0) && argc == 1) { buf_appendf(text, "        IFG EX, 0xffff\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if ((strcmp(op, "jle") == 0 || strcmp(op, "jbe") == 0) && argc == 1) { buf_appendf(text, "        IFL EX, 1\n        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "        SET PC, %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "        JSR %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "        SET PC, POP\n"); return; }
+    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "        SET PUSH, %s\n", dcpu_operand(args[0], line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "        SET %s, POP\n", dcpu_reg(args[0], line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "syscall") == 0) { emit_dcpu_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for DCPU-16");
 }
 
 static void emit_x86_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
@@ -762,17 +949,26 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     const char *size;
     size_t len = strlen(line);
     if (len > 0 && line[len - 1] == ':') {
-        buf_appendf(text, "%s\n", line, NULL, NULL);
+        line[len - 1] = '\0';
+        if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s\n", line, NULL, NULL);
+        else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, ":%s\n", line, NULL, NULL);
+        else buf_appendf(text, "%s:\n", line, NULL, NULL);
         return;
     }
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
-        buf_appendf(text, strcmp(target, "x86_64-nasm") == 0 ? "global %s\n" : ".globl %s\n", name, NULL, NULL);
+        if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name, NULL, NULL);
+        else if (strcmp(target, "riscv64-gnu") == 0) buf_appendf(text, ".globl %s\n", name, NULL, NULL);
+        else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name, NULL, NULL);
+        else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name, NULL, NULL);
         return;
     }
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
-        buf_appendf(text, strcmp(target, "x86_64-nasm") == 0 ? "extern %s\n" : ".extern %s\n", name, NULL, NULL);
+        if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name, NULL, NULL);
+        else if (strcmp(target, "riscv64-gnu") == 0) buf_appendf(text, ".extern %s\n", name, NULL, NULL);
+        else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name, NULL, NULL);
+        else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name, NULL, NULL);
         return;
     }
     space = line;
@@ -786,7 +982,41 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         line_error(line_no, line, "unknown size suffix");
     }
     if (strcmp(target, "x86_64-nasm") == 0) emit_x86_instruction(text, base_op, size, args, argc, line_no);
-    else emit_rv_instruction(text, base_op, size, args, argc, line_no);
+    else if (strcmp(target, "riscv64-gnu") == 0) emit_rv_instruction(text, base_op, size, args, argc, line_no);
+    else if (strcmp(target, "mmixal") == 0) emit_mmix_instruction(text, base_op, size, args, argc, line_no);
+    else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
+    else line_error(line_no, base_op, "unknown instruction target");
+}
+
+static Buffer compile_encoded_esolang(const char *source, const char *target) {
+    Buffer out;
+    buf_init(&out);
+    if (strcmp(target, "fractran") == 0) {
+        buf_append(&out, "2/3");
+        for (size_t i = 0; source[i]; i++) {
+            char frac[64];
+            snprintf(frac, sizeof(frac), " %u/1", (unsigned char)source[i] + 2u);
+            buf_append(&out, frac);
+        }
+        buf_append(&out, "\n");
+    } else {
+        unsigned int state = 0;
+        buf_append(&out, "# CommonASM cellular automaton seed\n");
+        buf_append(&out, "rule 110\n");
+        buf_append(&out, "seed ");
+        for (size_t i = 0; source[i]; i++) {
+            unsigned char ch = (unsigned char)source[i];
+            for (int bit = 7; bit >= 0; bit--) {
+                char cell = ((ch >> bit) & 1) ? '1' : '0';
+                buf_appendf(&out, "%s", cell == '1' ? "1" : "0", NULL, NULL);
+                state = ((state << 1) ^ ch ^ (unsigned int)bit) & 0xffffu;
+            }
+        }
+        char trailer[128];
+        snprintf(trailer, sizeof(trailer), "\nchecksum %u\n", state);
+        buf_append(&out, trailer);
+    }
+    return out;
 }
 
 static Buffer compile_source(char *source, const char *target) {
@@ -795,6 +1025,12 @@ static Buffer compile_source(char *source, const char *target) {
     const char *section = NULL;
     int line_no = 0;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
+    const bool rv = strcmp(target, "riscv64-gnu") == 0;
+    const bool mmix = strcmp(target, "mmixal") == 0;
+    const bool dcpu = strcmp(target, "dcpu16") == 0;
+    if (strcmp(target, "fractran") == 0 || strcmp(target, "cellular-automaton") == 0) {
+        return compile_encoded_esolang(source, target);
+    }
     buf_init(&constants); buf_init(&data); buf_init(&rodata); buf_init(&bss); buf_init(&text);
     while (*cursor) {
         char *line = cursor;
@@ -817,7 +1053,10 @@ static Buffer compile_source(char *source, const char *target) {
             name = trim(name);
             char *value = trim(eq + 1);
             remember_constant(name);
-            buf_appendf(&constants, x86 ? "%s equ %s\n" : ".equ %s, %s\n", name, value, NULL);
+            if (x86) buf_appendf(&constants, "%s equ %s\n", name, value, NULL);
+            else if (rv) buf_appendf(&constants, ".equ %s, %s\n", name, value, NULL);
+            else if (mmix) buf_appendf(&constants, "%s IS %s\n", name, value, NULL);
+            else if (dcpu) buf_appendf(&constants, "%s EQU %s\n", name, value, NULL);
             continue;
         }
         if (strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0) {
@@ -838,12 +1077,24 @@ static Buffer compile_source(char *source, const char *target) {
         if (data.len) { buf_append(&out, "\nsection .data\n"); buf_append(&out, data.data); }
         if (bss.len) { buf_append(&out, "\nsection .bss\n"); buf_append(&out, bss.data); }
         buf_append(&out, "\nsection .text\n");
-    } else if (strcmp(target, "riscv64-gnu") == 0) {
+    } else if (rv) {
         buf_append(&out, constants.data);
         if (rodata.len) { buf_append(&out, ".section .rodata\n"); buf_append(&out, rodata.data); }
         if (data.len) { buf_append(&out, ".section .data\n"); buf_append(&out, data.data); }
         if (bss.len) { buf_append(&out, ".section .bss\n"); buf_append(&out, bss.data); }
         buf_append(&out, "\n.section .text\n");
+    } else if (mmix) {
+        buf_append(&out, constants.data);
+        if (rodata.len) { buf_append(&out, "\n        LOC #1000\n"); buf_append(&out, rodata.data); }
+        if (data.len) { buf_append(&out, "\n        LOC #2000\n"); buf_append(&out, data.data); }
+        if (bss.len) { buf_append(&out, "\n        LOC #3000\n"); buf_append(&out, bss.data); }
+        buf_append(&out, "\n        LOC #4000\n");
+    } else if (dcpu) {
+        buf_append(&out, constants.data);
+        if (rodata.len) { buf_append(&out, "\n; rodata\n"); buf_append(&out, rodata.data); }
+        if (data.len) { buf_append(&out, "\n; data\n"); buf_append(&out, data.data); }
+        if (bss.len) { buf_append(&out, "\n; bss\n"); buf_append(&out, bss.data); }
+        buf_append(&out, "\n; text\n");
     } else {
         die("unknown target");
     }
@@ -861,9 +1112,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) output = argv[++i];
         else if (!input) input = argv[i];
-        else die("usage: commonasmc input.cas --target x86_64-nasm|riscv64-gnu [-o output]");
+        else die("usage: commonasmc input.cas --target x86_64-nasm|riscv64-gnu|mmixal|dcpu16|fractran|cellular-automaton [-o output]");
     }
-    if (!input || !target) die("usage: commonasmc input.cas --target x86_64-nasm|riscv64-gnu [-o output]");
+    if (!input || !target) die("usage: commonasmc input.cas --target x86_64-nasm|riscv64-gnu|mmixal|dcpu16|fractran|cellular-automaton [-o output]");
     source = read_file(input);
     compiled = compile_source(source, target);
     write_file_or_stdout(output, &compiled);

@@ -3,6 +3,10 @@ module compiler
 type Target =
   X86_64Nasm
   Riscv64Gnu
+  Mmixal
+  Dcpu16
+  Fractran
+  CellularAutomaton
 
 type DataString =
   name: string
@@ -57,6 +61,18 @@ fn parse_target(name: string) -> Target {
   }
   if name == "riscv64-gnu" {
     return Riscv64Gnu
+  }
+  if name == "mmixal" {
+    return Mmixal
+  }
+  if name == "dcpu16" {
+    return Dcpu16
+  }
+  if name == "fractran" {
+    return Fractran
+  }
+  if name == "cellular-automaton" {
+    return CellularAutomaton
   }
   fail("unknown target")
 }
