@@ -31,3 +31,6 @@ CommonASM is intentionally portable: the C compiler lowers the same input into
 primary, experimental assembly/IR, and pseudo/encoding outputs. FRACTRAN,
 Cellular Automaton, and many educational targets are intentionally experimental
 source-encoding or pseudo-assembly outputs.
+
+Compile errors use ANSI terminal colors to show the exact source line, column,
+and highlighted token without any external package dependency.

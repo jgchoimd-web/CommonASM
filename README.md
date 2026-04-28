@@ -45,6 +45,9 @@ machine model does not match Linux syscalls or random-access memory.
 - `csrc/commonasmc.c`: C AOT compiler
 - `selfhost/compiler.cal`: self-hosting compiler source sketch
 
+The C compiler prints ANSI-colored diagnostics with the source line, column, and
+highlighted token when compilation fails.
+
 ## Example
 
 ```asm

@@ -97,6 +97,9 @@ static const char *toy_targets[] = {
 };
 static char known_constants[256][64];
 static int known_constant_count = 0;
+static char **diagnostic_lines = NULL;
+static int diagnostic_line_count = 0;
+static const char *diagnostic_path = NULL;
 static const char *usage_text =
     "usage: commonasmc input.cas --target "
     "x86_64-nasm|i386-nasm|riscv64-gnu|rv64i-gnu|rv32i-gnu|rv128i-gnu|"
@@ -119,9 +122,103 @@ static void die(const char *message) {
     exit(1);
 }
 
-static void line_error(int line_no, const char *op, const char *message) {
-    fprintf(stderr, "commonasmc: error: line %d: %s: %s\n", line_no, op, message);
+static char *diagnostic_copy_range(const char *start, size_t len) {
+    char *copy = malloc(len + 1);
+    if (!copy) {
+        fprintf(stderr, "commonasmc: error: out of memory\n");
+        exit(1);
+    }
+    memcpy(copy, start, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static void set_diagnostic_source(const char *path, const char *source) {
+    int count = 1;
+    const char *cursor = source;
+    diagnostic_path = path;
+    for (const char *p = source; *p; p++) {
+        if (*p == '\n') count++;
+    }
+    diagnostic_lines = malloc(sizeof(char *) * (size_t)count);
+    if (!diagnostic_lines) {
+        fprintf(stderr, "commonasmc: error: out of memory\n");
+        exit(1);
+    }
+    diagnostic_line_count = 0;
+    while (*cursor) {
+        const char *newline = strchr(cursor, '\n');
+        size_t len = newline ? (size_t)(newline - cursor) : strlen(cursor);
+        if (len > 0 && cursor[len - 1] == '\r') len--;
+        diagnostic_lines[diagnostic_line_count++] = diagnostic_copy_range(cursor, len);
+        if (!newline) break;
+        cursor = newline + 1;
+    }
+    if (diagnostic_line_count == 0) {
+        diagnostic_lines[diagnostic_line_count++] = diagnostic_copy_range("", 0);
+    }
+}
+
+static int diagnostic_column_for_token(const char *line, const char *token) {
+    const char *found;
+    if (!line || !*line) return 1;
+    if (token && *token) {
+        found = strstr(line, token);
+        if (found) return (int)(found - line) + 1;
+    }
+    for (int i = 0; line[i]; i++) {
+        if (!isspace((unsigned char)line[i])) return i + 1;
+    }
+    return 1;
+}
+
+static int diagnostic_token_width(const char *line, const char *token, int column) {
+    int width = 0;
+    if (token && *token && line && strstr(line, token)) {
+        return (int)strlen(token);
+    }
+    if (!line || column < 1) return 1;
+    for (int i = column - 1; line[i] && !isspace((unsigned char)line[i]) && line[i] != ','; i++) {
+        width++;
+    }
+    return width > 0 ? width : 1;
+}
+
+static void line_error_token(int line_no, const char *token, const char *label, const char *message) {
+    const char *red = "\x1b[1;31m";
+    const char *yellow = "\x1b[1;33m";
+    const char *cyan = "\x1b[1;36m";
+    const char *dim = "\x1b[2m";
+    const char *reset = "\x1b[0m";
+    const char *line = NULL;
+    int column = 1;
+    int width = 1;
+    if (diagnostic_lines && line_no >= 1 && line_no <= diagnostic_line_count) {
+        line = diagnostic_lines[line_no - 1];
+        column = diagnostic_column_for_token(line, token);
+        width = diagnostic_token_width(line, token, column);
+    }
+    fprintf(stderr, "%scommonasmc: error:%s %s%s%s\n", red, reset, yellow, message, reset);
+    if (diagnostic_path) {
+        fprintf(stderr, "%s  --> %s:%d:%d%s\n", cyan, diagnostic_path, line_no, column, reset);
+    } else {
+        fprintf(stderr, "%s  --> line %d:%d%s\n", cyan, line_no, column, reset);
+    }
+    fprintf(stderr, "%s   |\n%s", dim, reset);
+    if (line) {
+        fprintf(stderr, "%s%3d |%s %s\n", cyan, line_no, reset, line);
+        fprintf(stderr, "%s   |%s ", dim, reset);
+        for (int i = 1; i < column; i++) fputc(' ', stderr);
+        fprintf(stderr, "%s", red);
+        for (int i = 0; i < width; i++) fputc('^', stderr);
+        fprintf(stderr, "%s %s%s%s\n", reset, yellow, label ? label : (token ? token : "token"), reset);
+    }
+    fprintf(stderr, "%s   |\n%s", dim, reset);
     exit(1);
+}
+
+static void line_error(int line_no, const char *op, const char *message) {
+    line_error_token(line_no, op, op, message);
 }
 
 static void *xmalloc(size_t size) {
@@ -376,7 +473,7 @@ static int virtual_reg_index(const char *name) {
 static const char *x86_reg(const char *value, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     return x86_regs[reg];
 }
@@ -384,7 +481,7 @@ static const char *x86_reg(const char *value, int line_no, const char *op) {
 static const char *x86_reg_sized(const char *value, const char *size, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     if (strcmp(size, "b") == 0) return x86_regs_b[reg];
     if (strcmp(size, "w") == 0) return x86_regs_w[reg];
@@ -402,7 +499,7 @@ static const char *x86_rax_sized(const char *size) {
 static const char *rv_reg(const char *value, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     return rv_regs[reg];
 }
@@ -410,7 +507,7 @@ static const char *rv_reg(const char *value, int line_no, const char *op) {
 static const char *mmix_reg(const char *value, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     return mmix_regs[reg];
 }
@@ -418,10 +515,10 @@ static const char *mmix_reg(const char *value, int line_no, const char *op) {
 static const char *dcpu_reg(const char *value, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     if (reg >= 8) {
-        line_error(line_no, op, "DCPU-16 maps only r0-r7 directly");
+        line_error_token(line_no, value, op, "DCPU-16 maps only r0-r7 directly");
     }
     return dcpu_regs[reg];
 }
@@ -429,7 +526,7 @@ static const char *dcpu_reg(const char *value, int line_no, const char *op) {
 static const char *generic_reg_for_target(const char *value, const char *target, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
-        line_error(line_no, op, "expected virtual register r0-r15");
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
     if (is_i386_target(target)) return i386_regs[reg];
     if (is_arm32_target(target)) return arm_regs[reg];
@@ -484,7 +581,7 @@ static const char *x86_operand(const char *value, int line_no, const char *op) {
     if (is_int(value) || is_symbol(value) || is_known_constant(value)) {
         return value;
     }
-    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     return value;
 }
 
@@ -559,7 +656,7 @@ static bool parse_address(const char *text, Address *addr) {
 static void x86_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
     Address addr;
     if (!parse_address(text, &addr)) {
-        line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+        line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
     if (addr.has_base) {
         snprintf(out, out_size, "[%s%s%ld]", x86_reg(addr.base, line_no, op), addr.offset < 0 ? "" : "+", addr.offset);
@@ -576,7 +673,7 @@ static void rv_emit_address_setup(Buffer *text, const char *addr_text, const cha
     Address addr;
     char offset[64];
     if (!parse_address(addr_text, &addr)) {
-        line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
     snprintf(offset, sizeof(offset), "%ld", addr.offset);
     if (addr.has_base) {
@@ -596,7 +693,7 @@ static void rv_emit_address_setup(Buffer *text, const char *addr_text, const cha
 static const char *rv_address_base(const char *addr_text, const char *scratch, int line_no, const char *op, long *offset) {
     Address addr;
     if (!parse_address(addr_text, &addr)) {
-        line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
     *offset = addr.has_base ? addr.offset : 0;
     return addr.has_base ? rv_reg(addr.base, line_no, op) : scratch;
@@ -764,7 +861,7 @@ static const char *mmix_operand(const char *value, int line_no, const char *op) 
     int reg = virtual_reg_index(value);
     if (reg >= 0) return mmix_regs[reg];
     if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
-    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     return value;
 }
 
@@ -772,7 +869,7 @@ static const char *dcpu_operand(const char *value, int line_no, const char *op) 
     int reg = virtual_reg_index(value);
     if (reg >= 0) return dcpu_reg(value, line_no, op);
     if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
-    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     return value;
 }
 
@@ -780,7 +877,7 @@ static const char *generic_operand(const char *value, const char *target, int li
     int reg = virtual_reg_index(value);
     if (reg >= 0) return generic_reg_for_target(value, target, line_no, op);
     if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
-    line_error(line_no, op, "expected register, integer, symbol, or constant");
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     return value;
 }
 
@@ -790,7 +887,7 @@ static const char *generic_comment(const char *target) {
 
 static void generic_format_address(const char *text, const char *target, char *out, size_t out_size, int line_no, const char *op) {
     Address addr;
-    if (!parse_address(text, &addr)) line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+    if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     if (is_i386_target(target)) {
         if (addr.has_base) snprintf(out, out_size, "[%s%s%ld]", generic_reg_for_target(addr.base, target, line_no, op), addr.offset < 0 ? "" : "+", addr.offset);
         else snprintf(out, out_size, "[%s%s%ld]", addr.symbol, addr.offset < 0 ? "" : "+", addr.offset);
@@ -817,14 +914,14 @@ static void generic_format_address(const char *text, const char *target, char *o
 
 static void mmix_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
     Address addr;
-    if (!parse_address(text, &addr)) line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+    if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     if (addr.has_base) snprintf(out, out_size, "%ld,%s", addr.offset, mmix_reg(addr.base, line_no, op));
     else snprintf(out, out_size, "%s%+ld", addr.symbol, addr.offset);
 }
 
 static void dcpu_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
     Address addr;
-    if (!parse_address(text, &addr)) line_error(line_no, op, "expected address like [r0 + 8] or [symbol + 8]");
+    if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     if (addr.has_base) {
         if (addr.offset == 0) snprintf(out, out_size, "[%s]", dcpu_reg(addr.base, line_no, op));
         else snprintf(out, out_size, "[%s%+ld]", dcpu_reg(addr.base, line_no, op), addr.offset);
@@ -1557,6 +1654,7 @@ int main(int argc, char **argv) {
     }
     if (!input || !target) die(usage_text);
     source = read_file(input);
+    set_diagnostic_source(input, source);
     compiled = compile_source(source, target);
     write_file_or_stdout(output, &compiled);
     free(source);
