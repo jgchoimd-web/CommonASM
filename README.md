@@ -67,11 +67,21 @@ Text:
 - `mov r0, 123`
 - `mov r1, r0`
 - `load_addr r0, label`
+- `load r0, label`
+- `store label, r0`
 - `add r0, r1`
 - `sub r0, 1`
+- `mul r0, 2`
+- `div r0, r1`
+- `push r0`
+- `pop r1`
 - `cmp r0, 10`
 - `je label`
 - `jne label`
+- `jg label`
+- `jl label`
+- `jge label`
+- `jle label`
 - `jmp label`
 - `call label`
 - `ret`
@@ -79,3 +89,4 @@ Text:
 - `syscall exit, code`
 
 Virtual registers are `r0` through `r7`. Each backend maps them to native registers.
+`cmp a, b` records `a - b` for the following conditional jump.

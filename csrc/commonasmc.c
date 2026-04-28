@@ -185,6 +185,17 @@ static const char *x86_operand(const char *value) {
     return value;
 }
 
+static const char *x86_address(const char *value) {
+    int reg = virtual_reg_index(value);
+    static char address[64];
+    if (reg >= 0) {
+        snprintf(address, sizeof(address), "[%s]", x86_regs[reg]);
+    } else {
+        snprintf(address, sizeof(address), "[rel %s]", value);
+    }
+    return address;
+}
+
 static const char *x86_reg(const char *value, int line_no) {
     int reg = virtual_reg_index(value);
     if (reg < 0) {
@@ -201,6 +212,12 @@ static const char *rv_reg(const char *value, int line_no) {
         exit(1);
     }
     return rv_regs[reg];
+}
+
+static bool is_condition_jump(const char *op) {
+    return strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 ||
+           strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 ||
+           strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0;
 }
 
 static int split_args(char *arg_text, char **args, int max_args) {
@@ -369,11 +386,38 @@ static void emit_text(Buffer *text, char *line, int line_no, const char *target)
             buf_appendf(text, "  %s %s, ", op, x86_reg(args[0], line_no), NULL);
             buf_append(text, x86_operand(args[1]));
             buf_append(text, "\n");
+        } else if (strcmp(op, "mul") == 0 && argc == 2) {
+            buf_appendf(text, "  imul %s, ", x86_reg(args[0], line_no), NULL, NULL);
+            buf_append(text, x86_operand(args[1]));
+            buf_append(text, "\n");
+        } else if (strcmp(op, "div") == 0 && argc == 2) {
+            buf_appendf(text, "  mov rax, %s\n", x86_reg(args[0], line_no), NULL, NULL);
+            buf_append(text, "  cqo\n");
+            if (virtual_reg_index(args[1]) >= 0) {
+                buf_appendf(text, "  idiv %s\n", x86_operand(args[1]), NULL, NULL);
+            } else {
+                buf_appendf(text, "  mov r11, %s\n", x86_operand(args[1]), NULL, NULL);
+                buf_append(text, "  idiv r11\n");
+            }
+            buf_appendf(text, "  mov %s, rax\n", x86_reg(args[0], line_no), NULL, NULL);
+        } else if (strcmp(op, "load") == 0 && argc == 2) {
+            buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no), x86_address(args[1]), NULL);
+        } else if (strcmp(op, "store") == 0 && argc == 2) {
+            if (virtual_reg_index(args[1]) >= 0) {
+                buf_appendf(text, "  mov %s, %s\n", x86_address(args[0]), x86_operand(args[1]), NULL);
+            } else {
+                buf_appendf(text, "  mov r11, %s\n", x86_operand(args[1]), NULL, NULL);
+                buf_appendf(text, "  mov %s, r11\n", x86_address(args[0]), NULL, NULL);
+            }
+        } else if (strcmp(op, "push") == 0 && argc == 1) {
+            buf_appendf(text, "  push %s\n", x86_operand(args[0]), NULL, NULL);
+        } else if (strcmp(op, "pop") == 0 && argc == 1) {
+            buf_appendf(text, "  pop %s\n", x86_reg(args[0], line_no), NULL, NULL);
         } else if (strcmp(op, "cmp") == 0 && argc == 2) {
             buf_appendf(text, "  cmp %s, ", x86_reg(args[0], line_no), NULL, NULL);
             buf_append(text, x86_operand(args[1]));
             buf_append(text, "\n");
-        } else if ((strcmp(op, "je") == 0 || strcmp(op, "jne") == 0) && argc == 1) {
+        } else if (is_condition_jump(op) && argc == 1) {
             buf_appendf(text, "  %s %s\n", op, args[0], NULL);
         } else if (strcmp(op, "jmp") == 0 && argc == 1) {
             buf_appendf(text, "  jmp %s\n", args[0], NULL, NULL);
@@ -412,21 +456,78 @@ static void emit_text(Buffer *text, char *line, int line_no, const char *target)
                 buf_append(text, args[1]);
                 buf_append(text, "\n");
             }
-        } else if (strcmp(op, "cmp") == 0 && argc == 2) {
+        } else if ((strcmp(op, "mul") == 0 || strcmp(op, "div") == 0) && argc == 2) {
             int src = virtual_reg_index(args[1]);
+            const char *native_op = strcmp(op, "mul") == 0 ? "mul" : "div";
             if (src >= 0) {
-                buf_appendf(text, "  sub t6, %s, ", rv_reg(args[0], line_no), NULL, NULL);
+                buf_appendf(text, "  %s %s, ", native_op, rv_reg(args[0], line_no), NULL);
+                buf_append(text, rv_reg(args[0], line_no));
+                buf_append(text, ", ");
                 buf_append(text, rv_regs[src]);
                 buf_append(text, "\n");
             } else {
-                buf_appendf(text, "  addi t6, %s, -", rv_reg(args[0], line_no), NULL, NULL);
+                buf_appendf(text, "  li a6, %s\n", args[1], NULL, NULL);
+                buf_appendf(text, "  %s %s, ", native_op, rv_reg(args[0], line_no), NULL);
+                buf_append(text, rv_reg(args[0], line_no));
+                buf_append(text, ", a6\n");
+            }
+        } else if (strcmp(op, "load") == 0 && argc == 2) {
+            int addr = virtual_reg_index(args[1]);
+            if (addr >= 0) {
+                buf_appendf(text, "  ld %s, 0(", rv_reg(args[0], line_no), NULL, NULL);
+                buf_append(text, rv_regs[addr]);
+                buf_append(text, ")\n");
+            } else {
+                buf_appendf(text, "  la a6, %s\n", args[1], NULL, NULL);
+                buf_appendf(text, "  ld %s, 0(a6)\n", rv_reg(args[0], line_no), NULL, NULL);
+            }
+        } else if (strcmp(op, "store") == 0 && argc == 2) {
+            int addr = virtual_reg_index(args[0]);
+            int src = virtual_reg_index(args[1]);
+            if (src < 0) {
+                buf_appendf(text, "  li a6, %s\n", args[1], NULL, NULL);
+            }
+            if (addr >= 0) {
+                buf_appendf(text, "  sd %s, 0(", src >= 0 ? rv_regs[src] : "a6", NULL, NULL);
+                buf_append(text, rv_regs[addr]);
+                buf_append(text, ")\n");
+            } else {
+                buf_appendf(text, "  la a7, %s\n", args[0], NULL, NULL);
+                buf_appendf(text, "  sd %s, 0(a7)\n", src >= 0 ? rv_regs[src] : "a6", NULL, NULL);
+            }
+        } else if (strcmp(op, "push") == 0 && argc == 1) {
+            int src = virtual_reg_index(args[0]);
+            if (src < 0) {
+                buf_appendf(text, "  li a6, %s\n", args[0], NULL, NULL);
+            }
+            buf_append(text, "  addi sp, sp, -8\n");
+            buf_appendf(text, "  sd %s, 0(sp)\n", src >= 0 ? rv_regs[src] : "a6", NULL, NULL);
+        } else if (strcmp(op, "pop") == 0 && argc == 1) {
+            buf_appendf(text, "  ld %s, 0(sp)\n", rv_reg(args[0], line_no), NULL, NULL);
+            buf_append(text, "  addi sp, sp, 8\n");
+        } else if (strcmp(op, "cmp") == 0 && argc == 2) {
+            int src = virtual_reg_index(args[1]);
+            if (src >= 0) {
+                buf_appendf(text, "  sub a6, %s, ", rv_reg(args[0], line_no), NULL, NULL);
+                buf_append(text, rv_regs[src]);
+                buf_append(text, "\n");
+            } else {
+                buf_appendf(text, "  addi a6, %s, -", rv_reg(args[0], line_no), NULL, NULL);
                 buf_append(text, args[1]);
                 buf_append(text, "\n");
             }
         } else if (strcmp(op, "je") == 0 && argc == 1) {
-            buf_appendf(text, "  beqz t6, %s\n", args[0], NULL, NULL);
+            buf_appendf(text, "  beqz a6, %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "jne") == 0 && argc == 1) {
-            buf_appendf(text, "  bnez t6, %s\n", args[0], NULL, NULL);
+            buf_appendf(text, "  bnez a6, %s\n", args[0], NULL, NULL);
+        } else if (strcmp(op, "jg") == 0 && argc == 1) {
+            buf_appendf(text, "  bgtz a6, %s\n", args[0], NULL, NULL);
+        } else if (strcmp(op, "jl") == 0 && argc == 1) {
+            buf_appendf(text, "  bltz a6, %s\n", args[0], NULL, NULL);
+        } else if (strcmp(op, "jge") == 0 && argc == 1) {
+            buf_appendf(text, "  bgez a6, %s\n", args[0], NULL, NULL);
+        } else if (strcmp(op, "jle") == 0 && argc == 1) {
+            buf_appendf(text, "  blez a6, %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "jmp") == 0 && argc == 1) {
             buf_appendf(text, "  j %s\n", args[0], NULL, NULL);
         } else if (strcmp(op, "call") == 0 && argc == 1) {

@@ -238,10 +238,28 @@ fn emit_x86_instruction(ins: Instruction) -> string {
   if ins.op == "add" or ins.op == "sub" {
     return "  " + ins.op + " " + x86_reg(ins.args[0]) + ", " + x86_operand(ins.args[1]) + "\n"
   }
+  if ins.op == "mul" {
+    return "  imul " + x86_reg(ins.args[0]) + ", " + x86_operand(ins.args[1]) + "\n"
+  }
+  if ins.op == "div" {
+    return "  mov rax, " + x86_reg(ins.args[0]) + "\n  cqo\n  idiv " + x86_operand(ins.args[1]) + "\n  mov " + x86_reg(ins.args[0]) + ", rax\n"
+  }
+  if ins.op == "push" {
+    return "  push " + x86_operand(ins.args[0]) + "\n"
+  }
+  if ins.op == "pop" {
+    return "  pop " + x86_reg(ins.args[0]) + "\n"
+  }
+  if ins.op == "load" {
+    return "  mov " + x86_reg(ins.args[0]) + ", [rel " + ins.args[1] + "]\n"
+  }
+  if ins.op == "store" {
+    return "  mov [rel " + ins.args[0] + "], " + x86_operand(ins.args[1]) + "\n"
+  }
   if ins.op == "cmp" {
     return "  cmp " + x86_reg(ins.args[0]) + ", " + x86_operand(ins.args[1]) + "\n"
   }
-  if ins.op == "je" or ins.op == "jne" {
+  if ins.op == "je" or ins.op == "jne" or ins.op == "jg" or ins.op == "jl" or ins.op == "jge" or ins.op == "jle" {
     return "  " + ins.op + " " + ins.args[0] + "\n"
   }
   if ins.op == "jmp" or ins.op == "call" {

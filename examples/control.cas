@@ -1,0 +1,23 @@
+const stdout = 1
+
+.data
+ok: string "branch ok\n"
+counter: bytes 0, 0, 0, 0, 0, 0, 0, 0
+
+.text
+global _start
+
+_start:
+  mov r0, 6
+  mul r0, 7
+  push r0
+  pop r1
+  store counter, r1
+  load r2, counter
+  cmp r2, 42
+  je success
+  syscall exit, 1
+
+success:
+  syscall write, stdout, ok, ok_len
+  syscall exit, 0
