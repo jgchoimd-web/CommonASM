@@ -1,0 +1,23 @@
+const stdout = 1
+
+.rodata
+msg: string "legacy target\n"
+
+.data
+slot: qword 0
+
+.text
+global _start
+
+_start:
+  mov r0, 10
+  add r0, 32
+  store.q [slot], r0
+  load.q r1, [slot]
+  cmp r1, 42
+  je done
+  syscall exit, 1
+
+done:
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0

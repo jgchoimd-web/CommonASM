@@ -19,6 +19,7 @@ type Target =
   Dcpu16
   Fractran
   CellularAutomaton
+  ExperimentalTarget(name: string)
 
 type DataString =
   name: string
@@ -49,7 +50,7 @@ fn main(args: array<string>) -> int {
   let output = option_value(args, "-o")
 
   if input == "" or target_name == "" {
-    print_error("usage: calcc input.cas --target x86_64-nasm|riscv64-gnu [-o output]")
+    print_error("usage: calcc input.cas --target TARGET [-o output]")
     return 1
   }
 
@@ -122,7 +123,41 @@ fn parse_target(name: string) -> Target {
   if name == "cellular-automaton" {
     return CellularAutomaton
   }
+  if is_known_experimental_target(name) {
+    return ExperimentalTarget(name: name)
+  }
   fail("unknown target")
+}
+
+fn is_known_experimental_target(name: string) -> bool {
+  return name == "mips1-gnu" or name == "mips32-gnu" or name == "mips64-gnu" or
+    name == "micromips-gnu" or name == "power1-gnu" or name == "power2-gnu" or
+    name == "ppc603-gnu" or name == "ppcg4-gnu" or name == "ppcg5-gnu" or
+    name == "power9-gnu" or name == "power10-gnu" or name == "sparcv8-gnu" or
+    name == "sparcv9-gnu" or name == "alpha-gnu" or name == "parisc-gnu" or
+    name == "m88k-gnu" or name == "mos6502" or name == "wdc65c02" or
+    name == "wdc65816" or name == "mos6510" or name == "i8008" or
+    name == "i8080" or name == "i8085" or name == "z80" or name == "ez80" or
+    name == "m6800" or name == "m6809" or name == "m68k" or name == "coldfire" or
+    name == "avr" or name == "pic16" or name == "pic32" or name == "i8051" or
+    name == "msp430" or name == "xtensa" or name == "superh" or name == "rx" or
+    name == "nios2" or name == "microblaze" or name == "arc" or name == "propeller" or
+    name == "pdp1" or name == "pdp8" or name == "pdp11" or name == "vax" or
+    name == "system360" or name == "system370" or name == "zarch" or
+    name == "cdc6600" or name == "univac1" or name == "cray1" or
+    name == "ptx" or name == "amdgcn" or name == "rdna" or name == "intelgen" or
+    name == "cell-spe" or name == "tms320" or name == "dsp56000" or
+    name == "blackfin" or name == "hexagon" or name == "ebpf" or name == "wasm" or
+    name == "llvm-ir" or name == "gcc-gimple" or name == "gcc-rtl" or
+    name == "jvm-bytecode" or name == "cil" or name == "dalvik" or
+    name == "lua-bytecode" or name == "python-bytecode" or name == "spirv" or
+    name == "evm" or name == "mix" or name == "lc3" or name == "lmc" or
+    name == "marie" or name == "chip8" or name == "schip8" or name == "redcode" or
+    name == "subleq" or name == "iota" or name == "jot" or name == "malbolge-asm" or
+    name == "brainfuck" or name == "urisc" or name == "tta" or name == "secd" or
+    name == "pcode" or name == "zmachine" or name == "sweet16" or
+    name == "befunge" or name == "bitblt-vm" or name == "turing-machine" or
+    name == "unlambda"
 }
 
 fn parse_program(source: string) -> Program {

@@ -10,32 +10,35 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 
 ## Supported targets
 
-- `i386-nasm`: IA-32 / 32-bit x86 NASM-style output
-- `x86_64-nasm`: Linux x86-64, NASM syntax
-- `armv4-gnu`: experimental ARMv4 GNU-style output
-- `armv5-gnu`: experimental ARMv5 GNU-style output
-- `armv7a-gnu`: experimental ARMv7-A GNU-style output
-- `aarch64-gnu`: experimental ARMv8-A / AArch64 GNU-style output
-- `thumb-gnu`: experimental Cortex-M Thumb-style output
-- `thumb2-gnu`: experimental Cortex-M Thumb-2-style output
-- `rv32i-gnu`: experimental RV32I GNU-style output
-- `rv64i-gnu`: RV64I alias for the RISC-V 64 backend
-- `riscv64-gnu`: Linux RISC-V 64, GNU assembler syntax
-- `rv128i-gnu`: experimental RV128I-style output
-- `ia64-gnu`: experimental Itanium / IA-64-style output
-- `loongarch64-gnu`: experimental LoongArch64 GNU-style output
-- `mmixal`: experimental MMIXAL-style output
-- `dcpu16`: experimental DCPU-16-style output
-- `fractran`: experimental FRACTRAN source-encoding output
-- `cellular-automaton`: experimental Rule 110 seed output
+Primary:
 
-The x86-64 and RISC-V 64 backends are the primary maintained backends. IA-32,
-ARM, AArch64, RV32/RV128, IA-64, LoongArch, MMIX, and DCPU-16 are experimental
-assembly-style outputs for the portable subset. FRACTRAN and Cellular Automaton
-targets encode the CommonASM source as esolang artifacts rather than modeling
-Linux syscalls or random-access machine memory directly.
-DCPU-16 directly maps `r0` through `r7`; wider virtual registers are kept for the
-other targets.
+- `x86_64-nasm`
+- `riscv64-gnu`
+
+Experimental assembly/IR:
+
+- `i386-nasm`, `ia32-nasm`
+- `armv4-gnu`, `armv5-gnu`, `armv7a-gnu`, `aarch64-gnu`, `thumb-gnu`, `thumb2-gnu`
+- `rv32i-gnu`, `rv64i-gnu`, `rv128i-gnu`, `ia64-gnu`, `loongarch64-gnu`
+- `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu`
+- `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`, `power9-gnu`, `power10-gnu`
+- `sparcv8-gnu`, `sparcv9-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
+- `m68k`, `coldfire`, `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
+- `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`
+- `wasm`, `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
+- `mmixal`, `dcpu16`
+
+Encoding/pseudo:
+
+- `mos6502`, `wdc65c02`, `wdc65816`, `mos6510`, `i8008`, `i8080`, `i8085`, `z80`, `ez80`, `m6800`, `m6809`
+- `pic16`, `pic32`, `propeller`
+- `pdp1`, `pdp8`, `pdp11`, `vax`, `system360`, `system370`, `zarch`, `cdc6600`, `univac1`, `cray1`
+- `mix`, `lc3`, `lmc`, `marie`, `chip8`, `schip8`, `redcode`, `subleq`, `urisc`, `tta`
+- `fractran`, `iota`, `jot`, `malbolge-asm`, `brainfuck`, `secd`, `pcode`, `zmachine`, `sweet16`, `befunge`, `bitblt-vm`, `turing-machine`, `cellular-automaton`, `unlambda`
+
+The experimental targets are portable-subset outputs, not complete ABI-level ports.
+Pseudo and encoding targets use comments, toy assembly, or source encodings when the
+machine model does not match Linux syscalls or random-access memory.
 
 ## Compiler implementations
 

@@ -1,0 +1,19 @@
+const stdout = 1
+
+.data
+cell: byte 0
+
+.text
+global _start
+
+_start:
+  mov r0, 7
+  add r0, 1
+  store.b [cell], r0
+  cmp r0, 8
+  jne fail
+  syscall write, stdout, cell, 1
+  syscall exit, 0
+
+fail:
+  syscall exit, 1

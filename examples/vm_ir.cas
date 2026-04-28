@@ -1,0 +1,25 @@
+const stdout = 1
+
+.rodata
+msg: string "vm ir target\n"
+
+.text
+global _start
+
+func main
+  enter 0
+  mov r0, 1
+  add r0, 2
+  cmp r0, 3
+  je ok
+  syscall exit, 1
+
+ok:
+  syscall write, stdout, msg, msg_len
+  leave
+  ret
+endfunc
+
+_start:
+  call main
+  syscall exit, 0

@@ -67,8 +67,52 @@ static const char *loong_regs[] = {
     "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7",
     "$t8", "$r21", "$a0", "$a1", "$a2", "$a3", "$a4", "$a5"
 };
+static const char *portable_regs[] = {
+    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+};
+static const char *legacy_arch_targets[] = {
+    "mips1-gnu", "mips32-gnu", "mips64-gnu", "micromips-gnu",
+    "power1-gnu", "power2-gnu", "ppc603-gnu", "ppcg4-gnu", "ppcg5-gnu",
+    "power9-gnu", "power10-gnu", "sparcv8-gnu", "sparcv9-gnu",
+    "alpha-gnu", "parisc-gnu", "m88k-gnu", "m68k", "coldfire",
+    "avr", "i8051", "msp430", "xtensa", "superh", "rx", "nios2",
+    "microblaze", "arc", "ptx", "amdgcn", "rdna", "intelgen",
+    "cell-spe", "tms320", "dsp56000", "blackfin", "hexagon", "ebpf",
+    NULL
+};
+static const char *vm_ir_targets[] = {
+    "wasm", "llvm-ir", "gcc-gimple", "gcc-rtl", "jvm-bytecode", "cil",
+    "dalvik", "lua-bytecode", "python-bytecode", "spirv", "evm", NULL
+};
+static const char *toy_targets[] = {
+    "mos6502", "wdc65c02", "wdc65816", "mos6510", "i8008", "i8080",
+    "i8085", "z80", "ez80", "m6800", "m6809", "pic16", "pic32",
+    "propeller", "pdp1", "pdp8", "pdp11", "vax", "system360",
+    "system370", "zarch", "cdc6600", "univac1", "cray1", "mix",
+    "lc3", "lmc", "marie", "chip8", "schip8", "redcode", "subleq",
+    "iota", "jot", "malbolge-asm", "brainfuck", "urisc", "tta",
+    "secd", "pcode", "zmachine", "sweet16", "befunge", "bitblt-vm",
+    "turing-machine", "unlambda", NULL
+};
 static char known_constants[256][64];
 static int known_constant_count = 0;
+static const char *usage_text =
+    "usage: commonasmc input.cas --target "
+    "x86_64-nasm|i386-nasm|riscv64-gnu|rv64i-gnu|rv32i-gnu|rv128i-gnu|"
+    "armv4-gnu|armv5-gnu|armv7a-gnu|aarch64-gnu|thumb-gnu|thumb2-gnu|"
+    "ia64-gnu|loongarch64-gnu|mips1-gnu|mips32-gnu|mips64-gnu|micromips-gnu|"
+    "power1-gnu|power2-gnu|ppc603-gnu|ppcg4-gnu|ppcg5-gnu|power9-gnu|power10-gnu|"
+    "sparcv8-gnu|sparcv9-gnu|alpha-gnu|parisc-gnu|m88k-gnu|mos6502|wdc65c02|"
+    "wdc65816|mos6510|i8008|i8080|i8085|z80|ez80|m6800|m6809|m68k|coldfire|"
+    "avr|pic16|pic32|i8051|msp430|xtensa|superh|rx|nios2|microblaze|arc|"
+    "propeller|pdp1|pdp8|pdp11|vax|system360|system370|zarch|cdc6600|univac1|"
+    "cray1|ptx|amdgcn|rdna|intelgen|cell-spe|tms320|dsp56000|blackfin|hexagon|"
+    "ebpf|wasm|llvm-ir|gcc-gimple|gcc-rtl|jvm-bytecode|cil|dalvik|lua-bytecode|"
+    "python-bytecode|spirv|evm|mix|mmixal|lc3|lmc|marie|dcpu16|chip8|schip8|"
+    "redcode|subleq|fractran|iota|jot|malbolge-asm|brainfuck|urisc|tta|secd|"
+    "pcode|zmachine|sweet16|befunge|bitblt-vm|turing-machine|cellular-automaton|"
+    "unlambda [-o output]";
 
 static void die(const char *message) {
     fprintf(stderr, "commonasmc: error: %s\n", message);
@@ -238,6 +282,15 @@ static bool is_symbol(const char *text) {
     return true;
 }
 
+static bool target_in_list(const char *target, const char *const *list) {
+    for (int i = 0; list[i]; i++) {
+        if (strcmp(target, list[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_i386_target(const char *target) {
     return strcmp(target, "i386-nasm") == 0 || strcmp(target, "ia32-nasm") == 0;
 }
@@ -252,6 +305,22 @@ static bool is_generic_arch_target(const char *target) {
            strcmp(target, "thumb-gnu") == 0 || strcmp(target, "thumb2-gnu") == 0 ||
            strcmp(target, "rv32i-gnu") == 0 || strcmp(target, "rv128i-gnu") == 0 ||
            strcmp(target, "ia64-gnu") == 0 || strcmp(target, "loongarch64-gnu") == 0;
+}
+
+static bool is_legacy_arch_target(const char *target) {
+    return target_in_list(target, legacy_arch_targets);
+}
+
+static bool is_vm_ir_target(const char *target) {
+    return target_in_list(target, vm_ir_targets);
+}
+
+static bool is_toy_target(const char *target) {
+    return target_in_list(target, toy_targets);
+}
+
+static bool is_pseudo_text_target(const char *target) {
+    return is_vm_ir_target(target) || is_toy_target(target);
 }
 
 static bool is_arm32_target(const char *target) {
@@ -368,6 +437,7 @@ static const char *generic_reg_for_target(const char *value, const char *target,
     if (is_rv_generic_target(target)) return rv_regs[reg];
     if (is_ia64_target(target)) return ia64_regs[reg];
     if (is_loong_target(target)) return loong_regs[reg];
+    if (is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target)) return portable_regs[reg];
     return rv_regs[reg];
 }
 
@@ -540,7 +610,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (strncmp(line, "align ", 6) == 0) {
         const char *value = trim(line + 6);
         if (x86) buf_appendf(out, "align %s\n", value, NULL, NULL);
@@ -564,6 +634,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         }
         if (dcpu) buf_appendf(out, ":%s DAT ", name, NULL, NULL);
         else if (generic && is_i386_target(target)) buf_appendf(out, "%s: db ", name, NULL, NULL);
+        else if (generic && is_toy_target(target)) buf_appendf(out, "%s: data ", name, NULL, NULL);
         else buf_appendf(out, "%s: %s ", name, x86 ? "db" : (mmix ? "BYTE" : ".byte"), NULL);
         quote++;
         for (size_t i = 0; quote[i] && quote[i] != '"'; i++) {
@@ -590,7 +661,8 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         else if (rv) buf_appendf(constants, ".equ %s_len, %s\n", name, len_value, NULL);
         else if (mmix) buf_appendf(constants, "%s_len IS %s\n", name, len_value, NULL);
         else if (dcpu) buf_appendf(constants, "%s_len EQU %s\n", name, len_value, NULL);
-        else if (generic) buf_appendf(constants, ".equ %s_len, %s\n", name, len_value, NULL);
+        else if (generic && !is_toy_target(target)) buf_appendf(constants, ".equ %s_len, %s\n", name, len_value, NULL);
+        else if (generic) buf_appendf(constants, "; const %s_len = %s\n", name, len_value, NULL);
         return;
     }
     if (strncmp(kind, "zero", 4) == 0 && isspace((unsigned char)kind[4])) {
@@ -607,6 +679,8 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
             buf_appendf(out, "%s: times %s db 0\n", name, value, NULL);
         } else if (generic && is_i386_target(target)) {
             buf_appendf(out, "%s: times %s db 0\n", name, value, NULL);
+        } else if (generic && is_toy_target(target)) {
+            buf_appendf(out, "%s: zero %s\n", name, value, NULL);
         } else {
             buf_appendf(out, "%s: .zero %s\n", name, value, NULL);
         }
@@ -636,6 +710,8 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         buf_appendf(out, "%s: %s ", name, mmix_dir, NULL);
     } else if (generic && is_i386_target(target)) {
         buf_appendf(out, "%s: %s ", name, x86_dir, NULL);
+    } else if (generic && is_toy_target(target)) {
+        buf_appendf(out, "%s: data ", name, NULL, NULL);
     } else {
         buf_appendf(out, "%s: %s ", name, x86 ? x86_dir : rv_dir, NULL);
     }
@@ -986,6 +1062,97 @@ static void emit_generic_instruction(Buffer *text, const char *target, const cha
     line_error(line_no, op, "unsupported instruction or wrong argument count for generic architecture");
 }
 
+static void emit_arch_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
+    (void)size;
+    const char *comment = target_in_list(target, legacy_arch_targets) ? "#" : ";";
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "  %s enter %s\n", comment, args[0], NULL); return; }
+    if (strcmp(op, "leave") == 0 && argc == 0) { buf_appendf(text, "  %s leave\n", comment, NULL, NULL); return; }
+    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op), NULL); return; }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "  la %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), args[1], NULL); return; }
+    if (strcmp(op, "load") == 0 && argc == 2) {
+        char addr[256]; generic_format_address(args[1], target, addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "  load %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), addr, NULL); return;
+    }
+    if (strcmp(op, "store") == 0 && argc == 2) {
+        char addr[256]; generic_format_address(args[0], target, addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "  store %s, %s\n", generic_operand(args[1], target, line_no, op), addr, NULL); return;
+    }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
+         strcmp(op, "mod") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 ||
+         strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        buf_appendf(text, "  %s %s, %s, ", op, generic_reg_for_target(args[0], target, line_no, op), generic_reg_for_target(args[0], target, line_no, op));
+        buf_append(text, generic_operand(args[1], target, line_no, op));
+        buf_append(text, "\n");
+        return;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+        buf_appendf(text, "  %s %s\n", op, generic_reg_for_target(args[0], target, line_no, op), NULL); return;
+    }
+    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "  cmp %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op), NULL); return; }
+    if ((strcmp(op, "jmp") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
+         strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 || strcmp(op, "ja") == 0 ||
+         strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0) && argc == 1) {
+        buf_appendf(text, "  %s %s\n", op, args[0], NULL); return;
+    }
+    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  call %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "  push %s\n", generic_operand(args[0], target, line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "  pop %s\n", generic_reg_for_target(args[0], target, line_no, op), NULL, NULL); return; }
+    if (strcmp(op, "syscall") == 0 && argc >= 1) { buf_appendf(text, "  %s syscall %s runtime placeholder\n", comment, args[0], NULL); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for architecture-style target");
+}
+
+static void emit_vm_ir_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
+    (void)size;
+    (void)line_no;
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "func %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) { buf_append(text, "endfunc\n"); return; }
+    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "  ; enter %s\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "leave") == 0 && argc == 0) { buf_append(text, "  ; leave\n"); return; }
+    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "  %s.mov %s, ", target, args[0], NULL); buf_append(text, args[1]); buf_append(text, "\n"); return; }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "  %s.addr %s, %s\n", target, args[0], args[1]); return; }
+    if ((strcmp(op, "load") == 0 || strcmp(op, "store") == 0) && argc == 2) {
+        buf_appendf(text, "  %s.%s %s, ", target, op, args[0]);
+        buf_append(text, args[1]);
+        buf_append(text, "\n");
+        return;
+    }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 ||
+         strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
+         strcmp(op, "mod") == 0 || strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        buf_appendf(text, "  %s.%s %s, ", target, op, args[0]); buf_append(text, args[1]); buf_append(text, "\n"); return;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 || strcmp(op, "push") == 0 || strcmp(op, "pop") == 0) && argc == 1) {
+        buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
+    }
+    if ((strcmp(op, "jmp") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
+         strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 || strcmp(op, "call") == 0) && argc == 1) {
+        buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
+    }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_appendf(text, "  %s.ret\n", target, NULL, NULL); return; }
+    if (strcmp(op, "syscall") == 0 && argc >= 1) { buf_appendf(text, "  %s.syscall %s\n", target, args[0], NULL); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for VM/IR target");
+}
+
+static void emit_encoded_or_toy_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
+    (void)size;
+    (void)line_no;
+    if (strcmp(target, "brainfuck") == 0) { buf_append(text, "+["); for (int i = 0; i < argc; i++) buf_append(text, "+"); buf_append(text, "-]\n"); return; }
+    if (strcmp(target, "subleq") == 0 || strcmp(target, "urisc") == 0) { buf_appendf(text, "  subleq %s_tmp, %s_tmp, next\n", op, op, NULL); return; }
+    if (strcmp(target, "redcode") == 0) { buf_appendf(text, "        MOV 0, 1        ; %s\n", op, NULL, NULL); return; }
+    if (strcmp(target, "chip8") == 0 || strcmp(target, "schip8") == 0) { buf_appendf(text, "        ; %s CHIP-8 pseudo op\n", op, NULL, NULL); return; }
+    if (strcmp(target, "befunge") == 0) { buf_appendf(text, ">:%s v\n", op, NULL, NULL); return; }
+    if (strcmp(target, "turing-machine") == 0) { buf_appendf(text, "state_%s: read _ write _ move R goto next\n", op, NULL, NULL); return; }
+    if (strcmp(target, "unlambda") == 0 || strcmp(target, "iota") == 0 || strcmp(target, "jot") == 0) { buf_appendf(text, "`k`k ; %s\n", op, NULL, NULL); return; }
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0], NULL, NULL); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    buf_appendf(text, "  %s.%s", target, op, NULL);
+    for (int i = 0; i < argc; i++) { buf_append(text, i == 0 ? " " : ", "); buf_append(text, args[i]); }
+    buf_append(text, "\n");
+}
+
 static void emit_x86_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
     if (strcmp(op, "func") == 0 && argc == 1) {
         buf_appendf(text, "%s:\n", args[0], NULL, NULL); return;
@@ -1203,19 +1370,21 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name, NULL, NULL);
-        else if (is_rv64_target(target) || is_generic_arch_target(target)) buf_appendf(text, ".globl %s\n", name, NULL, NULL);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name, NULL, NULL);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name, NULL, NULL);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name, NULL, NULL);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name, NULL, NULL);
+        else if (is_toy_target(target)) buf_appendf(text, "; global %s\n", name, NULL, NULL);
         return;
     }
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name, NULL, NULL);
-        else if (is_rv64_target(target) || is_generic_arch_target(target)) buf_appendf(text, ".extern %s\n", name, NULL, NULL);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name, NULL, NULL);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name, NULL, NULL);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name, NULL, NULL);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name, NULL, NULL);
+        else if (is_toy_target(target)) buf_appendf(text, "        ; extern %s\n", name, NULL, NULL);
         return;
     }
     space = line;
@@ -1233,6 +1402,9 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "mmixal") == 0) emit_mmix_instruction(text, base_op, size, args, argc, line_no);
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target) || is_generic_arch_target(target)) emit_generic_instruction(text, target, base_op, size, args, argc, line_no);
+    else if (is_legacy_arch_target(target)) emit_arch_instruction(text, target, base_op, size, args, argc, line_no);
+    else if (is_vm_ir_target(target)) emit_vm_ir_instruction(text, target, base_op, size, args, argc, line_no);
+    else if (is_toy_target(target)) emit_encoded_or_toy_instruction(text, target, base_op, size, args, argc, line_no);
     else line_error(line_no, base_op, "unknown instruction target");
 }
 
@@ -1277,7 +1449,7 @@ static Buffer compile_source(char *source, const char *target) {
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (strcmp(target, "fractran") == 0 || strcmp(target, "cellular-automaton") == 0) {
         return compile_encoded_esolang(source, target);
     }
@@ -1308,7 +1480,8 @@ static Buffer compile_source(char *source, const char *target) {
             else if (rv) buf_appendf(&constants, ".equ %s, %s\n", name, value, NULL);
             else if (mmix) buf_appendf(&constants, "%s IS %s\n", name, value, NULL);
             else if (dcpu) buf_appendf(&constants, "%s EQU %s\n", name, value, NULL);
-            else if (generic) buf_appendf(&constants, ".equ %s, %s\n", name, value, NULL);
+            else if (generic && !is_toy_target(target)) buf_appendf(&constants, ".equ %s, %s\n", name, value, NULL);
+            else if (generic) buf_appendf(&constants, "; const %s = %s\n", name, value, NULL);
             continue;
         }
         if (strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0) {
@@ -1349,13 +1522,20 @@ static Buffer compile_source(char *source, const char *target) {
         buf_append(&out, "\n; text\n");
     } else if (generic) {
         buf_append(&out, constants.data);
-        if (rodata.len) { buf_append(&out, ".section .rodata\n"); buf_append(&out, rodata.data); }
-        if (data.len) { buf_append(&out, ".section .data\n"); buf_append(&out, data.data); }
-        if (bss.len) { buf_append(&out, ".section .bss\n"); buf_append(&out, bss.data); }
-        if (strcmp(target, "thumb-gnu") == 0) buf_append(&out, ".thumb\n");
-        else if (strcmp(target, "thumb2-gnu") == 0) buf_append(&out, ".thumb\n.syntax unified\n");
-        else if (is_arm32_target(target)) buf_append(&out, ".arm\n.syntax unified\n");
-        buf_append(&out, "\n.section .text\n");
+        if (is_toy_target(target)) {
+            if (rodata.len) { buf_append(&out, "; rodata\n"); buf_append(&out, rodata.data); }
+            if (data.len) { buf_append(&out, "; data\n"); buf_append(&out, data.data); }
+            if (bss.len) { buf_append(&out, "; bss\n"); buf_append(&out, bss.data); }
+            buf_append(&out, "\n; text\n");
+        } else {
+            if (rodata.len) { buf_append(&out, ".section .rodata\n"); buf_append(&out, rodata.data); }
+            if (data.len) { buf_append(&out, ".section .data\n"); buf_append(&out, data.data); }
+            if (bss.len) { buf_append(&out, ".section .bss\n"); buf_append(&out, bss.data); }
+            if (strcmp(target, "thumb-gnu") == 0) buf_append(&out, ".thumb\n");
+            else if (strcmp(target, "thumb2-gnu") == 0) buf_append(&out, ".thumb\n.syntax unified\n");
+            else if (is_arm32_target(target)) buf_append(&out, ".arm\n.syntax unified\n");
+            buf_append(&out, "\n.section .text\n");
+        }
     } else {
         die("unknown target");
     }
@@ -1373,9 +1553,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) output = argv[++i];
         else if (!input) input = argv[i];
-        else die("usage: commonasmc input.cas --target x86_64-nasm|i386-nasm|riscv64-gnu|rv64i-gnu|rv32i-gnu|rv128i-gnu|armv4-gnu|armv5-gnu|armv7a-gnu|aarch64-gnu|thumb-gnu|thumb2-gnu|ia64-gnu|loongarch64-gnu|mmixal|dcpu16|fractran|cellular-automaton [-o output]");
+        else die(usage_text);
     }
-    if (!input || !target) die("usage: commonasmc input.cas --target x86_64-nasm|i386-nasm|riscv64-gnu|rv64i-gnu|rv32i-gnu|rv128i-gnu|armv4-gnu|armv5-gnu|armv7a-gnu|aarch64-gnu|thumb-gnu|thumb2-gnu|ia64-gnu|loongarch64-gnu|mmixal|dcpu16|fractran|cellular-automaton [-o output]");
+    if (!input || !target) die(usage_text);
     source = read_file(input);
     compiled = compile_source(source, target);
     write_file_or_stdout(output, &compiled);
