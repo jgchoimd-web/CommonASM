@@ -50,6 +50,11 @@ machine model does not match Linux syscalls or random-access memory.
 The C compiler prints ANSI-colored diagnostics with the source line, column, and
 highlighted token when compilation fails.
 
+## GitHub Pages site
+
+This repository includes a static project site in `docs/`. In GitHub Pages,
+choose "Deploy from a branch", select `main`, and set the folder to `/docs`.
+
 ## Example
 
 ```asm

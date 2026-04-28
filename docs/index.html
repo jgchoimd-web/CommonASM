@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CommonASM</title>
+    <meta
+      name="description"
+      content="CommonASM is a portable assembly IR that compiles one source into many assembly and experimental target formats."
+    >
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="CommonASM home">
+        <span class="brand-mark">CA</span>
+        <span>CommonASM</span>
+      </a>
+      <nav aria-label="Main navigation">
+        <a href="#targets">Targets</a>
+        <a href="#syntax">Syntax</a>
+        <a href="#build">Build</a>
+        <a href="https://ygsmsite.neocities.org/CommonASM">Neocities</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Portable assembly IR</p>
+          <h1>Write one low-level language. Lower it into many assembly worlds.</h1>
+          <p class="lead">
+            CommonASM is a common intermediate assembly for language builders who do
+            not want to write a separate backend by hand for every CPU, VM, toy
+            machine, or esoteric target.
+          </p>
+          <div class="hero-actions" aria-label="Primary actions">
+            <a class="button primary" href="#build">Build the compiler</a>
+            <a class="button secondary" href="#syntax">See the language</a>
+          </div>
+        </div>
+
+        <div class="terminal-art" aria-label="CommonASM lowering diagram">
+          <div class="terminal-bar">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <pre><code>your language
+  -> CommonASM
+     -> x86_64-nasm
+     -> riscv64-gnu
+     -> wasm
+     -> llvm-ir
+     -> mips32-gnu
+     -> brainfuck</code></pre>
+        </div>
+      </section>
+
+      <section class="summary-band" aria-label="Project summary">
+        <div>
+          <strong>Primary backends</strong>
+          <span>x86_64 NASM and RISC-V GNU assembly.</span>
+        </div>
+        <div>
+          <strong>Experimental backends</strong>
+          <span>MIPS, PowerPC, SPARC, m68k, eBPF, Wasm, LLVM IR, and more.</span>
+        </div>
+        <div>
+          <strong>Toy and encoding backends</strong>
+          <span>CHIP-8, SUBLEQ, Brainfuck, FRACTRAN, Rule 110, and friends.</span>
+        </div>
+      </section>
+
+      <section class="section" id="targets">
+        <div class="section-heading">
+          <p class="eyebrow">Target strategy</p>
+          <h2>Three support levels keep the promise honest.</h2>
+        </div>
+        <div class="target-grid">
+          <article class="target-card primary-card">
+            <h3>Primary</h3>
+            <p>
+              These targets are the reference outputs for the portable IR design.
+              They are the first place to verify new CommonASM instructions.
+            </p>
+            <ul>
+              <li><code>x86_64-nasm</code></li>
+              <li><code>riscv64-gnu</code></li>
+            </ul>
+          </article>
+          <article class="target-card">
+            <h3>Experimental assembly and IR</h3>
+            <p>
+              These outputs use real assembly or familiar IR style where possible,
+              while staying inside the CommonASM portable subset.
+            </p>
+            <ul>
+              <li><code>i386-nasm</code>, <code>aarch64-gnu</code>, <code>rv32i-gnu</code></li>
+              <li><code>mips32-gnu</code>, <code>ppcg4-gnu</code>, <code>sparcv9-gnu</code></li>
+              <li><code>m68k</code>, <code>avr</code>, <code>ebpf</code>, <code>wasm</code>, <code>llvm-ir</code></li>
+            </ul>
+          </article>
+          <article class="target-card">
+            <h3>Encoding and pseudo targets</h3>
+            <p>
+              Machines with very different memory models, tiny register sets, or
+              esoteric semantics use readable pseudo assembly or source encodings.
+            </p>
+            <ul>
+              <li><code>chip8</code>, <code>subleq</code>, <code>redcode</code></li>
+              <li><code>brainfuck</code>, <code>fractran</code>, <code>cellular-automaton</code></li>
+              <li><code>pdp11</code>, <code>vax</code>, <code>mix</code>, <code>lc3</code></li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section split" id="syntax">
+        <div class="section-heading">
+          <p class="eyebrow">Language shape</p>
+          <h2>A small assembly vocabulary for compiler backends.</h2>
+          <p>
+            CommonASM has sections, constants, data declarations, virtual registers,
+            typed memory access, arithmetic, branches, function helpers, stack
+            operations, and Linux-style syscall helpers for targets that can lower them.
+          </p>
+        </div>
+        <div class="code-panel">
+          <div class="panel-label">examples/hello.cas</div>
+          <pre><code>const stdout = 1
+
+.data
+msg: string "Hello from CommonASM\n"
+
+.text
+global _start
+
+_start:
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0</code></pre>
+        </div>
+      </section>
+
+      <section class="section flow" id="build">
+        <div class="section-heading">
+          <p class="eyebrow">Build and compile</p>
+          <h2>The C AOT compiler is the reference implementation.</h2>
+        </div>
+        <div class="steps">
+          <article>
+            <span class="step-number">1</span>
+            <h3>Build</h3>
+            <pre><code>gcc csrc/commonasmc.c -o build/commonasmc.exe</code></pre>
+          </article>
+          <article>
+            <span class="step-number">2</span>
+            <h3>Compile to a primary target</h3>
+            <pre><code>build/commonasmc.exe examples/hello.cas \
+  --target x86_64-nasm \
+  -o build/hello_x86.asm</code></pre>
+          </article>
+          <article>
+            <span class="step-number">3</span>
+            <h3>Try an experimental target</h3>
+            <pre><code>build/commonasmc.exe examples/vm_ir.cas \
+  --target wasm \
+  -o build/hello.wat</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="section diagnostics">
+        <div class="section-heading">
+          <p class="eyebrow">Developer ergonomics</p>
+          <h2>Compiler errors point at the token that broke the build.</h2>
+        </div>
+        <div class="diagnostic-output" role="img" aria-label="Colored compiler diagnostic example">
+          <pre><code>error: line 8: load: invalid destination register
+  8 |   load.q r99, [msg]
+                ^^^
+      token: r99</code></pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>CommonASM</span>
+      <span>Static GitHub Pages site in <code>docs/</code>.</span>
+    </footer>
+  </body>
+</html>
