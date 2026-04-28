@@ -1,0 +1,30 @@
+const stdout = 1
+
+.rodata
+msg: string "architecture target\n"
+
+.data
+slot: qword 0
+
+.text
+global _start
+
+func compute
+  enter 0
+  mov r0, 40
+  add r0, 2
+  store.q [slot], r0
+  load.q r1, [slot]
+  leave
+  ret
+endfunc
+
+_start:
+  call compute
+  cmp r1, 42
+  je ok
+  syscall exit, 1
+
+ok:
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0

@@ -1,8 +1,20 @@
 module compiler
 
 type Target =
+  I386Nasm
   X86_64Nasm
   Riscv64Gnu
+  Rv32iGnu
+  Rv64iGnu
+  Rv128iGnu
+  Armv4Gnu
+  Armv5Gnu
+  Armv7aGnu
+  Aarch64Gnu
+  ThumbGnu
+  Thumb2Gnu
+  Ia64Gnu
+  Loongarch64Gnu
   Mmixal
   Dcpu16
   Fractran
@@ -56,11 +68,47 @@ fn main(args: array<string>) -> int {
 }
 
 fn parse_target(name: string) -> Target {
+  if name == "i386-nasm" or name == "ia32-nasm" {
+    return I386Nasm
+  }
   if name == "x86_64-nasm" {
     return X86_64Nasm
   }
   if name == "riscv64-gnu" {
     return Riscv64Gnu
+  }
+  if name == "rv32i-gnu" {
+    return Rv32iGnu
+  }
+  if name == "rv64i-gnu" {
+    return Rv64iGnu
+  }
+  if name == "rv128i-gnu" {
+    return Rv128iGnu
+  }
+  if name == "armv4-gnu" {
+    return Armv4Gnu
+  }
+  if name == "armv5-gnu" {
+    return Armv5Gnu
+  }
+  if name == "armv7a-gnu" {
+    return Armv7aGnu
+  }
+  if name == "aarch64-gnu" {
+    return Aarch64Gnu
+  }
+  if name == "thumb-gnu" {
+    return ThumbGnu
+  }
+  if name == "thumb2-gnu" {
+    return Thumb2Gnu
+  }
+  if name == "ia64-gnu" {
+    return Ia64Gnu
+  }
+  if name == "loongarch64-gnu" {
+    return Loongarch64Gnu
   }
   if name == "mmixal" {
     return Mmixal

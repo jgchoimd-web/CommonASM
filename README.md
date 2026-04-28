@@ -10,16 +10,30 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 
 ## Supported targets
 
+- `i386-nasm`: IA-32 / 32-bit x86 NASM-style output
 - `x86_64-nasm`: Linux x86-64, NASM syntax
+- `armv4-gnu`: experimental ARMv4 GNU-style output
+- `armv5-gnu`: experimental ARMv5 GNU-style output
+- `armv7a-gnu`: experimental ARMv7-A GNU-style output
+- `aarch64-gnu`: experimental ARMv8-A / AArch64 GNU-style output
+- `thumb-gnu`: experimental Cortex-M Thumb-style output
+- `thumb2-gnu`: experimental Cortex-M Thumb-2-style output
+- `rv32i-gnu`: experimental RV32I GNU-style output
+- `rv64i-gnu`: RV64I alias for the RISC-V 64 backend
 - `riscv64-gnu`: Linux RISC-V 64, GNU assembler syntax
+- `rv128i-gnu`: experimental RV128I-style output
+- `ia64-gnu`: experimental Itanium / IA-64-style output
+- `loongarch64-gnu`: experimental LoongArch64 GNU-style output
 - `mmixal`: experimental MMIXAL-style output
 - `dcpu16`: experimental DCPU-16-style output
 - `fractran`: experimental FRACTRAN source-encoding output
 - `cellular-automaton`: experimental Rule 110 seed output
 
-MMIX and DCPU-16 are real assembly backends for the portable subset. FRACTRAN and
-Cellular Automaton targets encode the CommonASM source as esolang artifacts rather
-than modeling Linux syscalls or random-access machine memory directly.
+The x86-64 and RISC-V 64 backends are the primary maintained backends. IA-32,
+ARM, AArch64, RV32/RV128, IA-64, LoongArch, MMIX, and DCPU-16 are experimental
+assembly-style outputs for the portable subset. FRACTRAN and Cellular Automaton
+targets encode the CommonASM source as esolang artifacts rather than modeling
+Linux syscalls or random-access machine memory directly.
 DCPU-16 directly maps `r0` through `r7`; wider virtual registers are kept for the
 other targets.
 
@@ -50,7 +64,10 @@ Compile it:
 ```powershell
 gcc csrc/commonasmc.c -o build/commonasmc.exe
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
+build/commonasmc.exe examples/hello.cas --target i386-nasm -o build/hello_i386.asm
 build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
+build/commonasmc.exe examples/hello.cas --target aarch64-gnu -o build/hello_aarch64.s
+build/commonasmc.exe examples/hello.cas --target armv7a-gnu -o build/hello_armv7.s
 build/commonasmc.exe examples/hello.cas --target mmixal -o build/hello_mmix.mms
 build/commonasmc.exe examples/hello.cas --target dcpu16 -o build/hello_dcpu.dasm
 build/commonasmc.exe examples/hello.cas --target fractran -o build/hello.fractran
