@@ -2,6 +2,8 @@
 
 CommonASM is a portable assembly IR that compiles into real assembly dialects.
 
+Curious about CommonASM? Go to https://ygsmsite.neocities.org/CommonASM
+
 It is meant as a middle layer for a future programming language compiler:
 
 ```text
