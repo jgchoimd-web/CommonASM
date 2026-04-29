@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define COMMONASM_VERSION "0.1.0-dev"
+
 typedef struct {
     char *data;
     size_t len;
@@ -121,6 +123,7 @@ static const char *usage_text =
     "usage: commonasmc input.cas|- --target TARGET [-o output|-]\n"
     "       commonasmc --list-targets\n"
     "       commonasmc --target-info TARGET\n"
+    "       commonasmc --version\n"
     "       commonasmc --help";
 
 static void die(const char *message) {
@@ -1748,6 +1751,11 @@ int main(int argc, char **argv) {
         puts(usage_text);
         puts("\nUse --list-targets to print every supported target.");
         puts("Use --target-info TARGET to inspect one target.");
+        puts("Use --version to print the compiler version.");
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        puts("commonasmc " COMMONASM_VERSION);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--list-targets") == 0) {

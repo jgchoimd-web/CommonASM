@@ -69,17 +69,21 @@ Invoke-Native $Compiler @(
 )
 
 $HelpPath = Join-Path $BuildPath "help-pwsh.txt"
+$VersionPath = Join-Path $BuildPath "version-pwsh.txt"
 $TargetsPath = Join-Path $BuildPath "targets-pwsh.txt"
 $WasmInfoPath = Join-Path $BuildPath "wasm-info-pwsh.txt"
 $BrainfuckInfoPath = Join-Path $BuildPath "brainfuck-info-pwsh.txt"
 
 Invoke-NativeToFile $HelpPath $CompilerExe @("--help")
+Invoke-NativeToFile $VersionPath $CompilerExe @("--version")
 Invoke-NativeToFile $TargetsPath $CompilerExe @("--list-targets")
 Invoke-NativeToFile $WasmInfoPath $CompilerExe @("--target-info", "wasm")
 Invoke-NativeToFile $BrainfuckInfoPath $CompilerExe @("--target-info", "brainfuck")
 
 Assert-Contains $HelpPath "commonasmc --list-targets"
 Assert-Contains $HelpPath "commonasmc --target-info TARGET"
+Assert-Contains $HelpPath "commonasmc --version"
+Assert-Contains $VersionPath "commonasmc 0.1.0-dev"
 Assert-Contains $TargetsPath "x86_64-nasm"
 Assert-Contains $TargetsPath "riscv64-gnu"
 Assert-Contains $TargetsPath "brainfuck"

@@ -64,6 +64,7 @@ Local shortcuts:
 
 ```sh
 make build
+make version
 make smoke
 make examples
 ```
@@ -102,6 +103,7 @@ Compile it:
 
 ```powershell
 gcc csrc/commonasmc.c -o build/commonasmc.exe
+build/commonasmc.exe --version
 build/commonasmc.exe --help
 build/commonasmc.exe --list-targets
 build/commonasmc.exe --target-info wasm
@@ -200,6 +202,7 @@ Virtual registers are `r0` through `r15`. Each backend maps them to native regis
 
 ## CLI helpers
 
+- `commonasmc --version`: print the compiler version.
 - `commonasmc --help`: print command usage.
 - `commonasmc --list-targets`: print every supported target grouped by support
   style.

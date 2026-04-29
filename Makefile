@@ -4,11 +4,12 @@ BUILD_DIR ?= build
 COMMONASMC ?= $(BUILD_DIR)/commonasmc
 POWERSHELL ?= pwsh
 
-.PHONY: help build smoke smoke-sh smoke-ps examples clean
+.PHONY: help build version smoke smoke-sh smoke-ps examples clean
 
 help:
 	@echo "CommonASM developer targets:"
 	@echo "  make build      Build the C AOT compiler"
+	@echo "  make version    Print the compiler version"
 	@echo "  make smoke      Run the POSIX smoke test suite"
 	@echo "  make smoke-sh   Run scripts/smoke-test.sh"
 	@echo "  make smoke-ps   Run scripts/smoke-test.ps1 with PowerShell"
@@ -18,6 +19,9 @@ help:
 build:
 	mkdir -p "$(BUILD_DIR)"
 	$(CC) $(CFLAGS) csrc/commonasmc.c -o "$(COMMONASMC)"
+
+version: build
+	"$(COMMONASMC)" --version
 
 smoke: smoke-sh
 

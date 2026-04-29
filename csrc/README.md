@@ -31,6 +31,7 @@ Use:
 
 ```powershell
 build/commonasmc.exe --help
+build/commonasmc.exe --version
 build/commonasmc.exe --list-targets
 build/commonasmc.exe --target-info wasm
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_from_c.asm
