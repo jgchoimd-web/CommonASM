@@ -24,13 +24,19 @@ Run the smoke test suite on systems with a POSIX shell:
 sh scripts/smoke-test.sh
 ```
 
+On Windows PowerShell or PowerShell Core:
+
+```powershell
+.\scripts\smoke-test.ps1
+```
+
 If a C compiler is not available, still run:
 
 ```powershell
 git diff --check
 ```
 
-GitHub Actions runs `scripts/smoke-test.sh` on every push and pull request:
+GitHub Actions runs both smoke test scripts on every push and pull request:
 
 - Build `csrc/commonasmc.c` with `gcc`.
 - Check CLI help, target listing, and target metadata.

@@ -18,5 +18,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Run smoke tests
+      - name: Run POSIX smoke tests
         run: sh scripts/smoke-test.sh
+
+      - name: Run PowerShell smoke tests
+        shell: pwsh
+        run: ./scripts/smoke-test.ps1 -BuildDir build-pwsh

@@ -16,6 +16,7 @@
 
 - [ ] CI passes
 - [ ] Ran `sh scripts/smoke-test.sh` when a POSIX shell and C compiler were available
+- [ ] Ran `.\scripts\smoke-test.ps1` when PowerShell and a C compiler were available
 - [ ] Built `csrc/commonasmc.c`
 - [ ] Ran `git diff --check`
 - [ ] Added or updated examples

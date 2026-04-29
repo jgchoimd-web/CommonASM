@@ -14,6 +14,12 @@ Run smoke tests on systems with a POSIX shell:
 sh scripts/smoke-test.sh
 ```
 
+Or with PowerShell:
+
+```powershell
+.\scripts\smoke-test.ps1
+```
+
 Use:
 
 ```powershell

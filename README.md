@@ -54,10 +54,11 @@ highlighted token when compilation fails.
 
 ## CI
 
-GitHub Actions runs `scripts/smoke-test.sh`. The smoke test builds
-`csrc/commonasmc.c`, checks CLI helpers, compiles every example for the primary
-targets, compiles representative experimental targets, checks stdin/stdout
-piping, and verifies that diagnostics highlight invalid source tokens.
+GitHub Actions runs both `scripts/smoke-test.sh` and
+`scripts/smoke-test.ps1`. The smoke tests build `csrc/commonasmc.c`, check CLI
+helpers, compile every example for the primary targets, compile representative
+experimental targets, check stdin/stdout piping, and verify that diagnostics
+highlight invalid source tokens.
 
 ## GitHub Pages site
 
