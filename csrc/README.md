@@ -8,10 +8,17 @@ Build:
 gcc csrc/commonasmc.c -o build/commonasmc.exe
 ```
 
+With `make`:
+
+```sh
+make build
+```
+
 Run smoke tests on systems with a POSIX shell:
 
 ```sh
 sh scripts/smoke-test.sh
+make smoke
 ```
 
 Or with PowerShell:

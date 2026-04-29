@@ -11,6 +11,13 @@ Build the reference C AOT compiler:
 gcc csrc/commonasmc.c -o build/commonasmc.exe
 ```
 
+On systems with `make`:
+
+```sh
+make build
+make examples
+```
+
 Compile an example:
 
 ```powershell
@@ -22,6 +29,7 @@ Run the smoke test suite on systems with a POSIX shell:
 
 ```sh
 sh scripts/smoke-test.sh
+make smoke
 ```
 
 On Windows PowerShell or PowerShell Core:

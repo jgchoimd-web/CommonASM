@@ -60,6 +60,14 @@ helpers, compile every example for the primary targets, compile representative
 experimental targets, check stdin/stdout piping, and verify that diagnostics
 highlight invalid source tokens.
 
+Local shortcuts:
+
+```sh
+make build
+make smoke
+make examples
+```
+
 ## GitHub Pages site
 
 This repository includes a static project site in `docs/`. In GitHub Pages,
