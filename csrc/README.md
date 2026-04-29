@@ -13,6 +13,7 @@ Use:
 ```powershell
 build/commonasmc.exe --help
 build/commonasmc.exe --list-targets
+build/commonasmc.exe --target-info wasm
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_from_c.asm
 Get-Content examples/hello.cas | build/commonasmc.exe - --target wasm -o -
 build/commonasmc.exe examples/hello.cas --target i386-nasm -o build/hello_i386.asm
@@ -37,6 +38,8 @@ source-encoding or pseudo-assembly outputs.
 
 Use `--list-targets` to print the supported targets from the compiler itself.
 This keeps the CLI usable even as the backend list grows.
+Use `--target-info TARGET` to inspect one target's support level and output
+style.
 Use input `-` or output `-` for shell pipelines.
 
 Compile errors use ANSI terminal colors to show the exact source line, column,

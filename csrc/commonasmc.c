@@ -106,6 +106,12 @@ static const char *toy_targets[] = {
     "secd", "pcode", "zmachine", "sweet16", "befunge", "bitblt-vm",
     "turing-machine", "unlambda", NULL
 };
+static const char *special_asm_targets[] = {
+    "mmixal", "dcpu16", NULL
+};
+static const char *source_encoding_targets[] = {
+    "fractran", "cellular-automaton", NULL
+};
 static char known_constants[256][64];
 static int known_constant_count = 0;
 static char **diagnostic_lines = NULL;
@@ -114,6 +120,7 @@ static const char *diagnostic_path = NULL;
 static const char *usage_text =
     "usage: commonasmc input.cas|- --target TARGET [-o output|-]\n"
     "       commonasmc --list-targets\n"
+    "       commonasmc --target-info TARGET\n"
     "       commonasmc --help";
 
 static void die(const char *message) {
@@ -457,10 +464,8 @@ static bool is_supported_target(const char *target) {
            is_legacy_arch_target(target) ||
            is_vm_ir_target(target) ||
            is_toy_target(target) ||
-           strcmp(target, "mmixal") == 0 ||
-           strcmp(target, "dcpu16") == 0 ||
-           strcmp(target, "fractran") == 0 ||
-           strcmp(target, "cellular-automaton") == 0;
+           target_in_list(target, special_asm_targets) ||
+           target_in_list(target, source_encoding_targets);
 }
 
 static void print_target_group(const char *title, const char *const *targets) {
@@ -479,11 +484,60 @@ static void print_target_list(void) {
     print_target_group("Experimental assembly/IR", legacy_arch_targets);
     print_target_group("VM/IR", vm_ir_targets);
     print_target_group("Encoding/pseudo", toy_targets);
-    puts("Extra encoding targets:");
-    puts("  mmixal");
-    puts("  dcpu16");
-    puts("  fractran");
-    puts("  cellular-automaton");
+    print_target_group("Special assembly", special_asm_targets);
+    print_target_group("Source encoding", source_encoding_targets);
+}
+
+static const char *target_support_level(const char *target) {
+    if (target_in_list(target, primary_targets)) return "Primary";
+    if (is_i386_target(target) || is_generic_arch_target(target) ||
+        is_legacy_arch_target(target) || target_in_list(target, special_asm_targets)) {
+        return "Experimental assembly/IR";
+    }
+    if (is_vm_ir_target(target)) return "VM/IR";
+    if (is_toy_target(target) || target_in_list(target, source_encoding_targets)) return "Encoding/pseudo";
+    return "Unknown";
+}
+
+static const char *target_output_kind(const char *target) {
+    if (strcmp(target, "x86_64-nasm") == 0) return "NASM x86-64 assembly";
+    if (is_rv64_target(target)) return "GNU RISC-V 64 assembly";
+    if (is_i386_target(target)) return "NASM i386 assembly";
+    if (is_generic_arch_target(target) || is_legacy_arch_target(target)) return "assembly-style text output";
+    if (is_vm_ir_target(target)) return "VM or compiler IR-style text output";
+    if (strcmp(target, "mmixal") == 0) return "MMIXAL assembly-style output";
+    if (strcmp(target, "dcpu16") == 0) return "DCPU-16 assembly-style output";
+    if (is_toy_target(target)) return "pseudo assembly or toy-machine text output";
+    if (target_in_list(target, source_encoding_targets)) return "source encoding output";
+    return "unknown output";
+}
+
+static const char *target_portability_note(const char *target) {
+    if (target_in_list(target, primary_targets)) {
+        return "Reference backend for CommonASM portable semantics.";
+    }
+    if (is_i386_target(target) || is_generic_arch_target(target) ||
+        is_legacy_arch_target(target) || target_in_list(target, special_asm_targets)) {
+        return "Portable subset output; not a complete ABI-level port.";
+    }
+    if (is_vm_ir_target(target)) {
+        return "Portable subset represented as readable VM/IR text.";
+    }
+    if (is_toy_target(target) || target_in_list(target, source_encoding_targets)) {
+        return "Experimental pseudo or encoding output for very different machine models.";
+    }
+    return "Unknown target.";
+}
+
+static void print_target_info(const char *target) {
+    if (!is_supported_target(target)) {
+        fprintf(stderr, "commonasmc: error: unknown target '%s'; run commonasmc --list-targets\n", target);
+        exit(1);
+    }
+    printf("target: %s\n", target);
+    printf("support: %s\n", target_support_level(target));
+    printf("output: %s\n", target_output_kind(target));
+    printf("note: %s\n", target_portability_note(target));
 }
 
 static void remember_constant(const char *name) {
@@ -1693,10 +1747,15 @@ int main(int argc, char **argv) {
     if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         puts(usage_text);
         puts("\nUse --list-targets to print every supported target.");
+        puts("Use --target-info TARGET to inspect one target.");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--list-targets") == 0) {
         print_target_list();
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "--target-info") == 0) {
+        print_target_info(argv[2]);
         return 0;
     }
     for (int i = 1; i < argc; i++) {

@@ -28,17 +28,28 @@ jobs:
           set -eu
           ./build/commonasmc --help > build/help.txt
           ./build/commonasmc --list-targets > build/targets.txt
+          ./build/commonasmc --target-info wasm > build/wasm-info.txt
+          ./build/commonasmc --target-info brainfuck > build/brainfuck-info.txt
           grep -q "commonasmc --list-targets" build/help.txt
+          grep -q "commonasmc --target-info TARGET" build/help.txt
           grep -q "x86_64-nasm" build/targets.txt
           grep -q "riscv64-gnu" build/targets.txt
           grep -q "brainfuck" build/targets.txt
           grep -q "cellular-automaton" build/targets.txt
+          grep -q "support: VM/IR" build/wasm-info.txt
+          grep -q "support: Encoding/pseudo" build/brainfuck-info.txt
 
           if ./build/commonasmc examples/hello.cas --target no-such-target -o build/nope.out 2> build/unknown-target.txt; then
             echo "expected unknown target to fail"
             exit 1
           fi
           grep -q "unknown target" build/unknown-target.txt
+
+          if ./build/commonasmc --target-info no-such-target 2> build/unknown-info.txt; then
+            echo "expected unknown target info to fail"
+            exit 1
+          fi
+          grep -q "unknown target" build/unknown-info.txt
 
       - name: Check stdin and stdout piping
         run: |
