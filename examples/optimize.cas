@@ -1,0 +1,16 @@
+.text
+global _start
+
+_start:
+  mov r0, 2
+  add r0, 40
+  add r0, 0
+  mov r1, r1
+  xor r2, r2
+  mul r3, 1
+  cmp r0, 42
+  je success
+  syscall exit, 1
+
+success:
+  syscall exit, 0

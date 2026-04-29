@@ -83,6 +83,7 @@ Invoke-NativeToFile $BrainfuckInfoPath $CompilerExe @("--target-info", "brainfuc
 Assert-Contains $HelpPath "commonasmc --list-targets"
 Assert-Contains $HelpPath "commonasmc --target-info TARGET"
 Assert-Contains $HelpPath "commonasmc --version"
+Assert-Contains $HelpPath "-O1"
 Assert-Contains $VersionPath "commonasmc 0.1.0-dev"
 Assert-Contains $TargetsPath "x86_64-nasm"
 Assert-Contains $TargetsPath "riscv64-gnu"
@@ -131,6 +132,34 @@ $ControlRvPath = Join-Path $BuildPath "control-riscv64-gnu-pwsh.out"
 Assert-Contains $ControlRvPath "mv a6, t2"
 Assert-Contains $ControlRvPath "li a7, 42"
 Assert-Contains $ControlRvPath "beq a6, a7, success"
+
+$OptimizeO0Path = Join-Path $BuildPath "optimize-O0-pwsh.asm"
+$OptimizeO1Path = Join-Path $BuildPath "optimize-O1-pwsh.asm"
+Invoke-Native $CompilerExe @(
+    (Join-Path $RootDir "examples/optimize.cas"),
+    "--target",
+    "x86_64-nasm",
+    "-O0",
+    "-o",
+    $OptimizeO0Path
+)
+Invoke-Native $CompilerExe @(
+    (Join-Path $RootDir "examples/optimize.cas"),
+    "--target",
+    "x86_64-nasm",
+    "-O1",
+    "-o",
+    $OptimizeO1Path
+)
+Assert-Contains $OptimizeO1Path "mov rbx, 42"
+Assert-Contains $OptimizeO1Path "mov r13, 0"
+Assert-Contains $OptimizeO0Path "add rbx, 0"
+$OptimizeO1Text = Get-Content -Raw -Path $OptimizeO1Path
+foreach ($Needle in @("add rbx, 0", "mov r12, r12", "imul r14, 1")) {
+    if ($OptimizeO1Text.Contains($Needle)) {
+        throw "optimizer left removable instruction in -O1 output: $Needle"
+    }
+}
 
 $RepresentativeTargets = @(
     "i386-nasm",

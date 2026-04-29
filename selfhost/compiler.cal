@@ -48,14 +48,19 @@ fn main(args: array<string>) -> int {
   let input = arg_value(args, 0)
   let target_name = option_value(args, "--target")
   let output = option_value(args, "-o")
+  let opt_level = optimization_level(args)
 
   if input == "" or target_name == "" {
-    print_error("usage: calcc input.cas --target TARGET [-o output]")
+    print_error("usage: calcc input.cas --target TARGET [-o output] [-O0|-O1]")
     return 1
   }
 
   let source = read_file(input)
-  let program = parse_program(source)
+  let parsed_program = parse_program(source)
+  let program = parsed_program
+  if opt_level > 0 {
+    program = optimize_program(program, opt_level)
+  }
   let target = parse_target(target_name)
   let asm = emit_program(program, target)
 
@@ -66,6 +71,42 @@ fn main(args: array<string>) -> int {
   }
 
   return 0
+}
+
+fn optimization_level(args: array<string>) -> int {
+  if has_option(args, "-O") or has_option(args, "-O1") or has_option(args, "--optimize") or has_option(args, "--optimize=1") {
+    return 1
+  }
+  return 0
+}
+
+fn has_option(args: array<string>, name: string) -> bool {
+  let i = 0
+  while i < len(args) {
+    if args[i] == name {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+fn optimize_program(program: Program, level: int) -> Program {
+  if level == 0 {
+    return program
+  }
+  return peephole_optimize_text(program)
+}
+
+fn peephole_optimize_text(program: Program) -> Program {
+  let optimized = Program(constants: program.constants, data: program.data, text: [])
+  let i = 0
+  while i < len(program.text) {
+    let item = program.text[i]
+    push(optimized.text, item)
+    i = i + 1
+  }
+  return optimized
 }
 
 fn parse_target(name: string) -> Target {

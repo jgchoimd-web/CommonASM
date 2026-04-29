@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,7 +121,7 @@ static char **diagnostic_lines = NULL;
 static int diagnostic_line_count = 0;
 static const char *diagnostic_path = NULL;
 static const char *usage_text =
-    "usage: commonasmc input.cas|- --target TARGET [-o output|-]\n"
+    "usage: commonasmc input.cas|- --target TARGET [-o output|-] [-O0|-O1]\n"
     "       commonasmc --list-targets\n"
     "       commonasmc --target-info TARGET\n"
     "       commonasmc --version\n"
@@ -236,6 +237,13 @@ static void *xmalloc(size_t size) {
         die("out of memory");
     }
     return ptr;
+}
+
+static char *xstrdup(const char *text) {
+    size_t len = strlen(text);
+    char *copy = xmalloc(len + 1);
+    memcpy(copy, text, len + 1);
+    return copy;
 }
 
 static void buf_init(Buffer *buf) {
@@ -1605,6 +1613,279 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else line_error(line_no, base_op, "unknown instruction target");
 }
 
+typedef struct {
+    char base_op[64];
+    char args[3][128];
+    int argc;
+    bool label;
+    bool directive;
+} OptInstruction;
+
+typedef struct {
+    bool enabled;
+    bool has_pending;
+    char pending[512];
+    int pending_line_no;
+} Optimizer;
+
+static void emit_text_line_copy(Buffer *text, const char *line, int line_no, const char *target) {
+    char *copy = xstrdup(line);
+    emit_text_line(text, copy, line_no, target);
+    free(copy);
+}
+
+static bool opt_parse_long(const char *text, long *value) {
+    char *end = NULL;
+    errno = 0;
+    *value = strtol(text, &end, 0);
+    return errno == 0 && end && *end == '\0' && end != text;
+}
+
+static bool opt_parse_instruction(const char *line, OptInstruction *out) {
+    char tmp[1024];
+    char *space;
+    char *args[16];
+    char *work;
+    size_t len = strlen(line);
+    memset(out, 0, sizeof(*out));
+    if (len >= sizeof(tmp)) return false;
+    memcpy(tmp, line, len + 1);
+    work = trim(tmp);
+    len = strlen(work);
+    if (len == 0) return false;
+    if (work[len - 1] == ':') {
+        out->label = true;
+        return true;
+    }
+    if (strncmp(work, "global ", 7) == 0 || strncmp(work, "extern ", 7) == 0) {
+        out->directive = true;
+        return true;
+    }
+    space = work;
+    while (*space && !isspace((unsigned char)*space)) space++;
+    if (*space) {
+        *space++ = '\0';
+        out->argc = split_args(space, args, 16);
+    }
+    if (!size_suffix_or_default(work, out->base_op, sizeof(out->base_op))) {
+        return false;
+    }
+    if (out->argc > 3) return false;
+    for (int i = 0; i < out->argc; i++) {
+        if (strlen(args[i]) >= sizeof(out->args[i])) return false;
+        snprintf(out->args[i], sizeof(out->args[i]), "%s", args[i]);
+    }
+    return true;
+}
+
+static bool opt_is_mov_imm(const OptInstruction *ins, char *reg, long *value) {
+    long parsed;
+    if (ins->label || ins->directive || strcmp(ins->base_op, "mov") != 0 || ins->argc != 2) return false;
+    if (virtual_reg_index(ins->args[0]) < 0 || !opt_parse_long(ins->args[1], &parsed)) return false;
+    if (reg) snprintf(reg, 128, "%s", ins->args[0]);
+    if (value) *value = parsed;
+    return true;
+}
+
+static bool opt_set_pending(Optimizer *opt, const char *line, int line_no) {
+    if (strlen(line) >= sizeof(opt->pending)) return false;
+    snprintf(opt->pending, sizeof(opt->pending), "%s", line);
+    opt->pending_line_no = line_no;
+    opt->has_pending = true;
+    return true;
+}
+
+static void opt_flush(Buffer *text, const char *target, Optimizer *opt) {
+    if (!opt->has_pending) return;
+    emit_text_line_copy(text, opt->pending, opt->pending_line_no, target);
+    opt->has_pending = false;
+}
+
+static bool opt_safe_add(long a, long b, long *out) {
+    if ((b > 0 && a > LONG_MAX - b) || (b < 0 && a < LONG_MIN - b)) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool opt_safe_sub(long a, long b, long *out) {
+    if ((b < 0 && a > LONG_MAX + b) || (b > 0 && a < LONG_MIN + b)) return false;
+    *out = a - b;
+    return true;
+}
+
+static bool opt_safe_mul(long a, long b, long *out) {
+    if (a == 0 || b == 0) {
+        *out = 0;
+        return true;
+    }
+    if (a == -1 && b == LONG_MIN) return false;
+    if (b == -1 && a == LONG_MIN) return false;
+    if (a > 0) {
+        if (b > 0 && a > LONG_MAX / b) return false;
+        if (b < 0 && b < LONG_MIN / a) return false;
+    } else {
+        if (b > 0 && a < LONG_MIN / b) return false;
+        if (b < 0 && a < LONG_MAX / b) return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+static bool opt_compute_binary(const char *op, long lhs, long rhs, long *result) {
+    const long bits = (long)(sizeof(long) * CHAR_BIT);
+    if (strcmp(op, "add") == 0) return opt_safe_add(lhs, rhs, result);
+    if (strcmp(op, "sub") == 0) return opt_safe_sub(lhs, rhs, result);
+    if (strcmp(op, "mul") == 0) return opt_safe_mul(lhs, rhs, result);
+    if (strcmp(op, "div") == 0) {
+        if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
+        *result = lhs / rhs;
+        return true;
+    }
+    if (strcmp(op, "mod") == 0) {
+        if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
+        *result = lhs % rhs;
+        return true;
+    }
+    if (strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) {
+        if (lhs < 0 || rhs < 0) return false;
+        if (strcmp(op, "and") == 0) *result = lhs & rhs;
+        else if (strcmp(op, "or") == 0) *result = lhs | rhs;
+        else *result = lhs ^ rhs;
+        return true;
+    }
+    if (strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) {
+        if (lhs < 0 || rhs < 0 || rhs >= bits - 1) return false;
+        if (strcmp(op, "shl") == 0) {
+            if (lhs > (LONG_MAX >> rhs)) return false;
+            *result = lhs << rhs;
+        } else {
+            *result = lhs >> rhs;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_t line_out_size, bool *skip) {
+    long value;
+    int dst;
+    int src;
+    *skip = false;
+    if (ins->label || ins->directive || ins->argc < 1) return false;
+    dst = virtual_reg_index(ins->args[0]);
+    if (dst < 0) return false;
+    if (strcmp(ins->base_op, "mov") == 0 && ins->argc == 2) {
+        src = virtual_reg_index(ins->args[1]);
+        if (src == dst) {
+            *skip = true;
+            return true;
+        }
+        return false;
+    }
+    if (ins->argc != 2) return false;
+    src = virtual_reg_index(ins->args[1]);
+    if (src == dst) {
+        if (strcmp(ins->base_op, "or") == 0 || strcmp(ins->base_op, "and") == 0) {
+            *skip = true;
+            return true;
+        }
+        if (strcmp(ins->base_op, "sub") == 0 || strcmp(ins->base_op, "xor") == 0) {
+            snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
+            return true;
+        }
+    }
+    if (!opt_parse_long(ins->args[1], &value)) return false;
+    if ((strcmp(ins->base_op, "add") == 0 || strcmp(ins->base_op, "sub") == 0 ||
+         strcmp(ins->base_op, "or") == 0 || strcmp(ins->base_op, "xor") == 0 ||
+         strcmp(ins->base_op, "shl") == 0 || strcmp(ins->base_op, "shr") == 0 ||
+         strcmp(ins->base_op, "sar") == 0) && value == 0) {
+        *skip = true;
+        return true;
+    }
+    if ((strcmp(ins->base_op, "mul") == 0 || strcmp(ins->base_op, "div") == 0) && value == 1) {
+        *skip = true;
+        return true;
+    }
+    if (strcmp(ins->base_op, "and") == 0 && value == -1) {
+        *skip = true;
+        return true;
+    }
+    if ((strcmp(ins->base_op, "and") == 0 || strcmp(ins->base_op, "mul") == 0) && value == 0) {
+        snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
+        return true;
+    }
+    if (strcmp(ins->base_op, "mod") == 0 && value == 1) {
+        snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
+        return true;
+    }
+    return false;
+}
+
+static bool opt_try_absorb_pending(Optimizer *opt, const OptInstruction *current, const char *current_line, int line_no) {
+    OptInstruction pending;
+    char pending_reg[128];
+    char current_reg[128];
+    long lhs;
+    long rhs;
+    long result;
+    if (!opt->has_pending || !opt_parse_instruction(opt->pending, &pending)) return false;
+    if (!opt_is_mov_imm(&pending, pending_reg, &lhs)) return false;
+    if (opt_is_mov_imm(current, current_reg, NULL) && strcmp(pending_reg, current_reg) == 0) {
+        return opt_set_pending(opt, current_line, line_no);
+    }
+    if (current->label || current->directive || current->argc != 2) return false;
+    if (strcmp(current->args[0], pending_reg) != 0 || !opt_parse_long(current->args[1], &rhs)) return false;
+    if (!opt_compute_binary(current->base_op, lhs, rhs, &result)) return false;
+    snprintf(opt->pending, sizeof(opt->pending), "mov %s, %ld", pending_reg, result);
+    opt->pending_line_no = line_no;
+    return true;
+}
+
+static void emit_text_line_optimized(Buffer *text, const char *line, int line_no, const char *target, Optimizer *opt) {
+    OptInstruction parsed;
+    OptInstruction current;
+    char rewritten[512];
+    const char *candidate = line;
+    bool skip = false;
+    if (!opt->enabled) {
+        emit_text_line_copy(text, line, line_no, target);
+        return;
+    }
+    if (!opt_parse_instruction(line, &parsed)) {
+        opt_flush(text, target, opt);
+        emit_text_line_copy(text, line, line_no, target);
+        return;
+    }
+    if (parsed.label || parsed.directive) {
+        opt_flush(text, target, opt);
+        emit_text_line_copy(text, line, line_no, target);
+        return;
+    }
+    if (opt_rewrite_current(&parsed, rewritten, sizeof(rewritten), &skip)) {
+        if (skip) return;
+        candidate = rewritten;
+        if (!opt_parse_instruction(candidate, &current)) {
+            opt_flush(text, target, opt);
+            emit_text_line_copy(text, candidate, line_no, target);
+            return;
+        }
+    } else {
+        current = parsed;
+    }
+    if (opt_try_absorb_pending(opt, &current, candidate, line_no)) {
+        return;
+    }
+    if (opt_is_mov_imm(&current, NULL, NULL)) {
+        opt_flush(text, target, opt);
+        if (!opt_set_pending(opt, candidate, line_no)) {
+            emit_text_line_copy(text, candidate, line_no, target);
+        }
+        return;
+    }
+    opt_flush(text, target, opt);
+    emit_text_line_copy(text, candidate, line_no, target);
+}
+
 static Buffer compile_encoded_esolang(const char *source, const char *target) {
     Buffer out;
     buf_init(&out);
@@ -1636,8 +1917,9 @@ static Buffer compile_encoded_esolang(const char *source, const char *target) {
     return out;
 }
 
-static Buffer compile_source(char *source, const char *target) {
+static Buffer compile_source(char *source, const char *target, int opt_level) {
     Buffer constants, data, rodata, bss, text, out;
+    Optimizer optimizer;
     char *cursor = source;
     const char *section = NULL;
     int line_no = 0;
@@ -1650,6 +1932,10 @@ static Buffer compile_source(char *source, const char *target) {
     if (strcmp(target, "fractran") == 0 || strcmp(target, "cellular-automaton") == 0) {
         return compile_encoded_esolang(source, target);
     }
+    optimizer.enabled = opt_level > 0;
+    optimizer.has_pending = false;
+    optimizer.pending[0] = '\0';
+    optimizer.pending_line_no = 0;
     buf_init(&constants); buf_init(&data); buf_init(&rodata); buf_init(&bss); buf_init(&text);
     while (*cursor) {
         char *line = cursor;
@@ -1661,6 +1947,7 @@ static Buffer compile_source(char *source, const char *target) {
         line = trim(line);
         if (*line == '\0') continue;
         if (strcmp(line, ".data") == 0 || strcmp(line, ".rodata") == 0 || strcmp(line, ".bss") == 0 || strcmp(line, ".text") == 0) {
+            opt_flush(&text, target, &optimizer);
             section = line + 1;
             continue;
         }
@@ -1682,15 +1969,16 @@ static Buffer compile_source(char *source, const char *target) {
             continue;
         }
         if (strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0) {
-            emit_text_line(&text, line, line_no, target);
+            emit_text_line_optimized(&text, line, line_no, target, &optimizer);
             continue;
         }
         if (!section) line_error(line_no, "section", "expected .data, .rodata, .bss, or .text");
         if (strcmp(section, "data") == 0) emit_data_line(&data, &constants, line, line_no, target, section);
         else if (strcmp(section, "rodata") == 0) emit_data_line(&rodata, &constants, line, line_no, target, section);
         else if (strcmp(section, "bss") == 0) emit_data_line(&bss, &constants, line, line_no, target, section);
-        else emit_text_line(&text, line, line_no, target);
+        else emit_text_line_optimized(&text, line, line_no, target, &optimizer);
     }
+    opt_flush(&text, target, &optimizer);
     buf_init(&out);
     if (x86 || i386) {
         if (x86) buf_append(&out, "default rel\n");
@@ -1744,6 +2032,7 @@ int main(int argc, char **argv) {
     const char *input = NULL;
     const char *target = NULL;
     const char *output = NULL;
+    int opt_level = 0;
     char *source;
     Buffer compiled;
     if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
@@ -1751,6 +2040,7 @@ int main(int argc, char **argv) {
         puts("\nUse --list-targets to print every supported target.");
         puts("Use --target-info TARGET to inspect one target.");
         puts("Use --version to print the compiler version.");
+        puts("Use -O1, -O, or --optimize to enable peephole code optimization.");
         return 0;
     }
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -1768,6 +2058,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) target = argv[++i];
         else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) output = argv[++i];
+        else if (strcmp(argv[i], "-O0") == 0 || strcmp(argv[i], "--no-optimize") == 0) opt_level = 0;
+        else if (strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "--optimize") == 0 || strcmp(argv[i], "--optimize=1") == 0) opt_level = 1;
+        else if (strcmp(argv[i], "--optimize=0") == 0) opt_level = 0;
+        else if (strncmp(argv[i], "-O", 2) == 0 || strncmp(argv[i], "--optimize=", 11) == 0) die("unsupported optimization level; use -O0 or -O1");
         else if (!input) input = argv[i];
         else die(usage_text);
     }
@@ -1775,7 +2069,7 @@ int main(int argc, char **argv) {
     if (!is_supported_target(target)) die("unknown target; run commonasmc --list-targets");
     source = read_file(input);
     set_diagnostic_source(strcmp(input, "-") == 0 ? "<stdin>" : input, source);
-    compiled = compile_source(source, target);
+    compiled = compile_source(source, target, opt_level);
     write_file_or_stdout(output, &compiled);
     free(source);
     free(compiled.data);

@@ -58,7 +58,8 @@ GitHub Actions runs both `scripts/smoke-test.sh` and
 `scripts/smoke-test.ps1`. The smoke tests build `csrc/commonasmc.c`, check CLI
 helpers, compile every example for the primary targets, compile representative
 experimental targets, check stdin/stdout piping, and verify that diagnostics
-highlight invalid source tokens.
+highlight invalid source tokens. They also check that `-O1` removes simple
+no-op instructions and folds adjacent constant arithmetic.
 
 Local shortcuts:
 
@@ -108,6 +109,7 @@ build/commonasmc.exe --help
 build/commonasmc.exe --list-targets
 build/commonasmc.exe --target-info wasm
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
+build/commonasmc.exe examples/optimize.cas --target x86_64-nasm -O1 -o build/optimize_x86.asm
 Get-Content examples/hello.cas | build/commonasmc.exe - --target wasm -o -
 build/commonasmc.exe examples/hello.cas --target i386-nasm -o build/hello_i386.asm
 build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
@@ -204,6 +206,10 @@ conditional jump. Signed jumps use `jg`/`jl`/`jge`/`jle`; unsigned jumps use
 
 ## CLI helpers
 
+- `commonasmc input.cas --target x86_64-nasm -O1`: enable peephole
+  optimization. `-O1` removes no-op arithmetic, folds adjacent
+  `mov immediate` + integer operations, and drops overwritten pending
+  immediates. `-O0` is the default.
 - `commonasmc --version`: print the compiler version.
 - `commonasmc --help`: print command usage.
 - `commonasmc --list-targets`: print every supported target grouped by support

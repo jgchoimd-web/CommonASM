@@ -166,7 +166,12 @@ build/commonasmc.exe --target-info wasm</code></pre>
             <h3>Compile to a primary target</h3>
             <pre><code>build/commonasmc.exe examples/hello.cas \
   --target x86_64-nasm \
-  -o build/hello_x86.asm</code></pre>
+  -o build/hello_x86.asm
+
+build/commonasmc.exe examples/optimize.cas \
+  --target x86_64-nasm \
+  -O1 \
+  -o build/optimize_x86.asm</code></pre>
           </article>
           <article>
             <span class="step-number">4</span>

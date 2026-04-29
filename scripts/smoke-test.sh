@@ -20,6 +20,7 @@ mkdir -p "$BUILD_DIR"
 grep -q "commonasmc --list-targets" "$BUILD_DIR/help.txt"
 grep -q "commonasmc --target-info TARGET" "$BUILD_DIR/help.txt"
 grep -q "commonasmc --version" "$BUILD_DIR/help.txt"
+grep -q -- "-O1" "$BUILD_DIR/help.txt"
 grep -q "commonasmc 0.1.0-dev" "$BUILD_DIR/version.txt"
 grep -q "x86_64-nasm" "$BUILD_DIR/targets.txt"
 grep -q "riscv64-gnu" "$BUILD_DIR/targets.txt"
@@ -53,6 +54,18 @@ done
 grep -q "mv a6, t2" "$BUILD_DIR/control-riscv64-gnu.out"
 grep -q "li a7, 42" "$BUILD_DIR/control-riscv64-gnu.out"
 grep -q "beq a6, a7, success" "$BUILD_DIR/control-riscv64-gnu.out"
+
+"$BUILD_DIR/commonasmc" "$ROOT_DIR/examples/optimize.cas" --target x86_64-nasm -O0 -o "$BUILD_DIR/optimize-O0.asm"
+"$BUILD_DIR/commonasmc" "$ROOT_DIR/examples/optimize.cas" --target x86_64-nasm -O1 -o "$BUILD_DIR/optimize-O1.asm"
+grep -q "mov rbx, 42" "$BUILD_DIR/optimize-O1.asm"
+grep -q "mov r13, 0" "$BUILD_DIR/optimize-O1.asm"
+grep -q "add rbx, 0" "$BUILD_DIR/optimize-O0.asm"
+if grep -q "add rbx, 0" "$BUILD_DIR/optimize-O1.asm" ||
+   grep -q "mov r12, r12" "$BUILD_DIR/optimize-O1.asm" ||
+   grep -q "imul r14, 1" "$BUILD_DIR/optimize-O1.asm"; then
+  echo "optimizer left removable instructions in -O1 output"
+  exit 1
+fi
 
 targets="
   i386-nasm

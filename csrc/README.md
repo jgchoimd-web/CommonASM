@@ -35,6 +35,7 @@ build/commonasmc.exe --version
 build/commonasmc.exe --list-targets
 build/commonasmc.exe --target-info wasm
 build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_from_c.asm
+build/commonasmc.exe examples/optimize.cas --target x86_64-nasm -O1 -o build/optimize_from_c.asm
 Get-Content examples/hello.cas | build/commonasmc.exe - --target wasm -o -
 build/commonasmc.exe examples/hello.cas --target i386-nasm -o build/hello_i386.asm
 build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_from_c.s
@@ -61,6 +62,8 @@ This keeps the CLI usable even as the backend list grows.
 Use `--target-info TARGET` to inspect one target's support level and output
 style.
 Use input `-` or output `-` for shell pipelines.
+Use `-O1`, `-O`, or `--optimize` to enable the peephole optimizer. `-O0` is
+the default.
 
 Compile errors use ANSI terminal colors to show the exact source line, column,
 and highlighted token without any external package dependency.

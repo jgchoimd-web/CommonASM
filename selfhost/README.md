@@ -14,6 +14,8 @@ The CommonASM language now has constants, byte arrays, automatic string length s
 arithmetic, stack operations, memory load/store, and compare/branch operations.
 It also sketches portable data sizes, `.rodata`/`.bss`, functions, bit operations,
 and Linux syscall names shared by the C compiler.
+The CLI sketch recognizes `-O1`/`--optimize` and includes the peephole optimizer
+pass location so the self-hosted compiler can mirror `commonasmc.c`.
 Experimental minority targets include MMIXAL, DCPU-16, FRACTRAN source encoding,
 and Cellular Automaton Rule 110 seed output.
 Experimental common architecture targets include IA-32, ARMv4/v5/v7-A, AArch64,
