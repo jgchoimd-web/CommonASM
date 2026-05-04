@@ -72,6 +72,7 @@ make build
 make version
 make smoke
 make examples
+./scripts/run-example.sh
 ```
 
 ## GitHub Pages site
@@ -106,23 +107,24 @@ _start:
 
 Compile it:
 
-```powershell
-gcc csrc/commonasmc.c -o build/commonasmc.exe
-build/commonasmc.exe --version
-build/commonasmc.exe --help
-build/commonasmc.exe --list-targets
-build/commonasmc.exe --target-info wasm
-build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
-build/commonasmc.exe examples/optimize.cas --target x86_64-nasm -O1 -o build/optimize_x86.asm
-Get-Content examples/hello.cas | build/commonasmc.exe - --target wasm -o -
-build/commonasmc.exe examples/hello.cas --target i386-nasm -o build/hello_i386.asm
-build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
-build/commonasmc.exe examples/hello.cas --target aarch64-gnu -o build/hello_aarch64.s
-build/commonasmc.exe examples/hello.cas --target armv7a-gnu -o build/hello_armv7.s
-build/commonasmc.exe examples/hello.cas --target mmixal -o build/hello_mmix.mms
-build/commonasmc.exe examples/hello.cas --target dcpu16 -o build/hello_dcpu.dasm
-build/commonasmc.exe examples/hello.cas --target fractran -o build/hello.fractran
-build/commonasmc.exe examples/hello.cas --target cellular-automaton -o build/hello.ca
+```sh
+mkdir -p build
+gcc csrc/commonasmc.c -o build/commonasmc
+./build/commonasmc --version
+./build/commonasmc --help
+./build/commonasmc --list-targets
+./build/commonasmc --target-info wasm
+./build/commonasmc examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
+./build/commonasmc examples/optimize.cas --target x86_64-nasm -O1 -o build/optimize_x86.asm
+cat examples/hello.cas | ./build/commonasmc - --target wasm -o -
+./build/commonasmc examples/hello.cas --target i386-nasm -o build/hello_i386.asm
+./build/commonasmc examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
+./build/commonasmc examples/hello.cas --target aarch64-gnu -o build/hello_aarch64.s
+./build/commonasmc examples/hello.cas --target armv7a-gnu -o build/hello_armv7.s
+./build/commonasmc examples/hello.cas --target mmixal -o build/hello_mmix.mms
+./build/commonasmc examples/hello.cas --target dcpu16 -o build/hello_dcpu.dasm
+./build/commonasmc examples/hello.cas --target fractran -o build/hello.fractran
+./build/commonasmc examples/hello.cas --target cellular-automaton -o build/hello.ca
 ```
 
 ## Language sketch

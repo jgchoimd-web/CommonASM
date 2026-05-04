@@ -7,8 +7,9 @@ that can be lowered into real assembly, VM IR, and experimental pseudo targets.
 
 Build the reference C AOT compiler:
 
-```powershell
-gcc csrc/commonasmc.c -o build/commonasmc.exe
+```sh
+mkdir -p build
+gcc csrc/commonasmc.c -o build/commonasmc
 ```
 
 On systems with `make`:
@@ -20,9 +21,15 @@ make examples
 
 Compile an example:
 
-```powershell
-build/commonasmc.exe examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
-build/commonasmc.exe examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
+```sh
+./build/commonasmc examples/hello.cas --target x86_64-nasm -o build/hello_x86.asm
+./build/commonasmc examples/hello.cas --target riscv64-gnu -o build/hello_rv64.s
+```
+
+Quick start helper (build + representative examples):
+
+```sh
+./scripts/run-example.sh
 ```
 
 Run the smoke test suite on systems with a POSIX shell:
