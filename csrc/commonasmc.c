@@ -3510,7 +3510,11 @@ static const char *mips_regs[] = {
     "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7"
 };
 
+/* $a3 doubles as the second scratch. It carries a syscall argument, but a
+   scratch register is only ever live inside one instruction's expansion, and
+   a syscall's expansion never overlaps another's. */
 #define MIPS_SCRATCH "$v1"
+#define MIPS_SCRATCH2 "$a3"
 
 static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move"};
 
@@ -3543,17 +3547,18 @@ static bool mips_fits_imm16(const char *value, long long *out, bool signed_field
 
 /* Returns a register holding the operand, materialising it into the scratch
    when it is not already one. */
-static const char *mips_operand_reg(Buffer *text, const char *value, int line_no, const char *op) {
+static const char *mips_operand_reg(Buffer *text, const char *value, const char *scratch,
+                                    int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg >= 0) return mips_regs[reg];
     if (is_int(value) || is_known_constant(value)) {
-        buf_appendf(text, "  li %s, %s\n", MIPS_SCRATCH, value);
+        buf_appendf(text, "  li %s, %s\n", scratch, value);
     } else if (is_symbol(value)) {
-        buf_appendf(text, "  la %s, %s\n", MIPS_SCRATCH, value);
+        buf_appendf(text, "  la %s, %s\n", scratch, value);
     } else {
         line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     }
-    return MIPS_SCRATCH;
+    return scratch;
 }
 
 static void mips_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
@@ -3671,25 +3676,11 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         char addr[256];
         const char *mnemonic = size[0] == 'b' ? "sb" : size[0] == 'w' ? "sh" :
                                size[0] == 'd' ? "sw" : word_store;
-        /* The value is materialised before the address, because both would
-           otherwise want the one scratch register. */
-        int src = virtual_reg_index(args[1]);
+        /* Address and value can both need materialising, which is why there
+           are two scratch registers. */
         const char *value;
-        if (src >= 0) {
-            value = mips_regs[src];
-            mips_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
-        } else {
-            Address parsed;
-            if (!parse_address(args[0], &parsed)) {
-                line_error_token(line_no, args[0], op, "expected address like [r0 + 8] or [symbol + 8]");
-            }
-            if (!parsed.has_base) {
-                line_error_token(line_no, args[0], op,
-                                 "storing a constant to a symbol needs a register base on MIPS");
-            }
-            value = mips_operand_reg(text, args[1], line_no, op);
-            snprintf(addr, sizeof(addr), "%lld(%s)", parsed.offset, mips_reg(parsed.base, line_no, op));
-        }
+        mips_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        value = mips_operand_reg(text, args[1], MIPS_SCRATCH2, line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
         return;
     }
@@ -3708,7 +3699,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
             return;
         }
         {
-            const char *rhs = mips_operand_reg(text, args[1], line_no, op);
+            const char *rhs = mips_operand_reg(text, args[1], MIPS_SCRATCH, line_no, op);
             const char *native = op_is(op, "add") ? addu : op_is(op, "sub") ? subu : op;
             buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, rhs);
         }
@@ -3716,7 +3707,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     }
     if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         const char *dst = mips_reg(args[0], line_no, op);
-        const char *rhs = mips_operand_reg(text, args[1], line_no, op);
+        const char *rhs = mips_operand_reg(text, args[1], MIPS_SCRATCH, line_no, op);
         const char *native = op_is(op, "mul") ? (wide ? "dmul" : "mul") :
                              op_is(op, "div") ? (wide ? "ddiv" : "div") : (wide ? "drem" : "rem");
         buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, rhs);
@@ -3751,7 +3742,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         return;
     }
     if (op_is(op, "push") && argc == 1) {
-        const char *value = mips_operand_reg(text, args[0], line_no, op);
+        const char *value = mips_operand_reg(text, args[0], MIPS_SCRATCH, line_no, op);
         buf_appendf(text, "  %s $sp, $sp, -%d\n", addiu, slot);
         buf_appendf(text, "  %s %s, 0($sp)\n", word_store, value);
         return;
@@ -4559,6 +4550,7 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
 
 
 
