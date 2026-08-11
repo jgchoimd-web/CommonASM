@@ -23,22 +23,45 @@ typedef struct {
     bool has_symbol;
 } Address;
 
+/* rsp and rbp belong to the frame, and rax and r11 are the compiler's two
+   scratch registers, so none of them appear here: a virtual register must
+   never alias one. That leaves 12 machine registers for the 16 virtual ones,
+   and virtual r12-r15 live in spill slots. See x86_vreg_operand().
+
+   Two scratches are needed because one instruction can require both an
+   address held in a spilled register and a value held in another. */
 static const char *x86_regs[] = {
-    "rbx", "r12", "r13", "r14", "r15", "r8", "r9", "r10",
-    "rcx", "rdx", "rsi", "rdi", "rbp", "rax", "r11", "rsp"
+    "rbx", "rcx", "rdx", "rsi", "rdi", "r8",
+    "r9", "r10", "r12", "r13", "r14", "r15"
 };
 static const char *x86_regs_d[] = {
-    "ebx", "r12d", "r13d", "r14d", "r15d", "r8d", "r9d", "r10d",
-    "ecx", "edx", "esi", "edi", "ebp", "eax", "r11d", "esp"
+    "ebx", "ecx", "edx", "esi", "edi", "r8d",
+    "r9d", "r10d", "r12d", "r13d", "r14d", "r15d"
 };
 static const char *x86_regs_w[] = {
-    "bx", "r12w", "r13w", "r14w", "r15w", "r8w", "r9w", "r10w",
-    "cx", "dx", "si", "di", "bp", "ax", "r11w", "sp"
+    "bx", "cx", "dx", "si", "di", "r8w",
+    "r9w", "r10w", "r12w", "r13w", "r14w", "r15w"
 };
 static const char *x86_regs_b[] = {
-    "bl", "r12b", "r13b", "r14b", "r15b", "r8b", "r9b", "r10b",
-    "cl", "dl", "sil", "dil", "bpl", "al", "r11b", "spl"
+    "bl", "cl", "dl", "sil", "dil", "r8b",
+    "r9b", "r10b", "r12b", "r13b", "r14b", "r15b"
 };
+
+#define X86_MAPPED_COUNT ((int)(sizeof(x86_regs) / sizeof(x86_regs[0])))
+#define X86_SPILL_COUNT (16 - X86_MAPPED_COUNT)
+#define X86_SCRATCH "rax"
+#define X86_ADDR_SCRATCH "r11"
+#define X86_SPILL_SYMBOL "__cas_spill"
+
+/* Bit per spill slot actually referenced, so the reservation is only emitted
+   when the program really uses one of the spilled virtual registers. */
+static unsigned x86_spill_used = 0;
+
+/* Bit per virtual register the source mentions anywhere. A register that is
+   never named cannot be holding anything, so the syscall lowering can skip
+   saving the machine register it maps to. Defaults to "all of them" so that
+   anything reaching the emitter without a scan stays conservative. */
+static unsigned mentioned_vregs = 0xffffu;
 static const char *rv_regs[] = {
     "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s1",
     "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"
@@ -814,12 +837,39 @@ static int virtual_reg_index(const char *name) {
     return -1;
 }
 
-static const char *x86_reg(const char *value, int line_no, const char *op) {
-    int reg = virtual_reg_index(value);
-    if (reg < 0) {
-        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+/* Writes the operand naming virtual register idx at the given size, and
+   reports whether it came out as a memory reference. x86 allows at most one
+   memory operand per instruction, so callers that pair two operands must
+   route one through X86_SCRATCH when both are spilled. */
+static bool x86_vreg_operand(int idx, const char *size, char *out, size_t out_size) {
+    if (idx < X86_MAPPED_COUNT) {
+        const char *const *table = x86_regs;
+        if (strcmp(size, "b") == 0) table = x86_regs_b;
+        else if (strcmp(size, "w") == 0) table = x86_regs_w;
+        else if (strcmp(size, "d") == 0) table = x86_regs_d;
+        snprintf(out, out_size, "%s", table[idx]);
+        return false;
     }
-    return x86_regs[reg];
+    x86_spill_used |= 1u << (idx - X86_MAPPED_COUNT);
+    snprintf(out, out_size, "[rel %s+%d]", X86_SPILL_SYMBOL, (idx - X86_MAPPED_COUNT) * 8);
+    return true;
+}
+
+/* Spilled registers need a formatted string rather than a pointer into a
+   static table, so operand text is handed out from a small rotation. No
+   emitted instruction holds more than a handful of operands at once. */
+static const char *x86_operand_text(int idx, const char *size) {
+    static char pool[8][48];
+    static unsigned next = 0;
+    char *slot = pool[next];
+    next = (next + 1) % 8;
+    x86_vreg_operand(idx, size, slot, sizeof(pool[0]));
+    return slot;
+}
+
+static bool x86_reg_is_spilled(const char *value) {
+    int reg = virtual_reg_index(value);
+    return reg >= X86_MAPPED_COUNT;
 }
 
 static const char *x86_reg_sized(const char *value, const char *size, int line_no, const char *op) {
@@ -827,10 +877,11 @@ static const char *x86_reg_sized(const char *value, const char *size, int line_n
     if (reg < 0) {
         line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
-    if (strcmp(size, "b") == 0) return x86_regs_b[reg];
-    if (strcmp(size, "w") == 0) return x86_regs_w[reg];
-    if (strcmp(size, "d") == 0) return x86_regs_d[reg];
-    return x86_regs[reg];
+    return x86_operand_text(reg, size);
+}
+
+static const char *x86_reg(const char *value, int line_no, const char *op) {
+    return x86_reg_sized(value, "q", line_no, op);
 }
 
 static const char *x86_rax_sized(const char *size) {
@@ -917,16 +968,53 @@ static const char *rv_store_op(const char *size) {
     return "sd";
 }
 
+/* Over-approximates which virtual registers the program mentions by scanning
+   the raw source: a hit inside a string or a comment still counts. Erring that
+   way only ever costs an extra save, never a lost value. */
+static unsigned scan_mentioned_vregs(const char *source) {
+    unsigned mask = 0;
+    for (const char *p = source; *p; p++) {
+        char *end = NULL;
+        long value;
+        if (*p != 'r' || !isdigit((unsigned char)p[1])) continue;
+        if (p != source && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.')) continue;
+        value = strtol(p + 1, &end, 10);
+        if (end && value >= 0 && value <= 15 && !is_symbol_char(*end)) {
+            mask |= 1u << (unsigned)value;
+        }
+    }
+    return mask;
+}
+
+/* Index of the virtual register a machine register carries, or -1. */
+static int x86_vreg_of(const char *physical) {
+    for (int i = 0; i < X86_MAPPED_COUNT; i++) {
+        if (strcmp(x86_regs[i], physical) == 0) return i;
+    }
+    return -1;
+}
+
+static bool x86_must_preserve(const char *physical) {
+    int vreg = x86_vreg_of(physical);
+    return vreg >= 0 && (mentioned_vregs & (1u << (unsigned)vreg)) != 0;
+}
+
 static const char *x86_operand(const char *value, int line_no, const char *op) {
     int reg = virtual_reg_index(value);
     if (reg >= 0) {
-        return x86_regs[reg];
+        return x86_operand_text(reg, "q");
     }
     if (is_int(value) || is_symbol(value) || is_known_constant(value)) {
         return value;
     }
     line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     return value;
+}
+
+/* True when combining these two operands would put two memory references in
+   one instruction, which x86 cannot encode. */
+static bool x86_needs_scratch(const char *dst, const char *src) {
+    return x86_reg_is_spilled(dst) && x86_reg_is_spilled(src);
 }
 
 static int split_args(char *arg_text, char **args, int max_args) {
@@ -997,20 +1085,30 @@ static bool parse_address(const char *text, Address *addr) {
     return true;
 }
 
-static void x86_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
+/* Writes the x86 memory operand for an address expression. A spilled base
+   register cannot be named inside an address, so it is first loaded into the
+   address scratch, which is kept separate from the value scratch precisely so
+   that one instruction can need both. */
+static void x86_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                             int line_no, const char *op) {
     Address addr;
-    if (!parse_address(text, &addr)) {
-        line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    const char *base;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
-    if (addr.has_base) {
-        snprintf(out, out_size, "[%s%s%ld]", x86_reg(addr.base, line_no, op), addr.offset < 0 ? "" : "+", addr.offset);
+    if (!addr.has_base) {
+        if (addr.offset == 0) snprintf(out, out_size, "[rel %s]", addr.symbol);
+        else snprintf(out, out_size, "[rel %s%+ld]", addr.symbol, addr.offset);
+        return;
+    }
+    if (x86_reg_is_spilled(addr.base)) {
+        buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_reg(addr.base, line_no, op));
+        base = X86_ADDR_SCRATCH;
     } else {
-        snprintf(out, out_size, "[rel %s%s%ld]", addr.symbol, addr.offset < 0 ? "" : "+", addr.offset);
+        base = x86_reg(addr.base, line_no, op);
     }
-    if (addr.offset == 0) {
-        if (addr.has_base) snprintf(out, out_size, "[%s]", x86_reg(addr.base, line_no, op));
-        else snprintf(out, out_size, "[rel %s]", addr.symbol);
-    }
+    if (addr.offset == 0) snprintf(out, out_size, "[%s]", base);
+    else snprintf(out, out_size, "[%s%+ld]", base, addr.offset);
 }
 
 static void rv_emit_address_setup(Buffer *text, const char *addr_text, const char *scratch, int line_no, const char *op) {
@@ -1162,22 +1260,67 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
 }
 
 static void emit_x86_syscall(Buffer *text, char **args, int argc, int line_no) {
-    const char *arg_regs[] = {"rdi", "rsi", "rdx", "r10", "r8", "r9"};
+    static const char *const arg_regs[] = {"rdi", "rsi", "rdx", "r10", "r8", "r9"};
     int number = -1;
+    int count;
+    bool conflict = false;
+    bool returns = true;
     if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
     if (strcmp(args[0], "read") == 0) number = 0;
     else if (strcmp(args[0], "write") == 0) number = 1;
     else if (strcmp(args[0], "open") == 0) number = 2;
     else if (strcmp(args[0], "close") == 0) number = 3;
-    else if (strcmp(args[0], "exit") == 0) number = 60;
+    else if (strcmp(args[0], "exit") == 0) { number = 60; returns = false; }
     else line_error(line_no, "syscall", "unknown syscall");
-    char num[32];
-    snprintf(num, sizeof(num), "%d", number);
-    buf_appendf(text, "  mov rax, %s\n", num);
-    for (int i = 1; i < argc && i <= 6; i++) {
-        buf_appendf(text, "  mov %s, %s\n", arg_regs[i - 1], x86_operand(args[i], line_no, "syscall"));
+    count = argc - 1;
+    if (count > 6) count = 6;
+
+    /* Setting up the call writes the argument registers, and the syscall
+       instruction itself destroys rcx and r11. rax and r11 are compiler
+       scratch, but the argument registers and rcx carry virtual registers, so
+       they are saved across the call instead of being silently destroyed.
+       exit never comes back, so it skips all of that. */
+    if (returns) {
+        if (x86_must_preserve("rcx")) buf_append(text, "  push rcx\n");
+        for (int i = 0; i < count; i++) {
+            if (x86_must_preserve(arg_regs[i])) buf_appendf(text, "  push %s\n", arg_regs[i]);
+        }
     }
+
+    /* Loading one argument register can destroy the source of a later one, so
+       check for that before choosing the cheap in-order form. */
+    for (int i = 0; i < count && !conflict; i++) {
+        const char *src = x86_operand(args[i + 1], line_no, "syscall");
+        for (int j = 0; j < count; j++) {
+            if (strcmp(src, arg_regs[j]) == 0) {
+                conflict = true;
+                break;
+            }
+        }
+    }
+    if (conflict) {
+        /* Every source is still intact here, so stage the values on the stack
+           and take them back in reverse. */
+        for (int i = 0; i < count; i++) {
+            buf_appendf(text, "  push %s%s\n", x86_reg_is_spilled(args[i + 1]) ? "qword " : "",
+                        x86_operand(args[i + 1], line_no, "syscall"));
+        }
+        for (int i = count - 1; i >= 0; i--) {
+            buf_appendf(text, "  pop %s\n", arg_regs[i]);
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            buf_appendf(text, "  mov %s, %s\n", arg_regs[i], x86_operand(args[i + 1], line_no, "syscall"));
+        }
+    }
+    buf_appendf(text, "  mov rax, %d\n", number);
     buf_append(text, "  syscall\n");
+    if (returns) {
+        for (int i = count - 1; i >= 0; i--) {
+            if (x86_must_preserve(arg_regs[i])) buf_appendf(text, "  pop %s\n", arg_regs[i]);
+        }
+        if (x86_must_preserve("rcx")) buf_append(text, "  pop rcx\n");
+    }
 }
 
 static void emit_rv_syscall(Buffer *text, char **args, int argc, int line_no) {
@@ -1609,67 +1752,125 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         buf_append(text, "  mov rsp, rbp\n  pop rbp\n"); return;
     }
     if (strcmp(op, "mov") == 0 && argc == 2) {
-        buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op)); return;
+        if (x86_needs_scratch(args[0], args[1])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+        }
+        return;
     }
     if (strcmp(op, "load_addr") == 0 && argc == 2) {
-        buf_appendf(text, "  lea %s, [rel %s]\n", x86_reg(args[0], line_no, op), args[1]); return;
+        /* lea cannot write to memory, so a spilled destination goes through
+           the scratch register. */
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  lea %s, [rel %s]\n", X86_SCRATCH, args[1]);
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  lea %s, [rel %s]\n", x86_reg(args[0], line_no, op), args[1]);
+        }
+        return;
     }
     if (strcmp(op, "load") == 0 && argc == 2) {
         char addr[256];
-        x86_format_address(args[1], addr, sizeof(addr), line_no, op);
+        bool spilled = x86_reg_is_spilled(args[0]);
+        x86_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
         if (strcmp(size, "q") == 0) {
-            buf_appendf(text, "  mov %s, qword ", x86_reg(args[0], line_no, op));
+            buf_appendf(text, "  mov %s, qword %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), addr);
         } else if (strcmp(size, "d") == 0) {
-            buf_appendf(text, "  mov %s, dword ", x86_reg_sized(args[0], size, line_no, op));
+            /* A 32-bit destination zero-extends, which is what the spilled
+               path relies on before storing the full quadword back. */
+            buf_appendf(text, "  mov %s, dword %s\n", spilled ? "eax" : x86_reg_sized(args[0], size, line_no, op), addr);
         } else {
-            buf_appendf(text, "  movzx %s, %s ", x86_reg(args[0], line_no, op), x86_size_word(size));
+            buf_appendf(text, "  movzx %s, %s %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), x86_size_word(size), addr);
         }
-        buf_append(text, addr); buf_append(text, "\n"); return;
+        if (spilled) buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        return;
     }
     if (strcmp(op, "store") == 0 && argc == 2) {
         char addr[256];
-        x86_format_address(args[0], addr, sizeof(addr), line_no, op);
-        if (virtual_reg_index(args[1]) >= 0) {
-            buf_appendf(text, "  mov %s ", x86_size_word(size));
-            buf_append(text, addr);
-            buf_appendf(text, ", %s\n", x86_reg_sized(args[1], size, line_no, op));
+        x86_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        if (virtual_reg_index(args[1]) >= 0 && !x86_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  mov %s %s, %s\n", x86_size_word(size), addr, x86_reg_sized(args[1], size, line_no, op));
         } else {
-            buf_appendf(text, "  mov rax, %s\n", x86_operand(args[1], line_no, op));
-            buf_appendf(text, "  mov %s ", x86_size_word(size));
-            buf_append(text, addr);
-            buf_appendf(text, ", %s\n", x86_rax_sized(size));
+            /* The destination is already a memory operand, so a spilled or
+               immediate source has to come through the scratch. */
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov %s %s, %s\n", x86_size_word(size), addr, x86_rax_sized(size));
         }
+        return;
+    }
+    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        bool dst_mem = x86_reg_is_spilled(args[0]);
+        if (virtual_reg_index(args[1]) < 0) {
+            if (dst_mem) buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+            else buf_appendf(text, "  %s %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+            return;
+        }
+        /* A variable shift count must sit in cl, but rcx carries a virtual
+           register, so the value is shifted in the scratch while rcx is
+           borrowed. This also stays correct when the count and the
+           destination are the same virtual register. */
+        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+        buf_append(text, "  push rcx\n");
+        buf_appendf(text, "  mov rcx, %s\n", x86_operand(args[1], line_no, op));
+        buf_appendf(text, "  %s %s, cl\n", op, X86_SCRATCH);
+        buf_append(text, "  pop rcx\n");
+        buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "qword " : "", x86_reg(args[0], line_no, op), X86_SCRATCH);
         return;
     }
     if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "shl") == 0 ||
-         strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
-        buf_appendf(text, "  %s %s, ", op, x86_reg(args[0], line_no, op));
-        buf_append(text, x86_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
-    }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
-        buf_appendf(text, "  %s %s\n", op, x86_reg(args[0], line_no, op)); return;
-    }
-    if (strcmp(op, "mul") == 0 && argc == 2) {
-        buf_appendf(text, "  imul %s, ", x86_reg(args[0], line_no, op));
-        buf_append(text, x86_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
-    }
-    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
-        buf_appendf(text, "  mov rax, %s\n  cqo\n", x86_reg(args[0], line_no, op));
-        if (virtual_reg_index(args[1]) >= 0) buf_appendf(text, "  idiv %s\n", x86_operand(args[1], line_no, op));
-        else {
-            buf_appendf(text, "  mov r11, %s\n", x86_operand(args[1], line_no, op));
-            buf_append(text, "  idiv r11\n");
+         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0) && argc == 2) {
+        if (x86_needs_scratch(args[0], args[1])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
+            buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+        } else {
+            buf_appendf(text, "  %s %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
         }
-        buf_appendf(text, strcmp(op, "mod") == 0 ? "  mov %s, rdx\n" : "  mov %s, rax\n", x86_reg(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) {
-        buf_appendf(text, "  cmp %s, ", x86_reg(args[0], line_no, op));
-        buf_append(text, x86_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+        buf_appendf(text, "  %s %s%s\n", op, x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op));
+        return;
     }
-    if ((strcmp(op, "push") == 0 || strcmp(op, "pop") == 0) && argc == 1) {
-        buf_appendf(text, "  %s %s\n", op, strcmp(op, "pop") == 0 ? x86_reg(args[0], line_no, op) : x86_operand(args[0], line_no, op)); return;
+    if (strcmp(op, "mul") == 0 && argc == 2) {
+        /* imul cannot write to memory. */
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+            buf_appendf(text, "  imul %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  imul %s, %s\n", x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
+        }
+        return;
+    }
+    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+        /* idiv is hard-wired to rax:rdx. rdx carries a virtual register, so it
+           is saved across the division; the divisor is copied out before cqo
+           overwrites rdx, which keeps "div r0, r2" correct. */
+        buf_append(text, "  push rdx\n");
+        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+        buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_operand(args[1], line_no, op));
+        buf_append(text, "  cqo\n");
+        buf_appendf(text, "  idiv %s\n", X86_ADDR_SCRATCH);
+        if (strcmp(op, "mod") == 0) {
+            buf_appendf(text, "  mov %s, rdx\n", X86_SCRATCH);
+        }
+        buf_append(text, "  pop rdx\n");
+        buf_appendf(text, "  mov %s%s, %s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        return;
+    }
+    if (strcmp(op, "push") == 0 && argc == 1) {
+        buf_appendf(text, "  push %s%s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_operand(args[0], line_no, op));
+        return;
+    }
+    if (strcmp(op, "pop") == 0 && argc == 1) {
+        buf_appendf(text, "  pop %s%s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op));
+        return;
     }
     if ((strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 ||
          strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
@@ -1681,13 +1882,134 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
 
+/* RISC-V has no condition flags, so a compare has to survive to its branch
+   some other way. The old lowering copied both operands into a6/a7 and
+   branched on those, but a6/a7 are also the scratch and syscall-number
+   registers, so any syscall between the compare and the branch silently
+   replaced the comparison. The operands are recorded instead and folded into
+   the branch itself, which is both correct and two instructions shorter. When
+   an unrelated instruction comes between the two, the comparison is first
+   snapshotted into s10/s11 - registers nothing else touches - so it still
+   describes the values as of the compare. */
+typedef enum { RV_CMP_NONE, RV_CMP_PENDING, RV_CMP_SNAPSHOT } RvCompareState;
+
+#define RV_CMP_LHS_REG "s10"
+#define RV_CMP_RHS_REG "s11"
+#define RV_SCRATCH "a6"
+
+static RvCompareState rv_cmp_state = RV_CMP_NONE;
+static char rv_cmp_lhs[64];
+static char rv_cmp_rhs[64];
+static bool rv_cmp_rhs_is_reg = false;
+
+static bool rv_parse_long(const char *text, long *value) {
+    char *end = NULL;
+    errno = 0;
+    *value = strtol(text, &end, 0);
+    return errno == 0 && end && *end == '\0' && end != text;
+}
+
+/* addi and friends take a signed 12-bit immediate; wider values must be
+   materialised into a register first. */
+static bool rv_fits_imm12(long value) {
+    return value >= -2048 && value <= 2047;
+}
+
+static void rv_flush_compare(Buffer *text) {
+    if (rv_cmp_state != RV_CMP_PENDING) return;
+    buf_appendf(text, "  mv %s, %s\n", RV_CMP_LHS_REG, rv_cmp_lhs);
+    if (rv_cmp_rhs_is_reg) buf_appendf(text, "  mv %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
+    else buf_appendf(text, "  li %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
+    snprintf(rv_cmp_lhs, sizeof(rv_cmp_lhs), "%s", RV_CMP_LHS_REG);
+    snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", RV_CMP_RHS_REG);
+    rv_cmp_rhs_is_reg = true;
+    rv_cmp_state = RV_CMP_SNAPSHOT;
+}
+
+/* Instructions whose first operand is the register they write. */
+static bool rv_writes_first_arg(const char *op) {
+    return strcmp(op, "mov") == 0 || strcmp(op, "load_addr") == 0 || strcmp(op, "load") == 0 ||
+           strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
+           strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "shl") == 0 ||
+           strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0 || strcmp(op, "neg") == 0 ||
+           strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 ||
+           strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 || strcmp(op, "mod") == 0 ||
+           strcmp(op, "pop") == 0;
+}
+
+static bool rv_compare_reads(const char *reg) {
+    if (rv_cmp_state != RV_CMP_PENDING) return false;
+    if (strcmp(rv_cmp_lhs, reg) == 0) return true;
+    return rv_cmp_rhs_is_reg && strcmp(rv_cmp_rhs, reg) == 0;
+}
+
+/* A label starts a new basic block, so a comparison recorded before it no
+   longer describes the state of anything that jumps here. It is dropped
+   rather than snapshotted: writing the snapshot out would only leave dead
+   copies behind the common case where a branch already consumed it. */
+static void rv_discard_compare(void) {
+    rv_cmp_state = RV_CMP_NONE;
+}
+
+static bool rv_is_conditional_branch(const char *op) {
+    return strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
+           strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
+           strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 ||
+           strcmp(op, "jbe") == 0;
+}
+
+static void rv_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
+    const char *mnemonic =
+        strcmp(op, "je") == 0 ? "beq" : strcmp(op, "jne") == 0 ? "bne" :
+        strcmp(op, "jg") == 0 ? "bgt" : strcmp(op, "jl") == 0 ? "blt" :
+        strcmp(op, "jge") == 0 ? "bge" : strcmp(op, "jle") == 0 ? "ble" :
+        strcmp(op, "ja") == 0 ? "bgtu" : strcmp(op, "jb") == 0 ? "bltu" :
+        strcmp(op, "jae") == 0 ? "bgeu" : "bleu";
+    const char *rhs;
+    if (rv_cmp_state == RV_CMP_NONE) {
+        line_error(line_no, op, "conditional jump with no preceding cmp");
+    }
+    if (rv_cmp_rhs_is_reg) {
+        rhs = rv_cmp_rhs;
+    } else {
+        /* Branches compare registers only, so an immediate operand is
+           materialised at the branch rather than kept live in a register. */
+        buf_appendf(text, "  li %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
+        rhs = RV_CMP_RHS_REG;
+    }
+    buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, rv_cmp_lhs, rhs, label);
+}
+
 static void emit_rv_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+    /* A pending comparison only has to be pinned down when something is about
+       to disturb the registers it names. Snapshotting on every intervening
+       instruction instead would leave dead copies behind after the common
+       "cmp, branch, carry on" sequence. A call is enough on its own: the
+       operands live in caller-saved registers. */
+    if (!rv_is_conditional_branch(op) && strcmp(op, "cmp") != 0) {
+        if (strcmp(op, "call") == 0) {
+            rv_flush_compare(text);
+        } else if (argc >= 1 && rv_writes_first_arg(op)) {
+            int dst = virtual_reg_index(args[0]);
+            if (dst >= 0 && rv_compare_reads(rv_regs[dst])) {
+                rv_flush_compare(text);
+            }
+        }
+    }
     if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
     if (strcmp(op, "endfunc") == 0 && argc == 0) return;
     if (strcmp(op, "enter") == 0 && argc == 1) {
+        long frame;
         buf_append(text, "  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
-        if (strcmp(args[0], "0") != 0) {
-            buf_appendf(text, "  addi sp, sp, -%s\n", args[0]);
+        if (strcmp(args[0], "0") == 0) {
+            return;
+        }
+        /* A frame wider than a 12-bit immediate cannot ride along in addi. */
+        if (rv_parse_long(args[0], &frame) && frame != LONG_MIN && rv_fits_imm12(-frame)) {
+            buf_appendf(text, "  addi sp, sp, %ld\n", -frame);
+        } else {
+            buf_appendf(text, "  li %s, %s\n", RV_SCRATCH, args[0]);
+            buf_appendf(text, "  sub sp, sp, %s\n", RV_SCRATCH);
         }
         return;
     }
@@ -1725,17 +2047,29 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
          strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) && argc == 2) {
         int src = virtual_reg_index(args[1]);
         const char *dst = rv_reg(args[0], line_no, op);
+        long value;
         if (src >= 0) {
-            buf_appendf(text, "  %s %s, %s, ", op, dst, dst);
-            buf_append(text, rv_regs[src]); buf_append(text, "\n");
-        } else if (strcmp(op, "add") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) {
-            const char *immop = strcmp(op, "add") == 0 ? "addi" : (strcmp(op, "and") == 0 ? "andi" : (strcmp(op, "or") == 0 ? "ori" : "xori"));
-            buf_appendf(text, "  %s %s, %s, ", immop, dst, dst);
-            buf_append(text, args[1]); buf_append(text, "\n");
-        } else {
-            buf_appendf(text, "  addi %s, %s, -", dst, dst);
-            buf_append(text, args[1]); buf_append(text, "\n");
+            buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, rv_regs[src]);
+            return;
         }
+        /* "sub rX, imm" lowers to an addi of the negated immediate. The old
+           lowering spelled that by writing a minus in front of the operand
+           text, which turned "sub r0, -5" into "addi t0, t0, --5"; negating
+           the parsed value instead keeps both signs working. */
+        if (rv_parse_long(args[1], &value) && !(strcmp(op, "sub") == 0 && value == LONG_MIN)) {
+            long applied = strcmp(op, "sub") == 0 ? -value : value;
+            if (rv_fits_imm12(applied)) {
+                const char *immop = strcmp(op, "and") == 0 ? "andi" :
+                                    strcmp(op, "or") == 0 ? "ori" :
+                                    strcmp(op, "xor") == 0 ? "xori" : "addi";
+                buf_appendf(text, "  %s %s, %s, %ld\n", immop, dst, dst, applied);
+                return;
+            }
+        }
+        /* Symbolic operands, and values too wide for a 12-bit field, have to
+           be materialised into a register first. */
+        buf_appendf(text, "  li %s, %s\n", RV_SCRATCH, args[1]);
+        buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, RV_SCRATCH);
         return;
     }
     if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
@@ -1762,24 +2096,21 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     }
     if (strcmp(op, "cmp") == 0 && argc == 2) {
         int src = virtual_reg_index(args[1]);
-        buf_appendf(text, "  mv a6, %s\n", rv_reg(args[0], line_no, op));
+        snprintf(rv_cmp_lhs, sizeof(rv_cmp_lhs), "%s", rv_reg(args[0], line_no, op));
         if (src >= 0) {
-            buf_appendf(text, "  mv a7, %s\n", rv_regs[src]);
+            snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", rv_regs[src]);
+            rv_cmp_rhs_is_reg = true;
         } else {
-            buf_appendf(text, "  li a7, %s\n", args[1]);
+            snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", args[1]);
+            rv_cmp_rhs_is_reg = false;
         }
+        rv_cmp_state = RV_CMP_PENDING;
         return;
     }
-    if (strcmp(op, "je") == 0 && argc == 1) { buf_appendf(text, "  beq a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jne") == 0 && argc == 1) { buf_appendf(text, "  bne a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jg") == 0 && argc == 1) { buf_appendf(text, "  bgt a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jl") == 0 && argc == 1) { buf_appendf(text, "  blt a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jge") == 0 && argc == 1) { buf_appendf(text, "  bge a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jle") == 0 && argc == 1) { buf_appendf(text, "  ble a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "ja") == 0 && argc == 1) { buf_appendf(text, "  bgtu a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jb") == 0 && argc == 1) { buf_appendf(text, "  bltu a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jae") == 0 && argc == 1) { buf_appendf(text, "  bgeu a6, a7, %s\n", args[0]); return; }
-    if (strcmp(op, "jbe") == 0 && argc == 1) { buf_appendf(text, "  bleu a6, a7, %s\n", args[0]); return; }
+    if (rv_is_conditional_branch(op) && argc == 1) {
+        rv_emit_branch(text, op, args[0], line_no);
+        return;
+    }
     if (strcmp(op, "push") == 0 && argc == 1) {
         int src = virtual_reg_index(args[0]);
         if (src < 0) buf_appendf(text, "  li a6, %s\n", args[0]);
@@ -1801,6 +2132,13 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     char base_op[64];
     const char *size;
     size_t len = strlen(line);
+    /* A label or a symbol directive ends the straight-line run a pending
+       RISC-V comparison was counting on. */
+    if (is_rv64_target(target) &&
+        ((len > 0 && line[len - 1] == ':') ||
+         strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0)) {
+        rv_discard_compare();
+    }
     if (len > 0 && line[len - 1] == ':') {
         line[len - 1] = '\0';
         if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s\n", line);
@@ -2168,6 +2506,8 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
+    /* Scanned before the loop starts chopping the source into lines. */
+    mentioned_vregs = scan_mentioned_vregs(source);
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;
     optimizer.pending[0] = '\0';
@@ -2215,6 +2555,12 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         else emit_text_line_optimized(&text, line, line_no, target, &optimizer);
     }
     opt_flush(&text, target, &optimizer);
+    /* Only reserve backing store for the spilled virtual registers if the
+       program actually referenced one. */
+    if (x86 && x86_spill_used) {
+        buf_append(&bss, "alignb 8\n");
+        buf_appendf(&bss, "%s: resq %d\n", X86_SPILL_SYMBOL, X86_SPILL_COUNT);
+    }
     buf_init(&out);
     if (x86 || i386) {
         if (x86) buf_append(&out, "default rel\n");

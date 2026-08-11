@@ -148,10 +148,11 @@ Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas" | ForEach-Ob
     }
 }
 
+# RISC-V has no flags, so a compare is folded into its branch rather than
+# staged in a register pair that later instructions would overwrite.
 $ControlRvPath = Join-Path $BuildPath "control-riscv64-gnu-pwsh.out"
-Assert-Contains $ControlRvPath "mv a6, t2"
-Assert-Contains $ControlRvPath "li a7, 42"
-Assert-Contains $ControlRvPath "beq a6, a7, success"
+Assert-Contains $ControlRvPath "li s11, 42"
+Assert-Contains $ControlRvPath "beq t2, s11, success"
 
 $OptimizeO0Path = Join-Path $BuildPath "optimize-O0-pwsh.asm"
 $OptimizeO1Path = Join-Path $BuildPath "optimize-O1-pwsh.asm"
@@ -172,13 +173,91 @@ Invoke-Native $CompilerExe @(
     $OptimizeO1Path
 )
 Assert-Contains $OptimizeO1Path "mov rbx, 42"
-Assert-Contains $OptimizeO1Path "mov r13, 0"
+Assert-Contains $OptimizeO1Path "mov rdx, 0"
 Assert-Contains $OptimizeO0Path "add rbx, 0"
 $OptimizeO1Text = Get-Content -Raw -Path $OptimizeO1Path
-foreach ($Needle in @("add rbx, 0", "mov r12, r12", "imul r14, 1")) {
+foreach ($Needle in @("add rbx, 0", "mov rcx, rcx", "imul rsi, 1")) {
     if ($OptimizeO1Text.Contains($Needle)) {
         throw "optimizer left removable instruction in -O1 output: $Needle"
     }
+}
+
+# Each check below covers a lowering that used to produce silently wrong or
+# unassemblable code.
+$RegressPath = Join-Path $BuildPath "regress-pwsh.cas"
+$RegressX86 = Join-Path $BuildPath "regress-pwsh-x86.asm"
+$RegressRv = Join-Path $BuildPath "regress-pwsh-rv.s"
+$LongLabel = "a_label_long_enough_that_its_length_constant_used_to_be_truncated"
+@"
+const stdout = 1
+
+.data
+${LongLabel}: string "hi\n"
+
+.bss
+cell: zero 8
+
+.text
+global _start
+
+_start:
+  mov r13, 111
+  mov r15, 222
+  store.q [cell], 5
+  shl r0, r1
+  sub r2, -5
+  div r4, r5
+  cmp r3, 42
+  syscall write, stdout, ${LongLabel}, ${LongLabel}_len
+  je done
+done:
+  ret
+"@ | Set-Content -Path $RegressPath -Encoding ascii
+
+Invoke-NativeToFile $RegressX86 $CompilerExe @($RegressPath, "--target", "x86_64-nasm", "-o", "-")
+Invoke-NativeToFile $RegressRv $CompilerExe @($RegressPath, "--target", "riscv64-gnu", "-o", "-")
+
+$RegressX86Text = Get-Content -Raw -Path $RegressX86
+$RegressRvText = Get-Content -Raw -Path $RegressRv
+
+# A virtual register must never land on the stack or frame pointer.
+if ($RegressX86Text -match "(?m)^  (mov|add|sub|xor|and|or|imul|neg|not|inc|dec|shl|shr|sar) (rsp|rbp)[,\r\n]") {
+    throw "a virtual register was lowered onto rsp or rbp"
+}
+# Virtual registers past the machine register file need backing store.
+Assert-Contains $RegressX86 "__cas_spill: resq"
+Assert-Contains $RegressX86 "mov qword [rel __cas_spill+8], 111"
+# A variable shift count has to reach cl; "shl reg, reg" does not assemble.
+Assert-Contains $RegressX86 "shl rax, cl"
+# idiv overwrites rdx, which carries a virtual register.
+Assert-Contains $RegressX86 "push rdx"
+
+# Subtracting a negative immediate used to emit "addi t2, t2, --5".
+Assert-Contains $RegressRv "addi t2, t2, 5"
+if ($RegressRvText.Contains("--")) {
+    throw "riscv lowering emitted a doubled sign"
+}
+# A long label keeps its generated length constant, so it stays an immediate
+# ("li") rather than being mistaken for an address ("la").
+Assert-Contains $RegressRv "li a2, ${LongLabel}_len"
+# A compare must not be carried in a register the syscall sequence writes.
+if ($RegressRvText -match "(?m)^  b(eq|ne|lt|ge|gt|le)u? a[0-7],") {
+    throw "riscv compare was carried in a syscall argument register"
+}
+
+# Whether the output assembles is checked directly when an assembler is around.
+if (Get-Command nasm -ErrorAction SilentlyContinue) {
+    Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas" | ForEach-Object {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+        foreach ($Level in @("-O0", "-O1")) {
+            $AsmPath = Join-Path $BuildPath "asm-$Name$Level-pwsh.asm"
+            Invoke-Native $CompilerExe @($_.FullName, "--target", "x86_64-nasm", $Level, "-o", $AsmPath)
+            Invoke-Native "nasm" @("-f", "elf64", $AsmPath, "-o", (Join-Path $BuildPath "asm-$Name$Level-pwsh.o"))
+        }
+    }
+    Write-Host "nasm accepted every x86_64 output."
+} else {
+    Write-Host "nasm not found; skipped assembling the x86_64 output."
 }
 
 $RepresentativeTargets = @(

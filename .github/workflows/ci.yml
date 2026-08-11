@@ -18,6 +18,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Install assembler
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
       - name: Run POSIX smoke tests
         run: make smoke
 

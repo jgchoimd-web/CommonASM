@@ -51,20 +51,94 @@ for example in "$ROOT_DIR"/examples/*.cas; do
   done
 done
 
-grep -q "mv a6, t2" "$BUILD_DIR/control-riscv64-gnu.out"
-grep -q "li a7, 42" "$BUILD_DIR/control-riscv64-gnu.out"
-grep -q "beq a6, a7, success" "$BUILD_DIR/control-riscv64-gnu.out"
+# RISC-V has no flags, so a compare is folded into its branch rather than
+# staged in a register pair that later instructions would overwrite.
+grep -q "li s11, 42" "$BUILD_DIR/control-riscv64-gnu.out"
+grep -q "beq t2, s11, success" "$BUILD_DIR/control-riscv64-gnu.out"
 
 "$BUILD_DIR/commonasmc" "$ROOT_DIR/examples/optimize.cas" --target x86_64-nasm -O0 -o "$BUILD_DIR/optimize-O0.asm"
 "$BUILD_DIR/commonasmc" "$ROOT_DIR/examples/optimize.cas" --target x86_64-nasm -O1 -o "$BUILD_DIR/optimize-O1.asm"
 grep -q "mov rbx, 42" "$BUILD_DIR/optimize-O1.asm"
-grep -q "mov r13, 0" "$BUILD_DIR/optimize-O1.asm"
+grep -q "mov rdx, 0" "$BUILD_DIR/optimize-O1.asm"
 grep -q "add rbx, 0" "$BUILD_DIR/optimize-O0.asm"
 if grep -q "add rbx, 0" "$BUILD_DIR/optimize-O1.asm" ||
-   grep -q "mov r12, r12" "$BUILD_DIR/optimize-O1.asm" ||
-   grep -q "imul r14, 1" "$BUILD_DIR/optimize-O1.asm"; then
+   grep -q "mov rcx, rcx" "$BUILD_DIR/optimize-O1.asm" ||
+   grep -q "imul rsi, 1" "$BUILD_DIR/optimize-O1.asm"; then
   echo "optimizer left removable instructions in -O1 output"
   exit 1
+fi
+
+# Each check below covers a lowering that used to produce silently wrong or
+# unassemblable code.
+cat > "$BUILD_DIR/regress.cas" <<'CAS'
+const stdout = 1
+
+.data
+a_label_long_enough_that_its_length_constant_used_to_be_truncated: string "hi\n"
+
+.bss
+cell: zero 8
+
+.text
+global _start
+
+_start:
+  mov r13, 111
+  mov r15, 222
+  store.q [cell], 5
+  shl r0, r1
+  sub r2, -5
+  div r4, r5
+  cmp r3, 42
+  syscall write, stdout, a_label_long_enough_that_its_length_constant_used_to_be_truncated, a_label_long_enough_that_its_length_constant_used_to_be_truncated_len
+  je done
+done:
+  ret
+CAS
+
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/regress.cas" --target x86_64-nasm -o "$BUILD_DIR/regress-x86.asm"
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/regress.cas" --target riscv64-gnu -o "$BUILD_DIR/regress-rv.s"
+
+# A virtual register must never land on the stack or frame pointer.
+if grep -qE "^  (mov|add|sub|xor|and|or|imul|neg|not|inc|dec|shl|shr|sar) (rsp|rbp)[,$]" "$BUILD_DIR/regress-x86.asm"; then
+  echo "a virtual register was lowered onto rsp or rbp"
+  exit 1
+fi
+# Virtual registers past the machine register file need backing store.
+grep -q "__cas_spill: resq" "$BUILD_DIR/regress-x86.asm"
+grep -q "mov qword \[rel __cas_spill+8\], 111" "$BUILD_DIR/regress-x86.asm"
+# A variable shift count has to reach cl; "shl reg, reg" does not assemble.
+grep -q "shl rax, cl" "$BUILD_DIR/regress-x86.asm"
+# idiv overwrites rdx, which carries a virtual register.
+grep -q "push rdx" "$BUILD_DIR/regress-x86.asm"
+
+# Subtracting a negative immediate used to emit "addi t2, t2, --5".
+grep -q "addi t2, t2, 5" "$BUILD_DIR/regress-rv.s"
+if grep -q -- "--" "$BUILD_DIR/regress-rv.s"; then
+  echo "riscv lowering emitted a doubled sign"
+  exit 1
+fi
+# A long label keeps its generated length constant, so it stays an immediate
+# ("li") rather than being mistaken for an address ("la").
+grep -q "li a2, a_label_long_enough_that_its_length_constant_used_to_be_truncated_len" "$BUILD_DIR/regress-rv.s"
+# A compare must not be carried in a register the syscall sequence writes.
+if grep -qE "^  b(eq|ne|lt|ge|gt|le)u? a[0-7]," "$BUILD_DIR/regress-rv.s"; then
+  echo "riscv compare was carried in a syscall argument register"
+  exit 1
+fi
+
+# Whether the output assembles is checked directly when an assembler is around.
+if command -v nasm > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for level in -O0 -O1; do
+      "$BUILD_DIR/commonasmc" "$example" --target x86_64-nasm "$level" -o "$BUILD_DIR/asm-${name}${level}.asm"
+      nasm -f elf64 "$BUILD_DIR/asm-${name}${level}.asm" -o "$BUILD_DIR/asm-${name}${level}.o"
+    done
+  done
+  echo "nasm accepted every x86_64 output."
+else
+  echo "nasm not found; skipped assembling the x86_64 output."
 fi
 
 targets="
