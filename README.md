@@ -35,6 +35,8 @@ a claim:
 - `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu` (binutils)
 - `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`,
   `power9-gnu`, `power10-gnu` (binutils)
+- `sparcv8-gnu`, `sparcv9-gnu` (binutils)
+- `m68k`, `coldfire` (binutils)
 
 Every family in the list below that claims to emit assembly is in that set.
 The rest is assembly-shaped text rather than assembly, and says so under
