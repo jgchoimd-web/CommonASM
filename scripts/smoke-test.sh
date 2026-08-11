@@ -374,6 +374,18 @@ else
   echo "no z/Architecture assembler found; skipped assembling the zarch output."
 fi
 
+# wasm is text that has to be assembled and validated, not linked.
+if command -v wat2wasm > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target wasm -o "$BUILD_DIR/wasm-${name}.wat"
+    wat2wasm "$BUILD_DIR/wasm-${name}.wat" -o "$BUILD_DIR/wasm-${name}.wasm"
+  done
+  echo "wat2wasm assembled and validated every wasm output."
+else
+  echo "no wat2wasm found; skipped validating the wasm output."
+fi
+
 if command -v clang > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)

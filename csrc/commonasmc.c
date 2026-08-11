@@ -153,6 +153,7 @@ typedef enum {
     CLASS_SPARC,
     CLASS_M68K,
     CLASS_S390,
+    CLASS_WASM,
     CLASS_ENCODING
 } TargetClass;
 
@@ -271,7 +272,7 @@ static const TargetDesc target_table[] = {
     {"ebpf", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"zarch", CLASS_S390, GROUP_LEGACY, 0},
 
-    {"wasm", CLASS_VM_IR, GROUP_VM_IR, 0},
+    {"wasm", CLASS_WASM, GROUP_VM_IR, 0},
     {"llvm-ir", CLASS_VM_IR, GROUP_VM_IR, 0},
     {"gcc-gimple", CLASS_VM_IR, GROUP_VM_IR, 0},
     {"gcc-rtl", CLASS_VM_IR, GROUP_VM_IR, 0},
@@ -738,6 +739,10 @@ static bool is_s390_target(const char *target) {
     return target_has_class(target, CLASS_S390);
 }
 
+static bool is_wasm_target(const char *target) {
+    return target_has_class(target, CLASS_WASM);
+}
+
 static bool is_vm_ir_target(const char *target) {
     return target_has_class(target, CLASS_VM_IR);
 }
@@ -799,6 +804,10 @@ static unsigned target_caps(const char *target) {
             return CAP_BSWAP | CAP_ROT;
         case CLASS_RV64:
             return (desc->flags & TF_RV_ZBB) ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT) : 0;
+        case CLASS_WASM:
+            /* wasm counts bits and rotates natively, but has nothing that
+               reverses bytes. */
+            return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_ROT;
         case CLASS_GENERIC:
             if (desc->flags & TF_AARCH64) {
                 return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
@@ -918,6 +927,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_SPARC: return "GNU SPARC assembly";
         case CLASS_M68K: return "GNU m68k assembly";
         case CLASS_S390: return "GNU z/Architecture assembly";
+        case CLASS_WASM: return "WebAssembly text";
         case CLASS_GENERIC:
         case CLASS_LEGACY: return "assembly-style text output";
         case CLASS_VM_IR: return "VM or compiler IR-style text output";
@@ -5100,6 +5110,483 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
     line_error(line_no, op, "unsupported instruction or wrong argument count for s390x");
 }
 
+/* ----------------------------------------------------------------- wasm */
+
+/* WebAssembly has no jump to a label. It has structured control flow, so
+   arbitrary jumps are expressed the way compilers normally express them: a
+   loop whose body is a br_table over a block index. Each label becomes a
+   case, a jump sets the index and re-enters the dispatch, and falling from
+   one case into the next needs nothing at all, because that is what the
+   nesting already does. Calls and returns ride a shadow stack in linear
+   memory, since the dispatch has no call stack of its own.
+
+   Registers become i64 locals, data becomes one linear memory segment laid
+   out in declaration order, and the syscalls become WASI imports. */
+
+#define WASM_MAX_BLOCKS 256
+#define WASM_DATA_BASE 1024
+#define WASM_STACK_TOP 65536
+
+typedef struct {
+    char label[96];
+    Buffer body;
+} WasmBlock;
+
+typedef struct {
+    char name[96];
+    long long offset;
+} WasmSymbol;
+
+static WasmBlock wasm_blocks[WASM_MAX_BLOCKS];
+static int wasm_block_count = 0;
+static WasmSymbol wasm_symbols[512];
+static int wasm_symbol_count = 0;
+static Buffer wasm_data;
+static bool wasm_active = false;
+static long long wasm_data_size = 0;
+static bool wasm_uses_read = false;
+static bool wasm_uses_write = false;
+static bool wasm_uses_close = false;
+
+static void wasm_begin(void) {
+    wasm_block_count = 0;
+    wasm_symbol_count = 0;
+    wasm_uses_read = false;
+    wasm_uses_write = false;
+    wasm_uses_close = false;
+    buf_init(&wasm_data);
+    wasm_data_size = 0;
+    wasm_active = true;
+    /* Everything before the first label belongs to an entry block. */
+    snprintf(wasm_blocks[0].label, sizeof(wasm_blocks[0].label), "%s", "");
+    buf_init(&wasm_blocks[0].body);
+    wasm_block_count = 1;
+}
+
+static Buffer *wasm_current(void) {
+    return &wasm_blocks[wasm_block_count - 1].body;
+}
+
+static void wasm_open_block(const char *label) {
+    if (wasm_block_count >= WASM_MAX_BLOCKS) {
+        die("too many labels for the wasm dispatch table");
+    }
+    snprintf(wasm_blocks[wasm_block_count].label, sizeof(wasm_blocks[0].label), "%s", label);
+    buf_init(&wasm_blocks[wasm_block_count].body);
+    wasm_block_count++;
+}
+
+static int wasm_block_index(const char *label) {
+    for (int i = 0; i < wasm_block_count; i++) {
+        if (strcmp(wasm_blocks[i].label, label) == 0) return i;
+    }
+    return -1;
+}
+
+static void wasm_record_symbol(const char *name, long long offset) {
+    if (wasm_symbol_count >= (int)(sizeof(wasm_symbols) / sizeof(wasm_symbols[0]))) {
+        die("too many data symbols for the wasm layout");
+    }
+    snprintf(wasm_symbols[wasm_symbol_count].name, sizeof(wasm_symbols[0].name), "%s", name);
+    wasm_symbols[wasm_symbol_count].offset = offset;
+    wasm_symbol_count++;
+}
+
+static bool wasm_symbol_offset(const char *name, long long *offset) {
+    for (int i = 0; i < wasm_symbol_count; i++) {
+        if (strcmp(wasm_symbols[i].name, name) == 0) {
+            *offset = wasm_symbols[i].offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Data is laid out as bytes rather than emitted as directives, because a
+   wasm data segment is a byte string and every reference to a label is the
+   offset the label ended up at. */
+static void wasm_emit_bytes(const char *values, int width) {
+    char work[1024];
+    char *cursor;
+    snprintf(work, sizeof(work), "%s", values);
+    cursor = work;
+    while (*cursor) {
+        char *comma = strchr(cursor, ',');
+        long long value;
+        if (comma) *comma = '\0';
+        value = strtoll(trim(cursor), NULL, 0);
+        for (int i = 0; i < width; i++) {
+            buf_appendf(&wasm_data, "\\%02x", (unsigned)((unsigned long long)value >> (i * 8)) & 0xffu);
+        }
+        if (!comma) break;
+        cursor = comma + 1;
+    }
+}
+
+static void wasm_data_line(char *line, int line_no) {
+    char *colon = strchr(line, ':');
+    char *name;
+    char *kind;
+    if (strncmp(line, "align ", 6) == 0) return;
+    if (!colon) line_error(line_no, "data", "expected name: directive");
+    *colon = '\0';
+    name = trim(line);
+    kind = trim(colon + 1);
+    wasm_record_symbol(name, WASM_DATA_BASE + wasm_data_size);
+    if (strncmp(kind, "string", 6) == 0 && isspace((unsigned char)kind[6])) {
+        char *quote = trim(kind + 6);
+        int count = 0;
+        char len_name[128];
+        if (*quote != '"') line_error(line_no, "string", "expected string literal");
+        quote++;
+        for (size_t i = 0; quote[i] && quote[i] != '"'; i++) {
+            unsigned char ch = (unsigned char)quote[i];
+            if (ch == '\\') {
+                i++;
+                if (quote[i] == 'n') ch = '\n';
+                else if (quote[i] == 't') ch = '\t';
+                else if (quote[i] == '0') ch = '\0';
+                else ch = (unsigned char)quote[i];
+            }
+            buf_appendf(&wasm_data, "\\%02x", ch);
+            count++;
+        }
+        wasm_data_size += count;
+        snprintf(len_name, sizeof(len_name), "%s_len", name);
+        {
+            char len_text[32];
+            snprintf(len_text, sizeof(len_text), "%d", count);
+            remember_constant(len_name, len_text);
+        }
+        return;
+    }
+    if (strncmp(kind, "zero", 4) == 0 && isspace((unsigned char)kind[4])) {
+        long long count = strtoll(trim(kind + 4), NULL, 0);
+        for (long long i = 0; i < count; i++) buf_append(&wasm_data, "\\00");
+        wasm_data_size += count;
+        return;
+    }
+    {
+        static const struct { const char *name; int width; } kinds[] = {
+            {"bytes", 1}, {"byte", 1}, {"word", 2}, {"dword", 4}, {"qword", 8}, {NULL, 0}
+        };
+        for (int i = 0; kinds[i].name; i++) {
+            size_t len = strlen(kinds[i].name);
+            if (strncmp(kind, kinds[i].name, len) == 0 && isspace((unsigned char)kind[len])) {
+                const char *values = trim(kind + len);
+                int count = 1;
+                for (const char *p = values; *p; p++) if (*p == ',') count++;
+                wasm_emit_bytes(values, kinds[i].width);
+                wasm_data_size += (long long)count * kinds[i].width;
+                return;
+            }
+        }
+    }
+    line_error(line_no, "data", "expected string, bytes, byte, word, dword, qword, or zero");
+}
+
+/* Pushes an operand onto the wasm stack as an i64. */
+static void wasm_push_operand(Buffer *out, const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    long long number;
+    if (reg >= 0) {
+        buf_appendf(out, "    local.get $r%d\n", reg);
+        return;
+    }
+    if (is_int(value)) {
+        buf_appendf(out, "    i64.const %lld\n", strtoll(value, NULL, 0));
+        return;
+    }
+    if (constant_value(value, &number)) {
+        buf_appendf(out, "    i64.const %lld\n", number);
+        return;
+    }
+    if (wasm_symbol_offset(value, &number)) {
+        buf_appendf(out, "    i64.const %lld\n", number);
+        return;
+    }
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+}
+
+static void wasm_store_reg(Buffer *out, const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    buf_appendf(out, "    local.set $r%d\n", reg);
+}
+
+/* Puts a byte address on the stack as an i32, which is what wasm memory
+   instructions take. */
+static void wasm_push_address(Buffer *out, const char *addr_text, int line_no, const char *op) {
+    Address addr;
+    long long base;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        buf_appendf(out, "    local.get $r%d\n", virtual_reg_index(addr.base));
+        buf_append(out, "    i32.wrap_i64\n");
+        if (addr.offset != 0) {
+            buf_appendf(out, "    i32.const %lld\n    i32.add\n", addr.offset);
+        }
+        return;
+    }
+    if (!wasm_symbol_offset(addr.symbol, &base)) {
+        line_error_token(line_no, addr.symbol, op, "no data with that name to address");
+    }
+    buf_appendf(out, "    i32.const %lld\n", base + addr.offset);
+}
+
+static void emit_wasm_instruction(const char *op, const char *size, char **args, int argc, int line_no) {
+    Buffer *out = wasm_current();
+    if (op_is(op, "func") && argc == 1) { wasm_open_block(args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") || op_is(op, "leave")) return;
+    if (op_is(op, "mov") && argc == 2) {
+        wasm_push_operand(out, args[1], line_no, op);
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        wasm_push_operand(out, args[1], line_no, op);
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        const char *kind = size[0] == 'b' ? "i64.load8_u" : size[0] == 'w' ? "i64.load16_u" :
+                           size[0] == 'd' ? "i64.load32_u" : "i64.load";
+        wasm_push_address(out, args[1], line_no, op);
+        buf_appendf(out, "    %s\n", kind);
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        const char *kind = size[0] == 'b' ? "i64.store8" : size[0] == 'w' ? "i64.store16" :
+                           size[0] == 'd' ? "i64.store32" : "i64.store";
+        wasm_push_address(out, args[0], line_no, op);
+        wasm_push_operand(out, args[1], line_no, op);
+        buf_appendf(out, "    %s\n", kind);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "mod") || op_is(op, "and") || op_is(op, "or") || op_is(op, "xor") ||
+         op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar") ||
+         op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
+        const char *native = op_is(op, "add") ? "i64.add" : op_is(op, "sub") ? "i64.sub" :
+                             op_is(op, "mul") ? "i64.mul" : op_is(op, "div") ? "i64.div_s" :
+                             op_is(op, "mod") ? "i64.rem_s" : op_is(op, "and") ? "i64.and" :
+                             op_is(op, "or") ? "i64.or" : op_is(op, "xor") ? "i64.xor" :
+                             op_is(op, "shl") ? "i64.shl" : op_is(op, "shr") ? "i64.shr_u" :
+                             op_is(op, "sar") ? "i64.shr_s" : op_is(op, "rol") ? "i64.rotl" : "i64.rotr";
+        wasm_push_operand(out, args[0], line_no, op);
+        wasm_push_operand(out, args[1], line_no, op);
+        buf_appendf(out, "    %s\n", native);
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if ((op_is(op, "popcnt") || op_is(op, "clz") || op_is(op, "ctz")) && argc == 1) {
+        const char *native = op_is(op, "popcnt") ? "i64.popcnt" : op_is(op, "clz") ? "i64.clz" : "i64.ctz";
+        wasm_push_operand(out, args[0], line_no, op);
+        buf_appendf(out, "    %s\n", native);
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        if (op_is(op, "neg")) {
+            buf_append(out, "    i64.const 0\n");
+            wasm_push_operand(out, args[0], line_no, op);
+            buf_append(out, "    i64.sub\n");
+        } else if (op_is(op, "not")) {
+            wasm_push_operand(out, args[0], line_no, op);
+            buf_append(out, "    i64.const -1\n    i64.xor\n");
+        } else {
+            wasm_push_operand(out, args[0], line_no, op);
+            buf_appendf(out, "    i64.const 1\n    %s\n", op_is(op, "inc") ? "i64.add" : "i64.sub");
+        }
+        wasm_store_reg(out, args[0], line_no, op);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        /* wasm has no condition register, so the two values are kept for the
+           branch to test. */
+        wasm_push_operand(out, args[0], line_no, op);
+        buf_append(out, "    local.set $cmp_a\n");
+        wasm_push_operand(out, args[1], line_no, op);
+        buf_append(out, "    local.set $cmp_b\n");
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        const char *test = op_is(op, "je") ? "i64.eq" : op_is(op, "jne") ? "i64.ne" :
+                           op_is(op, "jg") ? "i64.gt_s" : op_is(op, "jl") ? "i64.lt_s" :
+                           op_is(op, "jge") ? "i64.ge_s" : op_is(op, "jle") ? "i64.le_s" :
+                           op_is(op, "ja") ? "i64.gt_u" : op_is(op, "jb") ? "i64.lt_u" :
+                           op_is(op, "jae") ? "i64.ge_u" : "i64.le_u";
+        buf_append(out, "    local.get $cmp_a\n    local.get $cmp_b\n");
+        buf_appendf(out, "    %s\n", test);
+        buf_appendf(out, "    if\n      i32.const @%s@\n      local.set $pc\n      br $dispatch\n    end\n", args[0]);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) {
+        buf_appendf(out, "    i32.const @%s@\n    local.set $pc\n    br $dispatch\n", args[0]);
+        return;
+    }
+    if (op_is(op, "call") && argc == 1) {
+        /* The return index goes on a shadow stack, because the dispatch loop
+           has no call stack of its own. */
+        buf_appendf(out, "    local.get $sp\n    i32.const 4\n    i32.sub\n    local.set $sp\n");
+        buf_appendf(out, "    local.get $sp\n    i32.const @@next@@\n    i32.store\n");
+        buf_appendf(out, "    i32.const @%s@\n    local.set $pc\n    br $dispatch\n", args[0]);
+        return;
+    }
+    if (op_is(op, "ret") && argc == 0) {
+        buf_append(out, "    local.get $sp\n    i32.load\n    local.set $pc\n");
+        buf_append(out, "    local.get $sp\n    i32.const 4\n    i32.add\n    local.set $sp\n");
+        buf_append(out, "    br $dispatch\n");
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        buf_append(out, "    local.get $sp\n    i32.const 8\n    i32.sub\n    local.set $sp\n");
+        buf_append(out, "    local.get $sp\n");
+        wasm_push_operand(out, args[0], line_no, op);
+        buf_append(out, "    i64.store\n");
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_append(out, "    local.get $sp\n    i64.load\n");
+        wasm_store_reg(out, args[0], line_no, op);
+        buf_append(out, "    local.get $sp\n    i32.const 8\n    i32.add\n    local.set $sp\n");
+        return;
+    }
+    if (op_is(op, "syscall")) {
+        const char *result = syscall_result_operand(&args, &argc);
+        if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+        if (op_is(args[0], "exit")) {
+            wasm_push_operand(out, argc > 1 ? args[1] : "0", line_no, op);
+            buf_append(out, "    i32.wrap_i64\n    call $proc_exit\n    unreachable\n");
+            return;
+        }
+        if (op_is(args[0], "close")) {
+            wasm_uses_close = true;
+            if (argc < 2) line_error(line_no, "syscall", "close needs a descriptor");
+            wasm_push_operand(out, args[1], line_no, op);
+            buf_append(out, "    i32.wrap_i64\n    call $fd_close\n");
+            if (result) {
+                buf_append(out, "    i64.extend_i32_s\n");
+                wasm_store_reg(out, result, line_no, op);
+            } else {
+                buf_append(out, "    drop\n");
+            }
+            return;
+        }
+        if (op_is(args[0], "write") || op_is(args[0], "read")) {
+            const bool writing = op_is(args[0], "write");
+            if (argc < 4) line_error(line_no, "syscall", "needs a descriptor, a buffer and a length");
+            if (writing) wasm_uses_write = true; else wasm_uses_read = true;
+            /* WASI takes a vector of buffers, so one is built in the scratch
+               area below the stack. */
+            buf_appendf(out, "    i32.const %d\n", WASM_STACK_TOP);
+            wasm_push_operand(out, args[2], line_no, op);
+            buf_append(out, "    i32.wrap_i64\n    i32.store\n");
+            buf_appendf(out, "    i32.const %d\n", WASM_STACK_TOP + 4);
+            wasm_push_operand(out, args[3], line_no, op);
+            buf_append(out, "    i32.wrap_i64\n    i32.store\n");
+            wasm_push_operand(out, args[1], line_no, op);
+            buf_append(out, "    i32.wrap_i64\n");
+            buf_appendf(out, "    i32.const %d\n    i32.const 1\n    i32.const %d\n",
+                        WASM_STACK_TOP, WASM_STACK_TOP + 8);
+            buf_appendf(out, "    call $%s\n    drop\n", writing ? "fd_write" : "fd_read");
+            if (result) {
+                buf_appendf(out, "    i32.const %d\n    i32.load\n    i64.extend_i32_u\n", WASM_STACK_TOP + 8);
+                wasm_store_reg(out, result, line_no, op);
+            }
+            return;
+        }
+        line_error(line_no, "syscall",
+                   "wasm reaches the host through WASI, which offers read, write, close and exit;"
+                   " open needs a directory descriptor WASI does not hand a program by name");
+    }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for wasm");
+}
+
+/* Replaces the @label@ placeholders with the block index each label ended up
+   at, now that every label is known. */
+static void wasm_resolve_labels(Buffer *out, const char *body, int next_index, int line_no) {
+    const char *cursor = body;
+    while (*cursor) {
+        const char *at = strchr(cursor, '@');
+        char name[96];
+        const char *close;
+        int index;
+        if (!at) { buf_append(out, cursor); return; }
+        buf_grow(out, (size_t)(at - cursor));
+        memcpy(out->data + out->len, cursor, (size_t)(at - cursor));
+        out->len += (size_t)(at - cursor);
+        out->data[out->len] = '\0';
+        if (at[1] == '@') {
+            /* @@next@@ is the block after this one, which is where a call
+               comes back to. */
+            buf_appendf(out, "%d", next_index);
+            cursor = strstr(at + 2, "@@") + 2;
+            continue;
+        }
+        close = strchr(at + 1, '@');
+        if (!close || (size_t)(close - at - 1) >= sizeof(name)) die("malformed wasm label reference");
+        memcpy(name, at + 1, (size_t)(close - at - 1));
+        name[close - at - 1] = '\0';
+        index = wasm_block_index(name);
+        if (index < 0) line_error(line_no, name, "no label with that name to jump to");
+        buf_appendf(out, "%d", index);
+        cursor = close + 1;
+    }
+}
+
+static Buffer wasm_finish(void) {
+    Buffer out;
+    buf_init(&out);
+    buf_append(&out, "(module\n");
+    if (wasm_uses_write) {
+        buf_append(&out, "  (import \"wasi_snapshot_preview1\" \"fd_write\"\n"
+                         "    (func $fd_write (param i32 i32 i32 i32) (result i32)))\n");
+    }
+    if (wasm_uses_read) {
+        buf_append(&out, "  (import \"wasi_snapshot_preview1\" \"fd_read\"\n"
+                         "    (func $fd_read (param i32 i32 i32 i32) (result i32)))\n");
+    }
+    if (wasm_uses_close) {
+        buf_append(&out, "  (import \"wasi_snapshot_preview1\" \"fd_close\"\n"
+                         "    (func $fd_close (param i32) (result i32)))\n");
+    }
+    buf_append(&out, "  (import \"wasi_snapshot_preview1\" \"proc_exit\"\n"
+                     "    (func $proc_exit (param i32)))\n");
+    buf_append(&out, "  (memory (export \"memory\") 2)\n");
+    if (wasm_data.len) {
+        buf_appendf(&out, "  (data (i32.const %d) \"%s\")\n", WASM_DATA_BASE, wasm_data.data);
+    }
+    buf_append(&out, "  (func (export \"_start\")\n");
+    for (int i = 0; i < 16; i++) buf_appendf(&out, "    (local $r%d i64)\n", i);
+    buf_append(&out, "    (local $cmp_a i64) (local $cmp_b i64)\n");
+    buf_append(&out, "    (local $pc i32) (local $sp i32)\n");
+    buf_appendf(&out, "    i32.const %d\n    local.set $sp\n", WASM_STACK_TOP - 256);
+    buf_append(&out, "    (block $exit\n      (loop $dispatch\n");
+    /* The blocks nest so that a branch out of one lands at the start of the
+       next case, which is what makes falling through cost nothing. */
+    for (int i = wasm_block_count - 1; i >= 0; i--) {
+        buf_appendf(&out, "%*s(block $case%d\n", 8 + (wasm_block_count - 1 - i) * 2, "", i);
+    }
+    buf_appendf(&out, "%*slocal.get $pc\n", 8 + wasm_block_count * 2, "");
+    buf_appendf(&out, "%*sbr_table", 8 + wasm_block_count * 2, "");
+    for (int i = 0; i < wasm_block_count; i++) buf_appendf(&out, " $case%d", i);
+    buf_append(&out, " $exit\n");
+    for (int i = 0; i < wasm_block_count; i++) {
+        buf_appendf(&out, "%*s)\n", 8 + (wasm_block_count - 1 - i) * 2, "");
+        wasm_resolve_labels(&out, wasm_blocks[i].body.data, i + 1, 0);
+    }
+    buf_append(&out, "        br $exit\n      )\n    )\n  )\n)\n");
+    for (int i = 0; i < wasm_block_count; i++) free(wasm_blocks[i].body.data);
+    free(wasm_data.data);
+    wasm_active = false;
+    return out;
+}
+
 /* ---------------------------------------------------------- inline assembly */
 
 /* The operand text a backend uses for a virtual register, which is what an
@@ -5941,6 +6428,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     }
     if (len > 0 && line[len - 1] == ':') {
         line[len - 1] = '\0';
+        if (is_wasm_target(target)) { wasm_open_block(line); return; }
         if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s\n", line);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, ":%s\n", line);
         else buf_appendf(text, "%s:\n", line);
@@ -5948,6 +6436,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     }
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
+        if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
         else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
@@ -5958,6 +6447,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     }
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
+        if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
         else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
@@ -6001,6 +6491,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_wasm_target(target)) emit_wasm_instruction(base_op, size, args, argc, line_no);
     else if (is_s390_target(target)) emit_s390_instruction(text, base_op, size, args, argc, line_no);
     else if (is_sparc_target(target)) emit_sparc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_m68k_target(target)) emit_m68k_instruction(text, base_op, size, args, argc, line_no);
@@ -6372,6 +6863,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     }
     /* Scanned before the loop starts chopping the source into lines. */
     mentioned_vregs = scan_mentioned_vregs(source);
+    if (is_wasm_target(target)) wasm_begin();
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;
     optimizer.pending[0] = '\0';
@@ -6517,6 +7009,12 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             continue;
         }
         if (section_kind == SECTION_NONE) line_error(line_no, "section", "expected .data, .rodata, .bss, or .text");
+        /* wasm has one linear memory rather than sections, so every kind of
+           data lands in the same layout in the order it was declared. */
+        if (is_wasm_target(target) && section_kind != SECTION_TEXT) {
+            wasm_data_line(line, line_no);
+            continue;
+        }
         if (section_kind == SECTION_TEXT) emit_text_line_optimized(&text, line, line_no, target, &optimizer);
         else if (section_kind == SECTION_DATA) emit_data_line(&data, &constants, line, line_no, target, section);
         else if (section_kind == SECTION_RODATA) emit_data_line(&rodata, &constants, line, line_no, target, section);
@@ -6532,6 +7030,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         }
     }
     free(asm_first_body.data);
+    if (is_wasm_target(target)) {
+        free(constants.data); free(data.data); free(rodata.data); free(bss.data); free(text.data);
+        return wasm_finish();
+    }
     opt_flush(&text, target, &optimizer);
     /* Only reserve backing store for the spilled virtual registers if the
        program actually referenced one. */
@@ -6690,6 +7192,9 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
+
 
 
 
