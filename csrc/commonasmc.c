@@ -4796,6 +4796,26 @@ static int s390_spill_offset(const char *value) {
     return index * 8;
 }
 
+/* lgfi carries a 32-bit immediate sign-extended to 64. A wider value has to
+   be built from its halves, which is what the population count masks need. */
+static void s390_load_imm(Buffer *text, const char *reg, const char *value) {
+    long long number;
+    if (is_int(value)) {
+        number = strtoll(value, NULL, 0);
+    } else if (!constant_value(value, &number)) {
+        /* A name the source did not give a plain number to is left for the
+           assembler, which knows what it stands for. */
+        buf_appendf(text, "  lgfi %s, %s\n", reg, value);
+        return;
+    }
+    if (number >= -2147483647LL - 1 && number <= 2147483647LL) {
+        buf_appendf(text, "  lgfi %s, %lld\n", reg, number);
+        return;
+    }
+    buf_appendf(text, "  llilf %s, %llu\n", reg, (unsigned long long)number & 0xffffffffu);
+    buf_appendf(text, "  iihf %s, %llu\n", reg, ((unsigned long long)number >> 32) & 0xffffffffu);
+}
+
 /* Brings a virtual register into a real one, loading it from its slot when it
    has no register of its own. */
 static const char *s390_value_reg(Buffer *text, const char *value, const char *scratch,
@@ -4811,7 +4831,7 @@ static const char *s390_value_reg(Buffer *text, const char *value, const char *s
     if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
         line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
     }
-    if (is_int(value) || is_known_constant(value)) buf_appendf(text, "  lgfi %s, %s\n", scratch, value);
+    if (is_int(value) || is_known_constant(value)) s390_load_imm(text, scratch, value);
     else buf_appendf(text, "  larl %s, %s\n", scratch, value);
     return scratch;
 }
@@ -4938,7 +4958,7 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
             const char *from = s390_value_reg(text, args[1], S390_SCRATCH, line_no, op);
             if (strcmp(from, dst) != 0) buf_appendf(text, "  lgr %s, %s\n", dst, from);
         } else if (is_int(args[1]) || is_known_constant(args[1])) {
-            buf_appendf(text, "  lgfi %s, %s\n", dst, args[1]);
+            s390_load_imm(text, dst, args[1]);
         } else {
             buf_appendf(text, "  larl %s, %s\n", dst, args[1]);
         }
@@ -5054,7 +5074,7 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
             const char *rhs = s390_value_reg(text, s390_cmp.rhs, S390_SCRATCH, line_no, op);
             buf_appendf(text, "  %s %s, %s\n", unsigned_test ? "clgr" : "cgr", lhs, rhs);
         } else {
-            buf_appendf(text, "  lgfi %s, %s\n", S390_SCRATCH, s390_cmp.rhs);
+            s390_load_imm(text, S390_SCRATCH, s390_cmp.rhs);
             buf_appendf(text, "  %s %s, %s\n", unsigned_test ? "clgr" : "cgr", lhs, S390_SCRATCH);
         }
         buf_appendf(text, "  %s %s\n", branch, args[0]);
@@ -6670,6 +6690,7 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
 
 
 
