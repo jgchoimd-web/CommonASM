@@ -343,7 +343,7 @@ static int diagnostic_line_count = 0;
 static const char *diagnostic_path = NULL;
 static const char *usage_text =
     "usage: commonasmc input.cas|- --target TARGET [-o output|-] [-O0|-O1]\n"
-    "                  [--emulate-extended]\n"
+    "                  [--emulate-extended] [--translate-asm]\n"
     "       commonasmc --list-targets\n"
     "       commonasmc --target-info TARGET\n"
     "       commonasmc --version\n"
@@ -750,6 +750,11 @@ static bool is_supported_target(const char *target) {
    their architecture defines - an x86-64 without POPCNT, say - and it lets the
    expansions be tested on a target that would otherwise never use them. */
 static bool force_extended_fallback = false;
+
+/* Set by --translate-asm. An inline block written for another machine is
+   lifted back into CommonASM and lowered for this one, rather than being
+   skipped for want of an arm somebody did not write. */
+static bool translate_inline_asm = false;
 
 static unsigned target_caps(const char *target) {
     const TargetDesc *desc = target_lookup(target);
@@ -3864,6 +3869,336 @@ static void emit_inline_asm_line(Buffer *out, const char *line, const char *targ
     buf_append(out, "\n");
 }
 
+/* ------------------------------------------------- inline assembly lifting */
+
+/* With --translate-asm, a block written for a machine other than the one being
+   compiled for is lifted back into CommonASM instead of being skipped. That is
+   only possible because the block names its registers as {rN}: the operands
+   are already the compiler's, so a recognised instruction can be mapped
+   straight back to the operation it came from. Anything outside the
+   recognised set is reported rather than guessed at. */
+typedef enum {
+    LIFT_DST_SRC,   /* op d, s        -> cas d, s   */
+    LIFT_DST,       /* op d           -> cas d      */
+    LIFT_DST_A_B,   /* op d, a, b     -> cas d, b, moving a into d first */
+    LIFT_UNARY_2    /* op d, s        -> mov d, s then cas d */
+} LiftShape;
+
+typedef struct {
+    const char *mnemonic;
+    const char *cas_op;
+    LiftShape shape;
+} LiftRule;
+
+static const LiftRule lift_x86[] = {
+    {"mov", "mov", LIFT_DST_SRC}, {"add", "add", LIFT_DST_SRC},
+    {"sub", "sub", LIFT_DST_SRC}, {"and", "and", LIFT_DST_SRC},
+    {"or", "or", LIFT_DST_SRC}, {"xor", "xor", LIFT_DST_SRC},
+    {"cmp", "cmp", LIFT_DST_SRC}, {"imul", "mul", LIFT_DST_SRC},
+    {"shl", "shl", LIFT_DST_SRC}, {"shr", "shr", LIFT_DST_SRC},
+    {"sar", "sar", LIFT_DST_SRC}, {"rol", "rol", LIFT_DST_SRC},
+    {"ror", "ror", LIFT_DST_SRC}, {"neg", "neg", LIFT_DST},
+    {"not", "not", LIFT_DST}, {"inc", "inc", LIFT_DST},
+    {"dec", "dec", LIFT_DST}, {"bswap", "bswap", LIFT_DST},
+    {"push", "push", LIFT_DST}, {"pop", "pop", LIFT_DST},
+    {"popcnt", "popcnt", LIFT_UNARY_2}, {"lzcnt", "clz", LIFT_UNARY_2},
+    {"tzcnt", "ctz", LIFT_UNARY_2}, {NULL, NULL, LIFT_DST}
+};
+
+static const LiftRule lift_a64[] = {
+    {"mov", "mov", LIFT_DST_SRC}, {"add", "add", LIFT_DST_A_B},
+    {"sub", "sub", LIFT_DST_A_B}, {"and", "and", LIFT_DST_A_B},
+    {"orr", "or", LIFT_DST_A_B}, {"eor", "xor", LIFT_DST_A_B},
+    {"mul", "mul", LIFT_DST_A_B}, {"sdiv", "div", LIFT_DST_A_B},
+    {"lsl", "shl", LIFT_DST_A_B}, {"lsr", "shr", LIFT_DST_A_B},
+    {"asr", "sar", LIFT_DST_A_B}, {"ror", "ror", LIFT_DST_A_B},
+    {"cmp", "cmp", LIFT_DST_SRC}, {"clz", "clz", LIFT_UNARY_2},
+    {"rev", "bswap", LIFT_UNARY_2}, {"neg", "neg", LIFT_UNARY_2},
+    {"mvn", "not", LIFT_UNARY_2}, {NULL, NULL, LIFT_DST}
+};
+
+static const LiftRule lift_rv[] = {
+    {"mv", "mov", LIFT_DST_SRC}, {"li", "mov", LIFT_DST_SRC},
+    {"add", "add", LIFT_DST_A_B}, {"addi", "add", LIFT_DST_A_B},
+    {"sub", "sub", LIFT_DST_A_B}, {"and", "and", LIFT_DST_A_B},
+    {"andi", "and", LIFT_DST_A_B}, {"or", "or", LIFT_DST_A_B},
+    {"ori", "or", LIFT_DST_A_B}, {"xor", "xor", LIFT_DST_A_B},
+    {"xori", "xor", LIFT_DST_A_B}, {"mul", "mul", LIFT_DST_A_B},
+    {"div", "div", LIFT_DST_A_B}, {"rem", "mod", LIFT_DST_A_B},
+    {"sll", "shl", LIFT_DST_A_B}, {"slli", "shl", LIFT_DST_A_B},
+    {"srl", "shr", LIFT_DST_A_B}, {"srli", "shr", LIFT_DST_A_B},
+    {"sra", "sar", LIFT_DST_A_B}, {"srai", "sar", LIFT_DST_A_B},
+    {"rol", "rol", LIFT_DST_A_B}, {"ror", "ror", LIFT_DST_A_B},
+    {"rori", "ror", LIFT_DST_A_B}, {"cpop", "popcnt", LIFT_UNARY_2},
+    {"clz", "clz", LIFT_UNARY_2}, {"ctz", "ctz", LIFT_UNARY_2},
+    {"rev8", "bswap", LIFT_UNARY_2}, {"neg", "neg", LIFT_UNARY_2},
+    {"not", "not", LIFT_UNARY_2}, {NULL, NULL, LIFT_DST}
+};
+
+static const LiftRule lift_mips[] = {
+    {"move", "mov", LIFT_DST_SRC}, {"li", "mov", LIFT_DST_SRC},
+    {"dli", "mov", LIFT_DST_SRC},
+    {"addu", "add", LIFT_DST_A_B}, {"daddu", "add", LIFT_DST_A_B},
+    {"addiu", "add", LIFT_DST_A_B}, {"daddiu", "add", LIFT_DST_A_B},
+    {"subu", "sub", LIFT_DST_A_B}, {"dsubu", "sub", LIFT_DST_A_B},
+    {"and", "and", LIFT_DST_A_B}, {"andi", "and", LIFT_DST_A_B},
+    {"or", "or", LIFT_DST_A_B}, {"ori", "or", LIFT_DST_A_B},
+    {"xor", "xor", LIFT_DST_A_B}, {"xori", "xor", LIFT_DST_A_B},
+    {"mul", "mul", LIFT_DST_A_B}, {"div", "div", LIFT_DST_A_B},
+    {"rem", "mod", LIFT_DST_A_B}, {"sll", "shl", LIFT_DST_A_B},
+    {"srl", "shr", LIFT_DST_A_B}, {"sra", "sar", LIFT_DST_A_B},
+    {"sllv", "shl", LIFT_DST_A_B}, {"srlv", "shr", LIFT_DST_A_B},
+    {"srav", "sar", LIFT_DST_A_B}, {"negu", "neg", LIFT_UNARY_2},
+    {NULL, NULL, LIFT_DST}
+};
+
+static const LiftRule *lift_rules_for(const char *selector, char *comment_out, size_t comment_size) {
+    if (strcmp(selector, "x86_64") == 0 || strcmp(selector, "i386") == 0 ||
+        target_has_class(selector, CLASS_X86_64) || target_has_class(selector, CLASS_I386)) {
+        snprintf(comment_out, comment_size, ";");
+        return lift_x86;
+    }
+    if (strcmp(selector, "aarch64") == 0 || target_has_flag(selector, TF_AARCH64)) {
+        snprintf(comment_out, comment_size, "//");
+        return lift_a64;
+    }
+    if (strcmp(selector, "arm32") == 0 || target_has_flag(selector, TF_ARM32)) {
+        snprintf(comment_out, comment_size, "@");
+        return lift_a64; /* ARM and AArch64 share this instruction shape */
+    }
+    if (strcmp(selector, "riscv64") == 0 || target_has_class(selector, CLASS_RV64)) {
+        snprintf(comment_out, comment_size, "#");
+        return lift_rv;
+    }
+    if (strcmp(selector, "mips") == 0 || target_has_class(selector, CLASS_MIPS)) {
+        snprintf(comment_out, comment_size, "#");
+        return lift_mips;
+    }
+    return NULL;
+}
+
+/* An operand a lifted instruction can use: a {rN} placeholder, or a literal
+   in any of the spellings these assemblers accept. */
+static bool lift_operand(const char *text, char *out, size_t out_size) {
+    size_t len = strlen(text);
+    if (len >= 4 && text[0] == '{' && text[len - 1] == '}') {
+        char name[16];
+        if (len - 2 >= sizeof(name)) return false;
+        memcpy(name, text + 1, len - 2);
+        name[len - 2] = '\0';
+        if (virtual_reg_index(name) < 0) return false;
+        snprintf(out, out_size, "%s", name);
+        return true;
+    }
+    if (text[0] == '#' || text[0] == '$') text++;
+    if (!is_int(text)) return false;
+    snprintf(out, out_size, "%s", text);
+    return true;
+}
+
+/* A virtual register the lifted sequence can borrow, avoiding up to three
+   that are already in play. */
+static int lift_pick_scratch(const char *target, const char *a, const char *b, const char *c) {
+    for (int i = target_max_vreg(target); i >= 0; i--) {
+        char name[8];
+        snprintf(name, sizeof(name), "r%d", i);
+        if (a && strcmp(name, a) == 0) continue;
+        if (b && strcmp(name, b) == 0) continue;
+        if (c && strcmp(name, c) == 0) continue;
+        return i;
+    }
+    return -1;
+}
+
+/* lea computes an address instead of loading from one, which makes it the x86
+   way to spell a small arithmetic expression, so it is worth carrying over.
+   The forms it takes are a base, an optional scaled index and a constant. */
+static bool lift_lea(Buffer *text, char **args, int argc, const char *target, int line_no) {
+    char expr[256];
+    char dst[32];
+    char base[32] = {0};
+    char index[32] = {0};
+    long long scale = 1;
+    long long disp = 0;
+    bool have_base = false;
+    bool have_index = false;
+    char *cursor;
+    size_t len;
+    int scratch;
+    if (argc != 2 || !lift_operand(args[0], dst, sizeof(dst))) return false;
+    len = strlen(args[1]);
+    if (len < 3 || args[1][0] != '[' || args[1][len - 1] != ']' || len - 2 >= sizeof(expr)) return false;
+    memcpy(expr, args[1] + 1, len - 2);
+    expr[len - 2] = '\0';
+    cursor = expr;
+    while (*cursor) {
+        char term[64];
+        char *plus = strchr(cursor, '+');
+        char *star;
+        char *piece;
+        size_t term_len = plus ? (size_t)(plus - cursor) : strlen(cursor);
+        if (term_len >= sizeof(term)) return false;
+        memcpy(term, cursor, term_len);
+        term[term_len] = '\0';
+        cursor = plus ? plus + 1 : cursor + strlen(cursor);
+        piece = trim(term);
+        if (!*piece) continue;
+        star = strchr(piece, '*');
+        if (star) {
+            char reg[16];
+            char *amount;
+            *star = '\0';
+            amount = trim(star + 1);
+            if (!lift_operand(trim(piece), reg, sizeof(reg)) || virtual_reg_index(reg) < 0) return false;
+            if (!is_int(amount)) return false;
+            scale = strtoll(amount, NULL, 0);
+            snprintf(index, sizeof(index), "%s", reg);
+            have_index = true;
+        } else {
+            char value[32];
+            if (!lift_operand(piece, value, sizeof(value))) return false;
+            if (virtual_reg_index(value) >= 0) {
+                if (!have_base) { snprintf(base, sizeof(base), "%s", value); have_base = true; }
+                else if (!have_index) { snprintf(index, sizeof(index), "%s", value); have_index = true; }
+                else return false;
+            } else {
+                disp = strtoll(value, NULL, 0);
+            }
+        }
+    }
+    if (!have_base && !have_index) return false;
+    scratch = lift_pick_scratch(target, dst, base, index);
+    if (scratch < 0) return false;
+    /* Built in a borrowed register so that the destination can also be one of
+       the inputs, which is the usual case. */
+    emit_cas(text, target, line_no, "push r%d", scratch);
+    if (have_index) {
+        emit_cas(text, target, line_no, "mov r%d, %s", scratch, index);
+        if (scale != 1) emit_cas(text, target, line_no, "mul r%d, %lld", scratch, scale);
+        if (have_base) emit_cas(text, target, line_no, "add r%d, %s", scratch, base);
+    } else {
+        emit_cas(text, target, line_no, "mov r%d, %s", scratch, base);
+    }
+    if (disp != 0) emit_cas(text, target, line_no, "add r%d, %lld", scratch, disp);
+    emit_cas(text, target, line_no, "mov %s, r%d", dst, scratch);
+    emit_cas(text, target, line_no, "pop r%d", scratch);
+    return true;
+}
+
+static void lift_line(Buffer *text, const LiftRule *rules, const char *selector,
+                      char *line, const char *target, int line_no) {
+    char *space;
+    char *args[8];
+    char ops[4][64];
+    int argc = 0;
+    size_t len = strlen(line);
+    if (len == 0) return;
+    if (line[len - 1] == ':') {
+        emit_cas(text, target, line_no, "%s", line);
+        return;
+    }
+    space = line;
+    while (*space && !isspace((unsigned char)*space)) space++;
+    if (*space) {
+        *space++ = '\0';
+        argc = split_args(space, args, 8);
+    }
+    if (rules == lift_x86 && strcmp(line, "lea") == 0 &&
+        lift_lea(text, args, argc, target, line_no)) {
+        return;
+    }
+    for (const LiftRule *rule = rules; rule->mnemonic; rule++) {
+        if (strcmp(rule->mnemonic, line) != 0) continue;
+        if (rule->shape == LIFT_DST && argc == 1 && lift_operand(args[0], ops[0], sizeof(ops[0]))) {
+            emit_cas(text, target, line_no, "%s %s", rule->cas_op, ops[0]);
+            return;
+        }
+        if ((rule->shape == LIFT_DST_SRC || rule->shape == LIFT_UNARY_2) && argc == 2 &&
+            lift_operand(args[0], ops[0], sizeof(ops[0])) &&
+            lift_operand(args[1], ops[1], sizeof(ops[1]))) {
+            if (rule->shape == LIFT_UNARY_2) {
+                if (strcmp(ops[0], ops[1]) != 0) {
+                    emit_cas(text, target, line_no, "mov %s, %s", ops[0], ops[1]);
+                }
+                emit_cas(text, target, line_no, "%s %s", rule->cas_op, ops[0]);
+            } else {
+                emit_cas(text, target, line_no, "%s %s, %s", rule->cas_op, ops[0], ops[1]);
+            }
+            return;
+        }
+        if (rule->shape == LIFT_DST_A_B && argc >= 3 && argc <= 4 &&
+            lift_operand(args[0], ops[0], sizeof(ops[0])) &&
+            lift_operand(args[1], ops[1], sizeof(ops[1])) &&
+            lift_operand(args[2], ops[2], sizeof(ops[2]))) {
+            /* A trailing "lsl #n" turns the third operand into a shifted one,
+               which is common enough on ARM to be worth carrying over. */
+            const char *shift_op = NULL;
+            char shift_amount[32] = {0};
+            int scratch_a, scratch_b;
+            if (argc == 4) {
+                char kind[16];
+                const char *rest = args[3];
+                size_t i = 0;
+                while (rest[i] && !isspace((unsigned char)rest[i]) && i + 1 < sizeof(kind)) {
+                    kind[i] = rest[i];
+                    i++;
+                }
+                kind[i] = '\0';
+                while (rest[i] && isspace((unsigned char)rest[i])) i++;
+                if (!lift_operand(rest + i, shift_amount, sizeof(shift_amount))) break;
+                if (strcmp(kind, "lsl") == 0) shift_op = "shl";
+                else if (strcmp(kind, "lsr") == 0) shift_op = "shr";
+                else if (strcmp(kind, "asr") == 0) shift_op = "sar";
+                else break;
+            }
+            /* d = a op b has to be expressed as a two-address sequence, and
+               the value of b must survive being written into d. */
+            ext_pick_scratch(target, ops[0], ops[1], &scratch_a, &scratch_b);
+            emit_cas(text, target, line_no, "push r%d", scratch_a);
+            emit_cas(text, target, line_no, "mov r%d, %s", scratch_a, ops[2]);
+            if (shift_op) {
+                emit_cas(text, target, line_no, "%s r%d, %s", shift_op, scratch_a, shift_amount);
+            }
+            emit_cas(text, target, line_no, "mov %s, %s", ops[0], ops[1]);
+            emit_cas(text, target, line_no, "%s %s, r%d", rule->cas_op, ops[0], scratch_a);
+            emit_cas(text, target, line_no, "pop r%d", scratch_a);
+            return;
+        }
+        break;
+    }
+    line_error_token(line_no, line, "asm",
+                     "--translate-asm does not recognise this instruction; give the run a portable arm instead");
+    (void)selector;
+}
+
+/* Lifts a whole block. Returns false when the block's own family has no
+   lifting rules at all. */
+static bool translate_asm_block(Buffer *text, const char *selector, const char *body,
+                                const char *target, int line_no) {
+    char comment[8];
+    const LiftRule *rules = lift_rules_for(selector, comment, sizeof(comment));
+    const char *cursor = body;
+    if (!rules) return false;
+    while (*cursor) {
+        char work[512];
+        const char *newline = strchr(cursor, '\n');
+        size_t len = newline ? (size_t)(newline - cursor) : strlen(cursor);
+        char *trimmed;
+        char *mark;
+        if (len >= sizeof(work)) len = sizeof(work) - 1;
+        memcpy(work, cursor, len);
+        work[len] = '\0';
+        cursor = newline ? newline + 1 : cursor + strlen(cursor);
+        /* The source family decides what a comment looks like; '#' is an
+           immediate in ARM assembly, not the start of one. */
+        mark = strstr(work, comment);
+        if (mark) *mark = '\0';
+        trimmed = trim(work);
+        if (*trimmed) lift_line(text, rules, selector, trimmed, target, line_no);
+    }
+    return true;
+}
+
 static void emit_text_line(Buffer *text, char *line, int line_no, const char *target) {
     char *space;
     char *args[16];
@@ -4291,6 +4626,11 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     bool asm_run_open = false;
     bool asm_run_matched = false;
     int asm_run_line = 0;
+    /* The first arm of a run is kept so that --translate-asm has something to
+       lift when no arm turns out to match. */
+    Buffer asm_first_body;
+    char asm_first_selector[64] = {0};
+    bool asm_capturing = false;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
     const bool i386 = is_i386_target(target);
     const bool rv = is_rv64_target(target);
@@ -4309,6 +4649,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     optimizer.pending_value = 0;
     optimizer.pending_line_no = 0;
     buf_init(&constants); buf_init(&data); buf_init(&rodata); buf_init(&bss); buf_init(&text);
+    buf_init(&asm_first_body);
     while (*cursor) {
         char *line = cursor;
         char *newline = strchr(cursor, '\n');
@@ -4329,6 +4670,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             if (strcmp(body, "}") == 0) {
                 in_asm_block = false;
                 continue;
+            }
+            if (asm_capturing) {
+                buf_append(&asm_first_body, line);
+                buf_append(&asm_first_body, "\n");
             }
             if (asm_emitting) {
                 if (asm_verbatim) {
@@ -4368,6 +4713,12 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
                 asm_run_open = true;
                 asm_run_matched = false;
                 asm_run_line = line_no;
+                asm_first_body.len = 0;
+                asm_first_body.data[0] = '\0';
+                snprintf(asm_first_selector, sizeof(asm_first_selector), "%s", selector);
+                asm_capturing = true;
+            } else {
+                asm_capturing = false;
             }
             asm_verbatim = strcmp(selector, "portable") != 0;
             if (!asm_verbatim && section_kind != SECTION_TEXT) {
@@ -4387,7 +4738,13 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         }
         if (asm_run_open) {
             if (!asm_run_matched) {
-                line_error(asm_run_line, "asm", "no asm block here matches the target being compiled");
+                if (!translate_inline_asm ||
+                    !translate_asm_block(&text, asm_first_selector, asm_first_body.data, target, asm_run_line)) {
+                    line_error(asm_run_line, "asm",
+                               translate_inline_asm
+                                   ? "no asm block matches this target, and the first one is not from a family that can be lifted"
+                                   : "no asm block here matches the target being compiled");
+                }
             }
             asm_run_open = false;
         }
@@ -4439,8 +4796,12 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         line_error(asm_run_line, "asm", "unterminated asm block; expected a closing }");
     }
     if (asm_run_open && !asm_run_matched) {
-        line_error(asm_run_line, "asm", "no asm block here matches the target being compiled");
+        if (!translate_inline_asm ||
+            !translate_asm_block(&text, asm_first_selector, asm_first_body.data, target, asm_run_line)) {
+            line_error(asm_run_line, "asm", "no asm block here matches the target being compiled");
+        }
     }
+    free(asm_first_body.data);
     opt_flush(&text, target, &optimizer);
     /* Only reserve backing store for the spilled virtual registers if the
        program actually referenced one. */
@@ -4526,6 +4887,8 @@ int main(int argc, char **argv) {
         puts("Use -O1, -O, or --optimize to enable peephole code optimization.");
         puts("Use --emulate-extended to expand popcnt, clz, ctz, bswap, rol and ror");
         puts("instead of using the target's instructions for them.");
+        puts("Use --translate-asm to lift an inline asm block written for another");
+        puts("machine back into CommonASM, instead of failing for want of an arm.");
         return 0;
     }
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -4546,6 +4909,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-O0") == 0 || strcmp(argv[i], "--no-optimize") == 0) opt_level = 0;
         else if (strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "--optimize") == 0 || strcmp(argv[i], "--optimize=1") == 0) opt_level = 1;
         else if (strcmp(argv[i], "--emulate-extended") == 0) force_extended_fallback = true;
+        else if (strcmp(argv[i], "--translate-asm") == 0) translate_inline_asm = true;
         else if (strcmp(argv[i], "--optimize=0") == 0) opt_level = 0;
         else if (strncmp(argv[i], "-O", 2) == 0 || strncmp(argv[i], "--optimize=", 11) == 0) die("unsupported optimization level; use -O0 or -O1");
         else if (!input) input = argv[i];

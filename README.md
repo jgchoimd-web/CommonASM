@@ -324,8 +324,42 @@ settled before the block and not carried across it. And `{rN}` needs a
 register the target can name: where a virtual register lives in a spill slot,
 x86 can still name it as a memory operand, but ARM cannot, and says so.
 
+### Lifting a block to another machine
+
+`--translate-asm` changes what happens when no arm matches. Instead of the
+error, the first block in the run is read back as assembly, turned into the
+CommonASM it came from, and lowered for the target actually being compiled:
+
+```
+$ commonasmc prog.cas --target riscv64-gnu --translate-asm
+```
+
+```asm
+  asm x86_64 {              # written only for x86
+    lea {r1}, [{r0}]
+    imul {r1}, 3
+    popcnt {r2}, {r1}
+  }
+```
+
+becomes, on AArch64, `mul` followed by the `fmov`/`cnt`/`addv` population
+count; on RISC-V without the bit-manipulation extension, `mul` followed by the
+expanded fold. This works because a block names its registers as `{rN}`: the
+operands are already the compiler's, so a recognised instruction maps straight
+back to the operation it came from.
+
+Recognised are the ordinary arithmetic, logic, shift, rotate, compare and
+stack instructions of x86, ARM, AArch64, RISC-V and MIPS, the bit operations
+(`popcnt`/`cpop`, `lzcnt`/`clz`, `tzcnt`/`ctz`, `bswap`/`rev`/`rev8`), ARM's
+shifted third operand, and x86's `lea` as the arithmetic it usually stands
+for. Anything else is reported by name rather than guessed at — the option
+does not turn an unreadable block into a plausible one.
+
 `examples/inline.cas` shows both forms. The block in
-`tests/extended-kernel.cas` is checked by running it.
+`tests/extended-kernel.cas` is checked by running it, and every block in
+`tests/translate-kernel.cas` is written for AArch64 so that an x86-64 build
+has to lift all of them; running that is what shows the lifting preserved
+what the blocks meant.
 
 `cmp a, b` records the relation between `a` and `b` for the following
 conditional jump. Signed jumps use `jg`/`jl`/`jge`/`jle`; unsigned jumps use

@@ -171,6 +171,26 @@ if command -v nasm > /dev/null 2>&1 && [ "$(uname -m)" = "x86_64" ]; then
     "$BUILD_DIR/extrun-$mode"
   done
   echo "extended operations agree with the reference, native and expanded."
+
+  # Every block in this kernel is written for AArch64, so an x86-64 build has
+  # to lift all of them. Running it is what shows the lifting kept the meaning.
+  "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/translate-kernel.cas" --target x86_64-nasm \
+    --translate-asm -o "$BUILD_DIR/translate-kernel.asm"
+  nasm -f elf64 $NASM_STRICT "$BUILD_DIR/translate-kernel.asm" -o "$BUILD_DIR/translate-kernel.o"
+  "$CC" "$ROOT_DIR/tests/translate-driver.c" "$BUILD_DIR/translate-kernel.o" \
+    -o "$BUILD_DIR/translate-run"
+  echo "  lifted AArch64 blocks running on x86-64:"
+  "$BUILD_DIR/translate-run"
+
+  # Without the option the same source must be rejected rather than quietly
+  # losing the blocks.
+  if "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/translate-kernel.cas" --target x86_64-nasm \
+       -o "$BUILD_DIR/translate-nope.asm" 2> "$BUILD_DIR/translate-nope.txt"; then
+    echo "expected an unmatched asm run to fail without --translate-asm"
+    exit 1
+  fi
+  grep -q "no asm block" "$BUILD_DIR/translate-nope.txt"
+  echo "an unmatched asm run still fails without --translate-asm."
 else
   echo "skipped running the extended operation checks."
 fi

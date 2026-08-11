@@ -1,0 +1,62 @@
+; Every block here is written for AArch64, so on any other machine there is no
+; arm to use and --translate-asm has to lift them. Built for x86-64 and linked
+; against tests/translate-driver.c, which checks the results: that is how the
+; lifting is shown to preserve what a block meant, rather than merely to
+; produce something an assembler will take.
+
+.data
+cas_in: qword 0
+cas_triple: qword 0
+cas_sum: qword 0
+cas_leading: qword 0
+cas_swapped: qword 0
+cas_shifted: qword 0
+
+.text
+global cas_run
+global cas_in
+global cas_triple
+global cas_sum
+global cas_leading
+global cas_swapped
+global cas_shifted
+
+func cas_run
+  ; x * 3, the way AArch64 spells it: a shifted add
+  load.q r0, [cas_in]
+  asm aarch64 {
+    add {r0}, {r0}, {r0}, lsl #1
+  }
+  store.q [cas_triple], r0
+
+  ; x + 100, with the addend in a register
+  load.q r0, [cas_in]
+  mov r1, 100
+  asm aarch64 {
+    add {r0}, {r0}, {r1}
+  }
+  store.q [cas_sum], r0
+
+  ; leading zeros
+  load.q r0, [cas_in]
+  asm aarch64 {
+    clz {r0}, {r0}
+  }
+  store.q [cas_leading], r0
+
+  ; byte order, written into a different register than it came from
+  load.q r0, [cas_in]
+  asm aarch64 {
+    rev {r2}, {r0}
+  }
+  store.q [cas_swapped], r2
+
+  ; shift by a constant
+  load.q r0, [cas_in]
+  asm aarch64 {
+    lsl {r0}, {r0}, #5
+  }
+  store.q [cas_shifted], r0
+
+  ret
+endfunc

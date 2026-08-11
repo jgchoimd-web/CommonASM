@@ -289,6 +289,28 @@ if ((Get-Command nasm -ErrorAction SilentlyContinue) -and (Get-Command $Compiler
         Invoke-Native $RunPath @()
     }
     Write-Host "extended operations agree with the reference, native and expanded."
+
+    # Every block in this kernel is written for AArch64, so an x86-64 build has
+    # to lift all of them. Running it is what shows the lifting kept the meaning.
+    $TrAsm = Join-Path $BuildPath "translate-kernel-pwsh.asm"
+    $TrObj = Join-Path $BuildPath "translate-kernel-pwsh.o"
+    $TrRun = Join-Path $BuildPath "translate-run-pwsh$(if ($IsWindowsPlatform) { '.exe' } else { '' })"
+    Invoke-Native $CompilerExe @((Join-Path $RootDir "tests/translate-kernel.cas"), "--target", "x86_64-nasm",
+        "--translate-asm", "-o", $TrAsm)
+    Invoke-Native "nasm" @("-f", $HostObjFormat, $NasmStrict, $TrAsm, "-o", $TrObj)
+    Invoke-Native $Compiler @((Join-Path $RootDir "tests/translate-driver.c"), $TrObj, "-o", $TrRun)
+    Write-Host "  lifted AArch64 blocks running on x86-64:"
+    Invoke-Native $TrRun @()
+
+    # Without the option the same source must be rejected rather than quietly
+    # losing the blocks.
+    $TrNope = Join-Path $BuildPath "translate-nope-pwsh.txt"
+    Invoke-NativeExpectFailure $TrNope $CompilerExe @(
+        (Join-Path $RootDir "tests/translate-kernel.cas"), "--target", "x86_64-nasm",
+        "-o", (Join-Path $BuildPath "translate-nope-pwsh.asm")
+    ) "expected an unmatched asm run to fail without --translate-asm"
+    Assert-Contains $TrNope "no asm block"
+    Write-Host "an unmatched asm run still fails without --translate-asm."
 } else {
     Write-Host "skipped running the extended operation checks."
 }
