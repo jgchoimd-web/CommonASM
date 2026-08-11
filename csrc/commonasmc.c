@@ -74,18 +74,42 @@ static const char *dcpu_regs[] = {
     "A", "B", "C", "X", "Y", "Z", "I", "J",
     "A", "B", "C", "X", "Y", "Z", "I", "J"
 };
+/* The old table listed eight machine registers twice, so virtual r0 and r8
+   both became ebx and quietly overwrote each other, and it handed out esp and
+   ebp as well. esp and ebp belong to the frame and eax and edx are the
+   compiler's scratch pair, which leaves four machine registers; the other
+   twelve virtual registers get spill slots. Reserving edx also means the
+   division sequence has it free without saving anything. */
 static const char *i386_regs[] = {
-    "ebx", "ecx", "edx", "esi", "edi", "ebp", "eax", "esp",
-    "ebx", "ecx", "edx", "esi", "edi", "ebp", "eax", "esp"
+    "ebx", "ecx", "esi", "edi"
 };
+static const char *i386_regs_w[] = {
+    "bx", "cx", "si", "di"
+};
+
+#define I386_MAPPED_COUNT ((int)(sizeof(i386_regs) / sizeof(i386_regs[0])))
+#define I386_SPILL_COUNT (16 - I386_MAPPED_COUNT)
+#define I386_SCRATCH "eax"
+#define I386_ADDR_SCRATCH "edx"
+
+static unsigned i386_spill_used = 0;
 static const char *arm_regs[] = {
     "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
     "r0", "r1", "r2", "r3", "r12", "sp", "lr", "pc"
 };
+/* x29, x30 and sp are the frame, link and stack registers, x0-x8 carry the
+   Linux syscall ABI, and x18 is the platform register, so none of them appear
+   here. AArch64 has enough registers left that all sixteen virtual ones get a
+   machine register and nothing has to spill. x16 and x17 are held back as the
+   compiler's scratch pair: they are the architecture's designated
+   intra-procedure scratch registers, which is exactly this use. */
 static const char *aarch64_regs[] = {
     "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
-    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"
+    "x27", "x28", "x9", "x10", "x11", "x12", "x13", "x14"
 };
+
+#define A64_SCRATCH "x16"
+#define A64_SCRATCH2 "x17"
 static const char *ia64_regs[] = {
     "r32", "r33", "r34", "r35", "r36", "r37", "r38", "r39",
     "r40", "r41", "r42", "r43", "r44", "r45", "r46", "r47"
@@ -923,9 +947,9 @@ static const char *generic_reg_for_target(const char *value, const char *target,
     if (reg < 0) {
         line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
-    if (is_i386_target(target)) return i386_regs[reg];
+    /* i386 and AArch64 have their own emitters and their own register files;
+       nothing routes them here. */
     if (is_arm32_target(target)) return arm_regs[reg];
-    if (is_aarch64_target(target)) return aarch64_regs[reg];
     if (is_rv_generic_target(target)) return rv_regs[reg];
     if (is_ia64_target(target)) return ia64_regs[reg];
     if (is_loong_target(target)) return loong_regs[reg];
@@ -1150,9 +1174,13 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
     const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    /* Both NASM targets take NASM directives. i386 used to fall through to the
+       GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
+       about to read. */
+    const bool nasm = x86 || is_i386_target(target);
     if (strncmp(line, "align ", 6) == 0) {
         const char *value = trim(line + 6);
-        if (x86) buf_appendf(out, "align %s\n", value);
+        if (nasm) buf_appendf(out, "align %s\n", value);
         else if (rv) buf_appendf(out, ".balign %s\n", value);
         else if (mmix) buf_appendf(out, "        %% align %s\n", value);
         else if (dcpu) buf_appendf(out, "        ; align %s\n", value);
@@ -1172,9 +1200,8 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
             line_error(line_no, "string", "expected string literal");
         }
         if (dcpu) buf_appendf(out, ":%s DAT ", name);
-        else if (generic && is_i386_target(target)) buf_appendf(out, "%s: db ", name);
         else if (generic && is_toy_target(target)) buf_appendf(out, "%s: data ", name);
-        else buf_appendf(out, "%s: %s ", name, x86 ? "db" : (mmix ? "BYTE" : ".byte"));
+        else buf_appendf(out, "%s: %s ", name, nasm ? "db" : (mmix ? "BYTE" : ".byte"));
         quote++;
         for (size_t i = 0; quote[i] && quote[i] != '"'; i++) {
             unsigned char ch = (unsigned char)quote[i];
@@ -1197,7 +1224,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         sprintf(len_name, "%s_len", name);
         remember_constant(len_name);
         free(len_name);
-        if (x86) buf_appendf(constants, "%s_len equ %d\n", name, byte_count);
+        if (nasm) buf_appendf(constants, "%s_len equ %d\n", name, byte_count);
         else if (rv) buf_appendf(constants, ".equ %s_len, %d\n", name, byte_count);
         else if (mmix) buf_appendf(constants, "%s_len IS %d\n", name, byte_count);
         else if (dcpu) buf_appendf(constants, "%s_len EQU %d\n", name, byte_count);
@@ -1213,11 +1240,10 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
             buf_append(out, " DUP(0)\n");
         } else if (mmix) {
             buf_appendf(out, "%s LOC @+%s\n", name, value);
-        } else if (x86 && strcmp(section, "bss") == 0) {
+        } else if (nasm && strcmp(section, "bss") == 0) {
+            /* .bss holds no initialised bytes, so it has to be a reservation. */
             buf_appendf(out, "%s: resb %s\n", name, value);
-        } else if (x86) {
-            buf_appendf(out, "%s: times %s db 0\n", name, value);
-        } else if (generic && is_i386_target(target)) {
+        } else if (nasm) {
             buf_appendf(out, "%s: times %s db 0\n", name, value);
         } else if (generic && is_toy_target(target)) {
             buf_appendf(out, "%s: zero %s\n", name, value);
@@ -1248,12 +1274,10 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     } else if (mmix) {
         const char *mmix_dir = strcmp(cas_dir, "word") == 0 ? "WYDE" : (strcmp(cas_dir, "dword") == 0 ? "TETRA" : (strcmp(cas_dir, "qword") == 0 ? "OCTA" : "BYTE"));
         buf_appendf(out, "%s: %s ", name, mmix_dir);
-    } else if (generic && is_i386_target(target)) {
-        buf_appendf(out, "%s: %s ", name, x86_dir);
     } else if (generic && is_toy_target(target)) {
         buf_appendf(out, "%s: data ", name);
     } else {
-        buf_appendf(out, "%s: %s ", name, x86 ? x86_dir : rv_dir);
+        buf_appendf(out, "%s: %s ", name, nasm ? x86_dir : rv_dir);
     }
     buf_append(out, kind);
     buf_append(out, "\n");
@@ -1645,6 +1669,523 @@ static void emit_generic_instruction(Buffer *text, const char *target, const cha
     if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  pop %s\n" : "  pop {%s}\n", generic_reg_for_target(args[0], target, line_no, op)); return; }
     if (strcmp(op, "syscall") == 0) { emit_generic_syscall(text, target, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for generic architecture");
+}
+
+/* ------------------------------------------------------------------- i386 */
+
+/* Same shape as the x86-64 operand model: a virtual register is either a
+   machine register or a spill slot, and the two scratch registers exist so an
+   instruction can need both an address and a value that live in memory. */
+static bool i386_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= I386_MAPPED_COUNT;
+}
+
+static const char *i386_operand_text(int idx, const char *size) {
+    static char pool[8][48];
+    static unsigned next = 0;
+    char *slot = pool[next];
+    next = (next + 1) % 8;
+    if (idx < I386_MAPPED_COUNT) {
+        snprintf(slot, sizeof(pool[0]), "%s", strcmp(size, "w") == 0 ? i386_regs_w[idx] : i386_regs[idx]);
+    } else {
+        i386_spill_used |= 1u << (idx - I386_MAPPED_COUNT);
+        snprintf(slot, sizeof(pool[0]), "[%s+%d]", X86_SPILL_SYMBOL, (idx - I386_MAPPED_COUNT) * 4);
+    }
+    return slot;
+}
+
+static const char *i386_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return i386_operand_text(reg, "d");
+}
+
+static const char *i386_operand(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return i386_operand_text(reg, "d");
+    if (is_int(value) || is_symbol(value) || is_known_constant(value)) return value;
+    line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    return value;
+}
+
+static int i386_vreg_of(const char *physical) {
+    for (int i = 0; i < I386_MAPPED_COUNT; i++) {
+        if (strcmp(i386_regs[i], physical) == 0) return i;
+    }
+    return -1;
+}
+
+static bool i386_must_preserve(const char *physical) {
+    int vreg = i386_vreg_of(physical);
+    return vreg >= 0 && (mentioned_vregs & (1u << (unsigned)vreg)) != 0;
+}
+
+static void i386_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                              int line_no, const char *op) {
+    Address addr;
+    const char *base;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (!addr.has_base) {
+        if (addr.offset == 0) snprintf(out, out_size, "[%s]", addr.symbol);
+        else snprintf(out, out_size, "[%s%+ld]", addr.symbol, addr.offset);
+        return;
+    }
+    if (i386_reg_is_spilled(addr.base)) {
+        buf_appendf(text, "  mov %s, %s\n", I386_ADDR_SCRATCH, i386_reg(addr.base, line_no, op));
+        base = I386_ADDR_SCRATCH;
+    } else {
+        base = i386_reg(addr.base, line_no, op);
+    }
+    if (addr.offset == 0) snprintf(out, out_size, "[%s]", base);
+    else snprintf(out, out_size, "[%s%+ld]", base, addr.offset);
+}
+
+static const char *i386_size_word(const char *size) {
+    if (strcmp(size, "b") == 0) return "byte";
+    if (strcmp(size, "w") == 0) return "word";
+    return "dword";
+}
+
+static void emit_i386_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"ebx", "ecx", "edx", "esi", "edi"};
+    int number = -1;
+    int count;
+    bool returns = true;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (strcmp(args[0], "exit") == 0) { number = 1; returns = false; }
+    else if (strcmp(args[0], "read") == 0) number = 3;
+    else if (strcmp(args[0], "write") == 0) number = 4;
+    else if (strcmp(args[0], "open") == 0) number = 5;
+    else if (strcmp(args[0], "close") == 0) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 5) count = 5;
+    /* ebx, ecx, esi and edi carry virtual registers, so the ones this call
+       writes are saved unless the source never names them. */
+    if (returns) {
+        for (int i = 0; i < count; i++) {
+            if (i386_must_preserve(arg_regs[i])) buf_appendf(text, "  push %s\n", arg_regs[i]);
+        }
+    }
+    /* Values are staged on the stack first: loading one argument register can
+       otherwise destroy the source of a later one. */
+    for (int i = 0; i < count; i++) {
+        buf_appendf(text, "  push %s%s\n", i386_reg_is_spilled(args[i + 1]) ? "dword " : "",
+                    i386_operand(args[i + 1], line_no, "syscall"));
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        buf_appendf(text, "  pop %s\n", arg_regs[i]);
+    }
+    buf_appendf(text, "  mov eax, %d\n", number);
+    buf_append(text, "  int 0x80\n");
+    if (returns) {
+        for (int i = count - 1; i >= 0; i--) {
+            if (i386_must_preserve(arg_regs[i])) buf_appendf(text, "  pop %s\n", arg_regs[i]);
+        }
+    }
+}
+
+static void emit_i386_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (strcmp(op, "enter") == 0 && argc == 1) {
+        buf_append(text, "  push ebp\n  mov ebp, esp\n");
+        if (strcmp(args[0], "0") != 0) buf_appendf(text, "  sub esp, %s\n", args[0]);
+        return;
+    }
+    if (strcmp(op, "leave") == 0 && argc == 0) { buf_append(text, "  mov esp, ebp\n  pop ebp\n"); return; }
+    if (strcmp(op, "mov") == 0 && argc == 2) {
+        if (i386_reg_is_spilled(args[0]) && i386_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  mov %s%s, %s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
+                        i386_reg(args[0], line_no, op), i386_operand(args[1], line_no, op));
+        }
+        return;
+    }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+        if (i386_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  lea %s, [%s]\n", I386_SCRATCH, args[1]);
+            buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  lea %s, [%s]\n", i386_reg(args[0], line_no, op), args[1]);
+        }
+        return;
+    }
+    if (strcmp(op, "load") == 0 && argc == 2) {
+        char addr[256];
+        bool spilled = i386_reg_is_spilled(args[0]);
+        i386_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (strcmp(size, "b") == 0 || strcmp(size, "w") == 0) {
+            buf_appendf(text, "  movzx %s, %s %s\n", spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op),
+                        i386_size_word(size), addr);
+        } else {
+            buf_appendf(text, "  mov %s, dword %s\n", spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op), addr);
+        }
+        if (spilled) buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        return;
+    }
+    if (strcmp(op, "store") == 0 && argc == 2) {
+        char addr[256];
+        i386_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        /* esi and edi have no 8-bit form on i386, and a spilled source would
+           make two memory operands, so sub-word and spilled stores both go
+           through the scratch register. */
+        if (strcmp(size, "d") == 0 && virtual_reg_index(args[1]) >= 0 && !i386_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  mov dword %s, %s\n", addr, i386_reg(args[1], line_no, op));
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov %s %s, %s\n", i386_size_word(size), addr,
+                        strcmp(size, "b") == 0 ? "al" : strcmp(size, "w") == 0 ? "ax" : "eax");
+        }
+        return;
+    }
+    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        bool dst_mem = i386_reg_is_spilled(args[0]);
+        if (virtual_reg_index(args[1]) < 0) {
+            buf_appendf(text, "  %s %s%s, %s\n", op, dst_mem ? "dword " : "",
+                        i386_reg(args[0], line_no, op), i386_operand(args[1], line_no, op));
+            return;
+        }
+        buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+        buf_append(text, "  push ecx\n");
+        buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[1], line_no, op));
+        buf_appendf(text, "  %s %s, cl\n", op, I386_SCRATCH);
+        buf_append(text, "  pop ecx\n");
+        buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "dword " : "", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        return;
+    }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
+         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0) && argc == 2) {
+        if (i386_reg_is_spilled(args[0]) && i386_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
+            buf_appendf(text, "  %s dword %s, %s\n", op, i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  %s %s%s, %s\n", op, i386_reg_is_spilled(args[0]) ? "dword " : "",
+                        i386_reg(args[0], line_no, op), i386_operand(args[1], line_no, op));
+        }
+        return;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+        buf_appendf(text, "  %s %s%s\n", op, i386_reg_is_spilled(args[0]) ? "dword " : "",
+                    i386_reg(args[0], line_no, op));
+        return;
+    }
+    if (strcmp(op, "mul") == 0 && argc == 2) {
+        /* The one-operand "mul" multiplies edx:eax; the two-operand form the
+           IR wants is imul, and it cannot write to memory. */
+        if (i386_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+            buf_appendf(text, "  imul %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
+            buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  imul %s, %s\n", i386_reg(args[0], line_no, op), i386_operand(args[1], line_no, op));
+        }
+        return;
+    }
+    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+        /* idiv works on edx:eax, and both are scratch here, so nothing has to
+           be saved. The divisor is copied out before cdq overwrites edx. */
+        buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+        buf_append(text, "  push ecx\n");
+        buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[1], line_no, op));
+        buf_append(text, "  cdq\n  idiv ecx\n");
+        if (strcmp(op, "mod") == 0) buf_appendf(text, "  mov %s, edx\n", I386_SCRATCH);
+        buf_append(text, "  pop ecx\n");
+        buf_appendf(text, "  mov %s%s, %s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
+                    i386_reg(args[0], line_no, op), I386_SCRATCH);
+        return;
+    }
+    if (strcmp(op, "push") == 0 && argc == 1) {
+        buf_appendf(text, "  push %s%s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
+                    i386_operand(args[0], line_no, op));
+        return;
+    }
+    if (strcmp(op, "pop") == 0 && argc == 1) {
+        buf_appendf(text, "  pop %s%s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
+                    i386_reg(args[0], line_no, op));
+        return;
+    }
+    if ((strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 ||
+         strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
+         strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0) && argc == 1) {
+        buf_appendf(text, "  %s %s\n", op, args[0]); return;
+    }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (strcmp(op, "syscall") == 0) { emit_i386_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for i386");
+}
+
+/* ---------------------------------------------------------------- AArch64 */
+
+static const char *a64_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return aarch64_regs[reg];
+}
+
+/* The 32-bit view of a register, which is what the sub-word loads write and
+   what zero-extends into the full register. */
+static const char *a64_reg_w(const char *physical) {
+    static char pool[4][8];
+    static unsigned next = 0;
+    char *slot = pool[next];
+    next = (next + 1) % 4;
+    snprintf(slot, sizeof(pool[0]), "w%s", physical + 1);
+    return slot;
+}
+
+/* Materialises any non-register operand into reg. Numbers are built out of
+   movz/movk so no literal pool is needed; a label becomes its address, and a
+   name the source declared as a constant stays an immediate. */
+static void a64_load_operand(Buffer *text, const char *reg, const char *value) {
+    long number;
+    if (is_int(value)) {
+        unsigned long bits;
+        int shift;
+        bool started = false;
+        char *end = NULL;
+        errno = 0;
+        number = strtol(value, &end, 0);
+        bits = (unsigned long)number;
+        for (shift = 0; shift < 64; shift += 16) {
+            unsigned long part = (bits >> shift) & 0xffffu;
+            if (part == 0 && started) continue;
+            if (!started) {
+                if (shift == 0) buf_appendf(text, "  movz %s, #%lu\n", reg, part);
+                else buf_appendf(text, "  movz %s, #%lu, lsl #%d\n", reg, part, shift);
+                started = true;
+            } else {
+                buf_appendf(text, "  movk %s, #%lu, lsl #%d\n", reg, part, shift);
+            }
+        }
+        if (!started) buf_appendf(text, "  movz %s, #0\n", reg);
+        return;
+    }
+    if (is_known_constant(value)) {
+        buf_appendf(text, "  mov %s, #%s\n", reg, value);
+        return;
+    }
+    buf_appendf(text, "  adrp %s, %s\n", reg, value);
+    buf_appendf(text, "  add %s, %s, :lo12:%s\n", reg, reg, value);
+}
+
+/* Returns the register holding value, materialising it into fallback first if
+   it is not already a virtual register. */
+static const char *a64_operand_reg(Buffer *text, const char *value, const char *fallback, int line_no, const char *op) {
+    if (virtual_reg_index(value) >= 0) {
+        return a64_reg(value, line_no, op);
+    }
+    if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    a64_load_operand(text, fallback, value);
+    return fallback;
+}
+
+/* add and sub take a 12-bit unsigned immediate; everything else has to go
+   through a register. */
+static bool a64_fits_add_imm(const char *value, long *out) {
+    char *end = NULL;
+    long parsed;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtol(value, &end, 0);
+    if (parsed < 0 || parsed > 4095) return false;
+    *out = parsed;
+    return true;
+}
+
+static void a64_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                             int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        if (addr.offset == 0) snprintf(out, out_size, "[%s]", a64_reg(addr.base, line_no, op));
+        else snprintf(out, out_size, "[%s, #%ld]", a64_reg(addr.base, line_no, op), addr.offset);
+        return;
+    }
+    /* A bare symbol has no addressing mode of its own, so its address is
+       computed into the scratch register first. */
+    buf_appendf(text, "  adrp %s, %s\n", A64_SCRATCH2, addr.symbol);
+    buf_appendf(text, "  add %s, %s, :lo12:%s\n", A64_SCRATCH2, A64_SCRATCH2, addr.symbol);
+    if (addr.offset == 0) snprintf(out, out_size, "[%s]", A64_SCRATCH2);
+    else snprintf(out, out_size, "[%s, #%ld]", A64_SCRATCH2, addr.offset);
+}
+
+static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"x0", "x1", "x2", "x3", "x4", "x5"};
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (strcmp(args[0], "read") == 0) number = 63;
+    else if (strcmp(args[0], "write") == 0) number = 64;
+    else if (strcmp(args[0], "open") == 0) number = 1024;
+    else if (strcmp(args[0], "close") == 0) number = 57;
+    else if (strcmp(args[0], "exit") == 0) number = 93;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* No virtual register maps onto x0-x8, so nothing has to be saved here. */
+    for (int i = 0; i < count; i++) {
+        if (virtual_reg_index(args[i + 1]) >= 0) {
+            buf_appendf(text, "  mov %s, %s\n", arg_regs[i], a64_reg(args[i + 1], line_no, "syscall"));
+        } else {
+            a64_load_operand(text, arg_regs[i], args[i + 1]);
+        }
+    }
+    buf_appendf(text, "  mov x8, #%d\n", number);
+    buf_append(text, "  svc #0\n");
+}
+
+static void emit_a64_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (strcmp(op, "enter") == 0 && argc == 1) {
+        long frame;
+        buf_append(text, "  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (a64_fits_add_imm(args[0], &frame)) {
+            /* The stack pointer must stay 16-byte aligned. */
+            buf_appendf(text, "  sub sp, sp, #%ld\n", (frame + 15) & ~15L);
+        } else {
+            a64_load_operand(text, A64_SCRATCH, args[0]);
+            buf_appendf(text, "  sub sp, sp, %s\n", A64_SCRATCH);
+        }
+        return;
+    }
+    if (strcmp(op, "leave") == 0 && argc == 0) {
+        buf_append(text, "  mov sp, x29\n  ldp x29, x30, [sp], #16\n"); return;
+    }
+    if (strcmp(op, "mov") == 0 && argc == 2) {
+        if (virtual_reg_index(args[1]) >= 0) {
+            buf_appendf(text, "  mov %s, %s\n", a64_reg(args[0], line_no, op), a64_reg(args[1], line_no, op));
+        } else {
+            a64_load_operand(text, a64_reg(args[0], line_no, op), args[1]);
+        }
+        return;
+    }
+    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        buf_appendf(text, "  adrp %s, %s\n", dst, args[1]);
+        buf_appendf(text, "  add %s, %s, :lo12:%s\n", dst, dst, args[1]);
+        return;
+    }
+    if (strcmp(op, "load") == 0 && argc == 2) {
+        char addr[256];
+        const char *dst = a64_reg(args[0], line_no, op);
+        a64_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (strcmp(size, "b") == 0) buf_appendf(text, "  ldrb %s, %s\n", a64_reg_w(dst), addr);
+        else if (strcmp(size, "w") == 0) buf_appendf(text, "  ldrh %s, %s\n", a64_reg_w(dst), addr);
+        else if (strcmp(size, "d") == 0) buf_appendf(text, "  ldr %s, %s\n", a64_reg_w(dst), addr);
+        else buf_appendf(text, "  ldr %s, %s\n", dst, addr);
+        return;
+    }
+    if (strcmp(op, "store") == 0 && argc == 2) {
+        char addr[256];
+        const char *src;
+        a64_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+        if (strcmp(size, "b") == 0) buf_appendf(text, "  strb %s, %s\n", a64_reg_w(src), addr);
+        else if (strcmp(size, "w") == 0) buf_appendf(text, "  strh %s, %s\n", a64_reg_w(src), addr);
+        else if (strcmp(size, "d") == 0) buf_appendf(text, "  str %s, %s\n", a64_reg_w(src), addr);
+        else buf_appendf(text, "  str %s, %s\n", src, addr);
+        return;
+    }
+    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0) && argc == 2) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        long imm;
+        if (a64_fits_add_imm(args[1], &imm)) {
+            buf_appendf(text, "  %s %s, %s, #%ld\n", op, dst, dst, imm);
+        } else {
+            const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, src);
+        }
+        return;
+    }
+    if ((strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 ||
+         strcmp(op, "mul") == 0) && argc == 2) {
+        /* The logical immediate encoding is a bitmask pattern rather than a
+           plain range, and mul has no immediate form at all, so every
+           non-register operand is materialised. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+        const char *native = strcmp(op, "and") == 0 ? "and" : strcmp(op, "or") == 0 ? "orr" :
+                             strcmp(op, "xor") == 0 ? "eor" : "mul";
+        buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, src);
+        return;
+    }
+    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+        if (strcmp(op, "div") == 0) {
+            buf_appendf(text, "  sdiv %s, %s, %s\n", dst, dst, src);
+        } else {
+            /* AArch64 has no remainder instruction: quotient, then subtract
+               back the product. */
+            buf_appendf(text, "  sdiv %s, %s, %s\n", A64_SCRATCH2, dst, src);
+            buf_appendf(text, "  msub %s, %s, %s, %s\n", dst, A64_SCRATCH2, src, dst);
+        }
+        return;
+    }
+    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        const char *native = strcmp(op, "shl") == 0 ? "lsl" : strcmp(op, "shr") == 0 ? "lsr" : "asr";
+        if (is_int(args[1])) {
+            buf_appendf(text, "  %s %s, %s, #%s\n", native, dst, dst, args[1]);
+        } else {
+            const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, src);
+        }
+        return;
+    }
+    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 ||
+         strcmp(op, "dec") == 0) && argc == 1) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        if (strcmp(op, "neg") == 0) buf_appendf(text, "  neg %s, %s\n", dst, dst);
+        else if (strcmp(op, "not") == 0) buf_appendf(text, "  mvn %s, %s\n", dst, dst);
+        else buf_appendf(text, "  %s %s, %s, #1\n", strcmp(op, "inc") == 0 ? "add" : "sub", dst, dst);
+        return;
+    }
+    if (strcmp(op, "cmp") == 0 && argc == 2) {
+        const char *lhs = a64_reg(args[0], line_no, op);
+        long imm;
+        if (a64_fits_add_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%ld\n", lhs, imm);
+        else buf_appendf(text, "  cmp %s, %s\n", lhs, a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op));
+        return;
+    }
+    if (strcmp(op, "push") == 0 && argc == 1) {
+        /* The stack pointer has to stay 16-byte aligned, so a single register
+           still moves it by 16. */
+        buf_appendf(text, "  str %s, [sp, #-16]!\n", a64_operand_reg(text, args[0], A64_SCRATCH, line_no, op));
+        return;
+    }
+    if (strcmp(op, "pop") == 0 && argc == 1) {
+        buf_appendf(text, "  ldr %s, [sp], #16\n", a64_reg(args[0], line_no, op)); return;
+    }
+    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
+    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
+    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (argc == 1) {
+        const char *cond =
+            strcmp(op, "je") == 0 ? "eq" : strcmp(op, "jne") == 0 ? "ne" :
+            strcmp(op, "jg") == 0 ? "gt" : strcmp(op, "jl") == 0 ? "lt" :
+            strcmp(op, "jge") == 0 ? "ge" : strcmp(op, "jle") == 0 ? "le" :
+            strcmp(op, "ja") == 0 ? "hi" : strcmp(op, "jb") == 0 ? "lo" :
+            strcmp(op, "jae") == 0 ? "hs" : strcmp(op, "jbe") == 0 ? "ls" : NULL;
+        if (cond) { buf_appendf(text, "  b.%s %s\n", cond, args[0]); return; }
+    }
+    if (strcmp(op, "syscall") == 0) { emit_a64_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for AArch64");
 }
 
 static void emit_arch_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
@@ -2180,7 +2721,9 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (is_rv64_target(target)) emit_rv_instruction(text, base_op, size, args, argc, line_no);
     else if (strcmp(target, "mmixal") == 0) emit_mmix_instruction(text, base_op, size, args, argc, line_no);
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
-    else if (is_i386_target(target) || is_generic_arch_target(target)) emit_generic_instruction(text, target, base_op, size, args, argc, line_no);
+    else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_generic_arch_target(target)) emit_generic_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_legacy_arch_target(target)) emit_arch_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_vm_ir_target(target)) emit_vm_ir_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_toy_target(target)) emit_encoded_or_toy_instruction(text, target, base_op, size, args, argc, line_no);
@@ -2560,6 +3103,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (x86 && x86_spill_used) {
         buf_append(&bss, "alignb 8\n");
         buf_appendf(&bss, "%s: resq %d\n", X86_SPILL_SYMBOL, X86_SPILL_COUNT);
+    }
+    if (i386 && i386_spill_used) {
+        buf_append(&bss, "alignb 4\n");
+        buf_appendf(&bss, "%s: resd %d\n", X86_SPILL_SYMBOL, I386_SPILL_COUNT);
     }
     buf_init(&out);
     if (x86 || i386) {

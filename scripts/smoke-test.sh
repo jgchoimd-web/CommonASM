@@ -127,18 +127,35 @@ if grep -qE "^  b(eq|ne|lt|ge|gt|le)u? a[0-7]," "$BUILD_DIR/regress-rv.s"; then
   exit 1
 fi
 
-# Whether the output assembles is checked directly when an assembler is around.
+# Whether the output assembles is checked directly, not just grepped for, on
+# every backend an assembler is available for.
 if command -v nasm > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
     for level in -O0 -O1; do
       "$BUILD_DIR/commonasmc" "$example" --target x86_64-nasm "$level" -o "$BUILD_DIR/asm-${name}${level}.asm"
       nasm -f elf64 "$BUILD_DIR/asm-${name}${level}.asm" -o "$BUILD_DIR/asm-${name}${level}.o"
+      "$BUILD_DIR/commonasmc" "$example" --target i386-nasm "$level" -o "$BUILD_DIR/asm32-${name}${level}.asm"
+      nasm -f elf32 "$BUILD_DIR/asm32-${name}${level}.asm" -o "$BUILD_DIR/asm32-${name}${level}.o"
     done
   done
-  echo "nasm accepted every x86_64 output."
+  echo "nasm accepted every x86_64 and i386 output."
 else
-  echo "nasm not found; skipped assembling the x86_64 output."
+  echo "nasm not found; skipped assembling the x86_64 and i386 output."
+fi
+
+if command -v clang > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for level in -O0 -O1; do
+      "$BUILD_DIR/commonasmc" "$example" --target aarch64-gnu "$level" -o "$BUILD_DIR/a64-${name}${level}.s"
+      clang -cc1as -triple aarch64-unknown-linux-gnu -filetype obj \
+        -o "$BUILD_DIR/a64-${name}${level}.o" "$BUILD_DIR/a64-${name}${level}.s"
+    done
+  done
+  echo "clang accepted every aarch64 output."
+else
+  echo "clang not found; skipped assembling the aarch64 output."
 fi
 
 targets="

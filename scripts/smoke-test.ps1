@@ -245,19 +245,39 @@ if ($RegressRvText -match "(?m)^  b(eq|ne|lt|ge|gt|le)u? a[0-7],") {
     throw "riscv compare was carried in a syscall argument register"
 }
 
-# Whether the output assembles is checked directly when an assembler is around.
+# Whether the output assembles is checked directly, not just grepped for, on
+# every backend an assembler is available for.
+$Examples = Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas"
+
 if (Get-Command nasm -ErrorAction SilentlyContinue) {
-    Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas" | ForEach-Object {
-        $Name = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+    foreach ($Example in $Examples) {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
         foreach ($Level in @("-O0", "-O1")) {
-            $AsmPath = Join-Path $BuildPath "asm-$Name$Level-pwsh.asm"
-            Invoke-Native $CompilerExe @($_.FullName, "--target", "x86_64-nasm", $Level, "-o", $AsmPath)
-            Invoke-Native "nasm" @("-f", "elf64", $AsmPath, "-o", (Join-Path $BuildPath "asm-$Name$Level-pwsh.o"))
+            foreach ($Pair in @(@{T = "x86_64-nasm"; F = "elf64"; P = "asm64" }, @{T = "i386-nasm"; F = "elf32"; P = "asm32" })) {
+                $AsmPath = Join-Path $BuildPath "$($Pair.P)-$Name$Level-pwsh.asm"
+                Invoke-Native $CompilerExe @($Example.FullName, "--target", $Pair.T, $Level, "-o", $AsmPath)
+                Invoke-Native "nasm" @("-f", $Pair.F, $AsmPath, "-o", (Join-Path $BuildPath "$($Pair.P)-$Name$Level-pwsh.o"))
+            }
         }
     }
-    Write-Host "nasm accepted every x86_64 output."
+    Write-Host "nasm accepted every x86_64 and i386 output."
 } else {
-    Write-Host "nasm not found; skipped assembling the x86_64 output."
+    Write-Host "nasm not found; skipped assembling the x86_64 and i386 output."
+}
+
+if (Get-Command clang -ErrorAction SilentlyContinue) {
+    foreach ($Example in $Examples) {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
+        foreach ($Level in @("-O0", "-O1")) {
+            $AsmPath = Join-Path $BuildPath "a64-$Name$Level-pwsh.s"
+            Invoke-Native $CompilerExe @($Example.FullName, "--target", "aarch64-gnu", $Level, "-o", $AsmPath)
+            Invoke-Native "clang" @("-cc1as", "-triple", "aarch64-unknown-linux-gnu", "-filetype", "obj",
+                "-o", (Join-Path $BuildPath "a64-$Name$Level-pwsh.o"), $AsmPath)
+        }
+    }
+    Write-Host "clang accepted every aarch64 output."
+} else {
+    Write-Host "clang not found; skipped assembling the aarch64 output."
 }
 
 $RepresentativeTargets = @(
