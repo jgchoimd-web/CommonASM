@@ -363,6 +363,17 @@ else
   echo "no m68k assembler found; skipped assembling the m68k output."
 fi
 
+if command -v s390x-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target zarch -o "$BUILD_DIR/s390-${name}.s"
+    s390x-linux-gnu-as -o "$BUILD_DIR/s390-${name}.o" "$BUILD_DIR/s390-${name}.s"
+  done
+  echo "the z/Architecture assembler accepted every zarch output."
+else
+  echo "no z/Architecture assembler found; skipped assembling the zarch output."
+fi
+
 if command -v clang > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)

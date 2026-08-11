@@ -37,6 +37,7 @@ a claim:
   `power9-gnu`, `power10-gnu` (binutils)
 - `sparcv8-gnu`, `sparcv9-gnu` (binutils)
 - `m68k`, `coldfire` (binutils)
+- `zarch` (binutils)
 
 Every family in the list below that claims to emit assembly is in that set.
 The rest is assembly-shaped text rather than assembly, and says so under
@@ -60,7 +61,7 @@ Experimental assembly/IR:
 - `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`, `power9-gnu`, `power10-gnu`
 - `sparcv8-gnu`, `sparcv9-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
 - `m68k`, `coldfire`, `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
-- `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`
+- `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`, `zarch`
 - `wasm`, `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
 - `mmixal`, `dcpu16`
 
@@ -68,7 +69,7 @@ Encoding/pseudo:
 
 - `mos6502`, `wdc65c02`, `wdc65816`, `mos6510`, `i8008`, `i8080`, `i8085`, `z80`, `ez80`, `m6800`, `m6809`
 - `pic16`, `pic32`, `propeller`
-- `pdp1`, `pdp8`, `pdp11`, `vax`, `system360`, `system370`, `zarch`, `cdc6600`, `univac1`, `cray1`
+- `pdp1`, `pdp8`, `pdp11`, `vax`, `system360`, `system370`, `cdc6600`, `univac1`, `cray1`
 - `mix`, `lc3`, `lmc`, `marie`, `chip8`, `schip8`, `redcode`, `subleq`, `urisc`, `tta`
 - `fractran`, `iota`, `jot`, `malbolge-asm`, `brainfuck`, `secd`, `pcode`, `zmachine`, `sweet16`, `befunge`, `bitblt-vm`, `turing-machine`, `cellular-automaton`, `unlambda`
 

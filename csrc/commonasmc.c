@@ -152,6 +152,7 @@ typedef enum {
     CLASS_PPC,
     CLASS_SPARC,
     CLASS_M68K,
+    CLASS_S390,
     CLASS_ENCODING
 } TargetClass;
 
@@ -268,6 +269,7 @@ static const TargetDesc target_table[] = {
     {"blackfin", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"hexagon", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"ebpf", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"zarch", CLASS_S390, GROUP_LEGACY, 0},
 
     {"wasm", CLASS_VM_IR, GROUP_VM_IR, 0},
     {"llvm-ir", CLASS_VM_IR, GROUP_VM_IR, 0},
@@ -301,8 +303,7 @@ static const TargetDesc target_table[] = {
     {"vax", CLASS_TOY, GROUP_TOY, 0},
     {"system360", CLASS_TOY, GROUP_TOY, 0},
     {"system370", CLASS_TOY, GROUP_TOY, 0},
-    {"zarch", CLASS_TOY, GROUP_TOY, 0},
-    {"cdc6600", CLASS_TOY, GROUP_TOY, 0},
+        {"cdc6600", CLASS_TOY, GROUP_TOY, 0},
     {"univac1", CLASS_TOY, GROUP_TOY, 0},
     {"cray1", CLASS_TOY, GROUP_TOY, 0},
     {"mix", CLASS_TOY, GROUP_TOY, 0},
@@ -733,6 +734,10 @@ static bool is_m68k_target(const char *target) {
     return target_has_class(target, CLASS_M68K);
 }
 
+static bool is_s390_target(const char *target) {
+    return target_has_class(target, CLASS_S390);
+}
+
 static bool is_vm_ir_target(const char *target) {
     return target_has_class(target, CLASS_VM_IR);
 }
@@ -823,6 +828,7 @@ static int target_word_bits(const char *target) {
         return (desc->flags & TF_64BIT) ? 64 : 32;
     }
     if (desc->cls == CLASS_M68K) return 32;
+    if (desc->cls == CLASS_S390) return 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
     return 64;
 }
@@ -911,6 +917,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_PPC: return "GNU PowerPC assembly";
         case CLASS_SPARC: return "GNU SPARC assembly";
         case CLASS_M68K: return "GNU m68k assembly";
+        case CLASS_S390: return "GNU z/Architecture assembly";
         case CLASS_GENERIC:
         case CLASS_LEGACY: return "assembly-style text output";
         case CLASS_VM_IR: return "VM or compiler IR-style text output";
@@ -1439,7 +1446,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -4759,6 +4766,320 @@ static void emit_m68k_instruction(Buffer *text, const char *op, const char *size
     line_error(line_no, op, "unsupported instruction or wrong argument count for m68k");
 }
 
+/* ---------------------------------------------------------------- s390x */
+
+/* z/Architecture has sixteen general registers and spends half of them on the
+   machine: r15 is the stack pointer, r14 the return address, r13 the frame
+   pointer here, r0 cannot serve as a base register and r0/r1 are the
+   compiler's scratch pair - which the division also needs, since it works on
+   an even/odd pair. That leaves eleven, and virtual r11-r15 spill. */
+static const char *s390_regs[] = {
+    "%r2", "%r3", "%r4", "%r5", "%r6", "%r7",
+    "%r8", "%r9", "%r10", "%r11", "%r12"
+};
+
+#define S390_MAPPED_COUNT ((int)(sizeof(s390_regs) / sizeof(s390_regs[0])))
+#define S390_SPILL_COUNT (16 - S390_MAPPED_COUNT)
+#define S390_SCRATCH "%r1"
+#define S390_SCRATCH2 "%r0"
+
+static unsigned s390_spill_used = 0;
+static DeferredCompare s390_cmp = {CMP_NONE, {0}, {0}, false, "", "", "lgr", "lgfi"};
+
+static bool s390_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= S390_MAPPED_COUNT;
+}
+
+static int s390_spill_offset(const char *value) {
+    int index = virtual_reg_index(value) - S390_MAPPED_COUNT;
+    s390_spill_used |= 1u << (unsigned)index;
+    return index * 8;
+}
+
+/* Brings a virtual register into a real one, loading it from its slot when it
+   has no register of its own. */
+static const char *s390_value_reg(Buffer *text, const char *value, const char *scratch,
+                                  int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0 && reg < S390_MAPPED_COUNT) return s390_regs[reg];
+    if (reg >= 0) {
+        int offset = s390_spill_offset(value);
+        buf_appendf(text, "  larl %s, %s\n", scratch, X86_SPILL_SYMBOL);
+        buf_appendf(text, "  lg %s, %d(%s)\n", scratch, offset, scratch);
+        return scratch;
+    }
+    if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    if (is_int(value) || is_known_constant(value)) buf_appendf(text, "  lgfi %s, %s\n", scratch, value);
+    else buf_appendf(text, "  larl %s, %s\n", scratch, value);
+    return scratch;
+}
+
+/* Where a result should be computed, and where it has to be put afterwards. */
+static const char *s390_dst_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    return reg < S390_MAPPED_COUNT ? s390_regs[reg] : S390_SCRATCH2;
+}
+
+static void s390_store_back(Buffer *text, const char *value, const char *from, const char *via) {
+    if (!s390_reg_is_spilled(value)) return;
+    buf_appendf(text, "  larl %s, %s\n", via, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  stg %s, %d(%s)\n", from, s390_spill_offset(value), via);
+}
+
+static void s390_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                              const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        const char *base = s390_value_reg(text, addr.base, scratch, line_no, op);
+        snprintf(out, out_size, "%lld(%s)", addr.offset, base);
+        return;
+    }
+    buf_appendf(text, "  larl %s, %s\n", scratch, addr.symbol);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, scratch);
+}
+
+static int s390_vreg_of(const char *physical) {
+    for (int i = 0; i < S390_MAPPED_COUNT; i++) {
+        if (strcmp(s390_regs[i], physical) == 0) return i;
+    }
+    return -1;
+}
+
+static bool s390_must_preserve(const char *physical) {
+    int vreg = s390_vreg_of(physical);
+    return vreg >= 0 && (mentioned_vregs & (1u << (unsigned)vreg)) != 0;
+}
+
+static void emit_s390_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"%r2", "%r3", "%r4", "%r5", "%r6"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    bool returns = true;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (op_is(args[0], "exit")) { number = 1; returns = false; }
+    else if (op_is(args[0], "read")) number = 3;
+    else if (op_is(args[0], "write")) number = 4;
+    else if (op_is(args[0], "open")) number = 5;
+    else if (op_is(args[0], "close")) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 5) count = 5;
+    /* r2 through r6 also carry virtual registers, so the ones this call
+       writes are saved unless the source never names them. */
+    if (returns) {
+        for (int i = 0; i < count; i++) {
+            if (s390_must_preserve(arg_regs[i])) {
+                buf_append(text, "  aghi %r15, -8\n");
+                buf_appendf(text, "  stg %s, 0(%%r15)\n", arg_regs[i]);
+            }
+        }
+    }
+    /* Values are staged on the stack because loading one argument register
+       can destroy the source of a later one. */
+    for (int i = 0; i < count; i++) {
+        const char *src = s390_value_reg(text, args[i + 1], S390_SCRATCH, line_no, "syscall");
+        buf_append(text, "  aghi %r15, -8\n");
+        buf_appendf(text, "  stg %s, 0(%%r15)\n", src);
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        buf_appendf(text, "  lg %s, 0(%%r15)\n", arg_regs[i]);
+        buf_append(text, "  aghi %r15, 8\n");
+    }
+    buf_appendf(text, "  lghi %s, %d\n", S390_SCRATCH, number);
+    buf_append(text, "  svc 0\n");
+    /* The result arrives in r2, which the restores below are about to
+       overwrite, so it is taken aside first. */
+    if (result) buf_appendf(text, "  lgr %s, %%r2\n", S390_SCRATCH2);
+    if (returns) {
+        for (int i = count - 1; i >= 0; i--) {
+            if (s390_must_preserve(arg_regs[i])) {
+                buf_appendf(text, "  lg %s, 0(%%r15)\n", arg_regs[i]);
+                buf_append(text, "  aghi %r15, 8\n");
+            }
+        }
+    }
+    if (result) {
+        const char *dst = s390_dst_reg(result, line_no, "syscall");
+        if (strcmp(dst, S390_SCRATCH2) != 0) buf_appendf(text, "  lgr %s, %s\n", dst, S390_SCRATCH2);
+        s390_store_back(text, result, S390_SCRATCH2, S390_SCRATCH);
+    }
+}
+
+static void emit_s390_instruction(Buffer *text, const char *op, const char *size,
+                                  char **args, int argc, int line_no) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        buf_append(text, "  aghi %r15, -16\n");
+        buf_append(text, "  stg %r14, 8(%r15)\n");
+        buf_append(text, "  stg %r13, 0(%r15)\n");
+        buf_append(text, "  lgr %r13, %r15\n");
+        if (strcmp(args[0], "0") != 0) buf_appendf(text, "  aghi %%r15, -%s\n", args[0]);
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  lgr %r15, %r13\n");
+        buf_append(text, "  lg %r13, 0(%r15)\n");
+        buf_append(text, "  lg %r14, 8(%r15)\n");
+        buf_append(text, "  aghi %r15, 16\n");
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) {
+            const char *from = s390_value_reg(text, args[1], S390_SCRATCH, line_no, op);
+            if (strcmp(from, dst) != 0) buf_appendf(text, "  lgr %s, %s\n", dst, from);
+        } else if (is_int(args[1]) || is_known_constant(args[1])) {
+            buf_appendf(text, "  lgfi %s, %s\n", dst, args[1]);
+        } else {
+            buf_appendf(text, "  larl %s, %s\n", dst, args[1]);
+        }
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  larl %s, %s\n", dst, args[1]);
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        const char *mnemonic = size[0] == 'b' ? "llgc" : size[0] == 'w' ? "llgh" :
+                               size[0] == 'd' ? "llgf" : "lg";
+        s390_emit_address(text, args[1], addr, sizeof(addr), S390_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        const char *mnemonic = size[0] == 'b' ? "stc" : size[0] == 'w' ? "sth" :
+                               size[0] == 'd' ? "st" : "stg";
+        const char *value = s390_value_reg(text, args[1], S390_SCRATCH2, line_no, op);
+        s390_emit_address(text, args[0], addr, sizeof(addr), S390_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor") || op_is(op, "mul")) && argc == 2) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        const char *native = op_is(op, "add") ? "agr" : op_is(op, "sub") ? "sgr" :
+                             op_is(op, "and") ? "ngr" : op_is(op, "or") ? "ogr" :
+                             op_is(op, "xor") ? "xgr" : "msgr";
+        const char *src;
+        if (s390_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  larl %s, %s\n", S390_SCRATCH, X86_SPILL_SYMBOL);
+            buf_appendf(text, "  lg %s, %d(%s)\n", dst, s390_spill_offset(args[0]), S390_SCRATCH);
+        }
+        src = s390_value_reg(text, args[1], S390_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", native, dst, src);
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        /* The divide works on the r0:r1 pair: the dividend goes in the odd
+           register sign-extended into the even one, and it leaves the
+           remainder in the even and the quotient in the odd. */
+        const char *dividend = s390_value_reg(text, args[0], S390_SCRATCH, line_no, op);
+        const char *divisor;
+        const char *dst;
+        if (strcmp(dividend, S390_SCRATCH) != 0) buf_appendf(text, "  lgr %s, %s\n", S390_SCRATCH, dividend);
+        divisor = s390_value_reg(text, args[1], "%r12", line_no, op);
+        buf_append(text, "  srag %r0, %r1, 63\n");
+        buf_appendf(text, "  dsgr %%r0, %s\n", divisor);
+        dst = s390_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  lgr %s, %s\n", dst, op_is(op, "div") ? "%r1" : "%r0");
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        const char *native = op_is(op, "shl") ? "sllg" : op_is(op, "shr") ? "srlg" : "srag";
+        int src = virtual_reg_index(args[1]);
+        const char *value = s390_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  lgr %s, %s\n", dst, value);
+        /* The shift distance is a displacement, optionally plus a register. */
+        if (src >= 0) {
+            const char *amount = s390_value_reg(text, args[1], S390_SCRATCH, line_no, op);
+            buf_appendf(text, "  %s %s, %s, 0(%s)\n", native, dst, dst, amount);
+        } else {
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, args[1]);
+        }
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        const char *value = s390_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  lgr %s, %s\n", dst, value);
+        if (op_is(op, "neg")) buf_appendf(text, "  lcgr %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) {
+            /* No complement instruction: exclusive-or against all ones. */
+            buf_appendf(text, "  lghi %s, -1\n", S390_SCRATCH);
+            buf_appendf(text, "  xgr %s, %s\n", dst, S390_SCRATCH);
+        } else buf_appendf(text, "  aghi %s, %s\n", dst, op_is(op, "inc") ? "1" : "-1");
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        int src = virtual_reg_index(args[1]);
+        compare_record(&s390_cmp, args[0], src >= 0 ? args[1] : args[1], src >= 0);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        /* Only the branch says whether the comparison was meant to be signed,
+           so it is emitted here. */
+        const bool unsigned_test = op_is(op, "ja") || op_is(op, "jb") ||
+                                   op_is(op, "jae") || op_is(op, "jbe");
+        const char *branch = op_is(op, "je") ? "je" : op_is(op, "jne") ? "jne" :
+                             op_is(op, "jg") || op_is(op, "ja") ? "jh" :
+                             op_is(op, "jl") || op_is(op, "jb") ? "jl" :
+                             op_is(op, "jge") || op_is(op, "jae") ? "jhe" : "jle";
+        const char *lhs;
+        if (s390_cmp.state == CMP_NONE) {
+            line_error(line_no, op, "conditional jump with no preceding cmp");
+        }
+        lhs = s390_value_reg(text, s390_cmp.lhs, S390_SCRATCH2, line_no, op);
+        if (s390_cmp.rhs_is_reg) {
+            const char *rhs = s390_value_reg(text, s390_cmp.rhs, S390_SCRATCH, line_no, op);
+            buf_appendf(text, "  %s %s, %s\n", unsigned_test ? "clgr" : "cgr", lhs, rhs);
+        } else {
+            buf_appendf(text, "  lgfi %s, %s\n", S390_SCRATCH, s390_cmp.rhs);
+            buf_appendf(text, "  %s %s, %s\n", unsigned_test ? "clgr" : "cgr", lhs, S390_SCRATCH);
+        }
+        buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = s390_value_reg(text, args[0], S390_SCRATCH2, line_no, op);
+        buf_append(text, "  aghi %r15, -8\n");
+        buf_appendf(text, "  stg %s, 0(%%r15)\n", value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  lg %s, 0(%%r15)\n", dst);
+        buf_append(text, "  aghi %r15, 8\n");
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  brasl %%r14, %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  br %r14\n"); return; }
+    if (op_is(op, "syscall")) { emit_s390_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for s390x");
+}
+
 /* ---------------------------------------------------------- inline assembly */
 
 /* The operand text a backend uses for a virtual register, which is what an
@@ -5608,7 +5929,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -5618,7 +5939,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -5660,6 +5981,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_s390_target(target)) emit_s390_instruction(text, base_op, size, args, argc, line_no);
     else if (is_sparc_target(target)) emit_sparc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_m68k_target(target)) emit_m68k_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
@@ -6024,7 +6346,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -6204,6 +6526,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (is_m68k_target(target) && m68k_spill_used) {
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, M68K_SPILL_COUNT * 4);
     }
+    if (is_s390_target(target) && s390_spill_used) {
+        buf_append(&bss, ".balign 8\n");
+        buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, S390_SPILL_COUNT * 8);
+    }
     buf_init(&out);
     if (x86 || i386) {
         if (x86) buf_append(&out, "default rel\n");
@@ -6344,6 +6670,9 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
+
 
 
 
