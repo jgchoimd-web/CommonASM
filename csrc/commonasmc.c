@@ -86,6 +86,11 @@ static const char *i386_regs[] = {
 static const char *i386_regs_w[] = {
     "bx", "cx", "si", "di"
 };
+/* 32-bit x86 has no 8-bit view of esi or edi, so a byte store from one of
+   those has to go through the scratch; ebx and ecx do not. */
+static const char *i386_regs_b[] = {
+    "bl", "cl", NULL, NULL
+};
 
 #define I386_MAPPED_COUNT ((int)(sizeof(i386_regs) / sizeof(i386_regs[0])))
 #define I386_SPILL_COUNT (16 - I386_MAPPED_COUNT)
@@ -333,6 +338,8 @@ static const TargetDesc target_table[] = {
    fixed cell, and the table grows instead of capping how many may exist. */
 typedef struct {
     char **slots;
+    long long *values;
+    bool *known;
     size_t cap;
     size_t count;
 } SymbolSet;
@@ -974,30 +981,60 @@ static size_t symbol_slot(char *const *slots, size_t cap, const char *name) {
 static void symbol_set_grow(SymbolSet *set) {
     size_t new_cap = set->cap ? set->cap * 2 : 64;
     char **new_slots = xmalloc(sizeof(char *) * new_cap);
+    long long *new_values = xmalloc(sizeof(long long) * new_cap);
+    bool *new_known = xmalloc(sizeof(bool) * new_cap);
     for (size_t i = 0; i < new_cap; i++) {
         new_slots[i] = NULL;
+        new_values[i] = 0;
+        new_known[i] = false;
     }
     for (size_t i = 0; i < set->cap; i++) {
         if (set->slots[i]) {
-            new_slots[symbol_slot(new_slots, new_cap, set->slots[i])] = set->slots[i];
+            size_t index = symbol_slot(new_slots, new_cap, set->slots[i]);
+            new_slots[index] = set->slots[i];
+            new_values[index] = set->values[i];
+            new_known[index] = set->known[i];
         }
     }
     free(set->slots);
+    free(set->values);
+    free(set->known);
     set->slots = new_slots;
+    set->values = new_values;
+    set->known = new_known;
     set->cap = new_cap;
 }
 
-static void symbol_set_add(SymbolSet *set, const char *name) {
+/* Constants carry their value where the source gave a plain number, because a
+   backend that has to build the value cannot ask the assembler what it is:
+   AArch64's mov reaches only a restricted set of immediates, so "mov x19,
+   #VGA" is rejected for a constant like 0xb8000 that the compiler could have
+   materialised had it known. */
+static void symbol_set_add(SymbolSet *set, const char *name, const char *value_text) {
     size_t index;
     if ((set->count + 1) * 4 >= set->cap * 3) {
         symbol_set_grow(set);
     }
     index = symbol_slot(set->slots, set->cap, name);
-    if (set->slots[index]) {
-        return;
+    if (!set->slots[index]) {
+        set->slots[index] = xstrdup(name);
+        set->count++;
     }
-    set->slots[index] = xstrdup(name);
-    set->count++;
+    if (value_text && is_int(value_text)) {
+        char *end = NULL;
+        errno = 0;
+        set->values[index] = strtoll(value_text, &end, 0);
+        set->known[index] = errno == 0;
+    }
+}
+
+static bool symbol_set_value(const SymbolSet *set, const char *name, long long *value) {
+    size_t index;
+    if (set->count == 0) return false;
+    index = symbol_slot(set->slots, set->cap, name);
+    if (!set->slots[index] || !set->known[index]) return false;
+    *value = set->values[index];
+    return true;
 }
 
 static bool symbol_set_contains(const SymbolSet *set, const char *name) {
@@ -1012,13 +1049,21 @@ static void symbol_set_free(SymbolSet *set) {
         free(set->slots[i]);
     }
     free(set->slots);
+    free(set->values);
+    free(set->known);
+    set->values = NULL;
+    set->known = NULL;
     set->slots = NULL;
     set->cap = 0;
     set->count = 0;
 }
 
-static void remember_constant(const char *name) {
-    symbol_set_add(&known_constants, name);
+static void remember_constant(const char *name, const char *value_text) {
+    symbol_set_add(&known_constants, name, value_text);
+}
+
+static bool constant_value(const char *name, long long *value) {
+    return symbol_set_value(&known_constants, name, value);
 }
 
 static bool is_known_constant(const char *name) {
@@ -1421,8 +1466,10 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         /* Sized from the label itself so that a long long name keeps its whole
            "<name>_len" spelling instead of being cut to fit a fixed buffer. */
         char *len_name = xmalloc(strlen(name) + sizeof("_len"));
+        char len_text[32];
         sprintf(len_name, "%s_len", name);
-        remember_constant(len_name);
+        snprintf(len_text, sizeof(len_text), "%d", byte_count);
+        remember_constant(len_name, len_text);
         free(len_name);
         if (nasm) buf_appendf(constants, "%s_len equ %d\n", name, byte_count);
         else if (rv) buf_appendf(constants, ".equ %s_len, %d\n", name, byte_count);
@@ -1483,8 +1530,22 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     buf_append(out, "\n");
 }
 
+/* A syscall may name a virtual register to receive its result: "syscall r0,
+   read, ..." puts the count read into r0. Without it there is no way to tell
+   a short read from a full one, or to notice an error. */
+static const char *syscall_result_operand(char ***args, int *argc) {
+    const char *result = NULL;
+    if (*argc >= 2 && virtual_reg_index((*args)[0]) >= 0) {
+        result = (*args)[0];
+        (*args)++;
+        (*argc)--;
+    }
+    return result;
+}
+
 static void emit_x86_syscall(Buffer *text, char **args, int argc, int line_no) {
     static const char *const arg_regs[] = {"rdi", "rsi", "rdx", "r10", "r8", "r9"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     int count;
     bool conflict = false;
@@ -1545,10 +1606,16 @@ static void emit_x86_syscall(Buffer *text, char **args, int argc, int line_no) {
         }
         if (x86_must_preserve("rcx")) buf_append(text, "  pop rcx\n");
     }
+    /* rax is not one of the restored registers, so the result survives them. */
+    if (result) {
+        buf_appendf(text, "  mov %s%s, %s\n", x86_reg_is_spilled(result) ? "qword " : "",
+                    x86_reg(result, line_no, "syscall"), X86_SCRATCH);
+    }
 }
 
 static void emit_rv_syscall(Buffer *text, char **args, int argc, int line_no) {
     const char *arg_regs[] = {"a0", "a1", "a2", "a3", "a4", "a5"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
     if (strcmp(args[0], "read") == 0) number = 63;
@@ -1567,6 +1634,7 @@ static void emit_rv_syscall(Buffer *text, char **args, int argc, int line_no) {
     snprintf(num, sizeof(num), "%d", number);
     buf_appendf(text, "  li a7, %s\n", num);
     buf_append(text, "  ecall\n");
+    if (result) buf_appendf(text, "  mv %s, a0\n", rv_reg(result, line_no, "syscall"));
 }
 
 static const char *mmix_operand(const char *value, int line_no, const char *op) {
@@ -1746,6 +1814,9 @@ static void emit_dcpu_instruction(Buffer *text, const char *op, const char *size
 }
 
 static void emit_generic_syscall(Buffer *text, const char *target, char **args, int argc, int line_no) {
+    /* These targets render the call rather than making one, but the operand
+       still has to be stepped over so the name is found. */
+    (void)syscall_result_operand(&args, &argc);
     if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
     if (is_i386_target(target)) {
         int number = -1;
@@ -1952,6 +2023,7 @@ static const char *i386_size_word(const char *size) {
 
 static void emit_i386_syscall(Buffer *text, char **args, int argc, int line_no) {
     static const char *const arg_regs[] = {"ebx", "ecx", "edx", "esi", "edi"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     int count;
     bool returns = true;
@@ -1986,6 +2058,11 @@ static void emit_i386_syscall(Buffer *text, char **args, int argc, int line_no) 
         for (int i = count - 1; i >= 0; i--) {
             if (i386_must_preserve(arg_regs[i])) buf_appendf(text, "  pop %s\n", arg_regs[i]);
         }
+    }
+    /* eax is not one of the restored registers, so the result survives them. */
+    if (result) {
+        buf_appendf(text, "  mov %s%s, %s\n", i386_reg_is_spilled(result) ? "dword " : "",
+                    i386_reg(result, line_no, "syscall"), I386_SCRATCH);
     }
 }
 
@@ -2033,11 +2110,22 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
     if (op_is(op, "store") && argc == 2) {
         char addr[256];
         i386_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
-        /* esi and edi have no 8-bit form on i386, and a spilled source would
-           make two memory operands, so sub-word and spilled stores both go
-           through the scratch register. */
-        if (strcmp(size, "d") == 0 && virtual_reg_index(args[1]) >= 0 && !i386_reg_is_spilled(args[1])) {
-            buf_appendf(text, "  mov dword %s, %s\n", addr, i386_reg(args[1], line_no, op));
+        /* A spilled source would make two memory operands, and esi and edi
+           have no 8-bit form, so those go through the scratch. Everything
+           else stores straight from its own register. */
+        int src_reg = virtual_reg_index(args[1]);
+        const char *direct = NULL;
+        if (src_reg >= 0 && src_reg < I386_MAPPED_COUNT) {
+            if (size[0] == 'b') direct = i386_regs_b[src_reg];
+            else if (size[0] == 'w') direct = i386_regs_w[src_reg];
+            else direct = i386_regs[src_reg];
+        }
+        if (direct) {
+            buf_appendf(text, "  mov %s %s, %s\n", i386_size_word(size), addr, direct);
+        } else if (is_int(args[1]) || is_known_constant(args[1])) {
+            /* A literal, or a name the source gave a value, goes straight
+               into the store rather than being staged in a register. */
+            buf_appendf(text, "  mov %s %s, %s\n", i386_size_word(size), addr, args[1]);
         } else {
             buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
             buf_appendf(text, "  mov %s %s, %s\n", i386_size_word(size), addr,
@@ -2237,6 +2325,7 @@ static bool arm_must_preserve(const char *physical) {
 
 static void emit_arm_syscall(Buffer *text, char **args, int argc, int line_no) {
     static const char *const arg_regs[] = {"r0", "r1", "r2", "r3", "r4", "r5"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     int count;
     bool returns = true;
@@ -2265,10 +2354,18 @@ static void emit_arm_syscall(Buffer *text, char **args, int argc, int line_no) {
     }
     buf_appendf(text, "  ldr r7, =%d\n", number);
     buf_append(text, "  svc #0\n");
+    /* r0 is both where the result arrives and a register the restores below
+       are about to overwrite, so it is taken aside first. */
+    if (result) buf_appendf(text, "  mov %s, r0\n", ARM_SCRATCH2);
     if (returns) {
         for (int i = count - 1; i >= 0; i--) {
             if (arm_must_preserve(arg_regs[i])) buf_appendf(text, "  pop {%s}\n", arg_regs[i]);
         }
+    }
+    if (result) {
+        const char *dst = arm_reg_is_spilled(result) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(result)];
+        if (strcmp(dst, ARM_SCRATCH2) != 0) buf_appendf(text, "  mov %s, %s\n", dst, ARM_SCRATCH2);
+        arm_store_vreg(text, result, ARM_SCRATCH2, ARM_SCRATCH);
     }
 }
 
@@ -2468,6 +2565,14 @@ static const char *a64_reg_w(const char *physical) {
    name the source declared as a constant stays an immediate. */
 static void a64_load_operand(Buffer *text, const char *reg, const char *value) {
     long long number;
+    char resolved[32];
+    /* A constant the source gave a plain number is materialised from that
+       number: AArch64's mov reaches only a restricted set of immediates, and
+       the assembler cannot rewrite one that does not fit. */
+    if (!is_int(value) && constant_value(value, &number)) {
+        snprintf(resolved, sizeof(resolved), "%lld", number);
+        value = resolved;
+    }
     if (is_int(value)) {
         unsigned long long bits;
         int shift;
@@ -2545,6 +2650,7 @@ static void a64_emit_address(Buffer *text, const char *addr_text, char *out, siz
 
 static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
     static const char *const arg_regs[] = {"x0", "x1", "x2", "x3", "x4", "x5"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     int count;
     if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
@@ -2566,6 +2672,7 @@ static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
     }
     buf_appendf(text, "  mov x8, #%d\n", number);
     buf_append(text, "  svc #0\n");
+    if (result) buf_appendf(text, "  mov %s, x0\n", a64_reg(result, line_no, "syscall"));
 }
 
 static void emit_a64_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
@@ -2900,9 +3007,13 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         x86_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
         if (virtual_reg_index(args[1]) >= 0 && !x86_reg_is_spilled(args[1])) {
             buf_appendf(text, "  mov %s %s, %s\n", x86_size_word(size), addr, x86_reg_sized(args[1], size, line_no, op));
+        } else if ((is_int(args[1]) || is_known_constant(args[1])) && !x86_imm_too_wide(args[1])) {
+            /* A literal narrow enough to encode goes straight into the store
+               rather than being staged in a register first. */
+            buf_appendf(text, "  mov %s %s, %s\n", x86_size_word(size), addr, args[1]);
         } else {
             /* The destination is already a memory operand, so a spilled or
-               immediate source has to come through the scratch. */
+               symbolic source has to come through the scratch. */
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
             buf_appendf(text, "  mov %s %s, %s\n", x86_size_word(size), addr, x86_rax_sized(size));
         }
@@ -3604,6 +3715,7 @@ static void mips_emit_address(Buffer *text, const char *addr_text, char *out, si
 
 static void emit_mips_syscall(Buffer *text, const char *target, char **args, int argc, int line_no) {
     static const char *const arg_regs[] = {"$a0", "$a1", "$a2", "$a3"};
+    const char *result = syscall_result_operand(&args, &argc);
     int number = -1;
     int count;
     (void)target;
@@ -3628,6 +3740,7 @@ static void emit_mips_syscall(Buffer *text, const char *target, char **args, int
     }
     buf_appendf(text, "  li $v0, %d\n", number);
     buf_append(text, "  syscall\n");
+    if (result) buf_appendf(text, "  move %s, $v0\n", mips_reg(result, line_no, "syscall"));
 }
 
 static void emit_mips_instruction(Buffer *text, const char *target, const char *op, const char *size,
@@ -5183,7 +5296,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             *eq = '\0';
             name = trim(name);
             char *value = trim(eq + 1);
-            remember_constant(name);
+            remember_constant(name, value);
             if (x86) buf_appendf(&constants, "%s equ %s\n", name, value);
             else if (i386) buf_appendf(&constants, "%s equ %s\n", name, value);
             else if (rv) buf_appendf(&constants, ".equ %s, %s\n", name, value);
@@ -5360,6 +5473,10 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
+
+
 
 
 

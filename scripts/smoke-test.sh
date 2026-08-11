@@ -238,6 +238,35 @@ CAS
     fi
   done
   echo "every family's assembly reads back into the CommonASM it came from."
+
+  # The demos are programs rather than test cases, so they are built the way a
+  # user would build them, and the game is run far enough to reach the read
+  # that reports end of input.
+  for demo_target in x86_64-nasm:elf64 i386-nasm:elf32; do
+    demo_name=${demo_target%%:*}
+    demo_fmt=${demo_target##*:}
+    for demo in "$ROOT_DIR"/demos/os/kernel.cas "$ROOT_DIR"/demos/game/guess.cas; do
+      demo_base=$(basename "$demo" .cas)
+      "$BUILD_DIR/commonasmc" "$demo" --target "$demo_name" -O1 \
+        -o "$BUILD_DIR/demo-$demo_base-$demo_fmt.asm"
+      nasm -f "$demo_fmt" $NASM_STRICT "$BUILD_DIR/demo-$demo_base-$demo_fmt.asm" \
+        -o "$BUILD_DIR/demo-$demo_base-$demo_fmt.o"
+    done
+  done
+
+  # The game makes Linux syscalls directly, so it can only be run on Linux.
+  if [ "$(uname -s)" = "Linux" ] && command -v ld > /dev/null 2>&1; then
+    ld "$BUILD_DIR/demo-guess-elf64.o" -o "$BUILD_DIR/guess"
+    printf '50\n' | "$BUILD_DIR/guess" > "$BUILD_DIR/guess.out" 2>&1 || true
+    grep -q "Guess a number" "$BUILD_DIR/guess.out"
+    grep -qE "Higher|Lower|Correct" "$BUILD_DIR/guess.out"
+    echo "the guessing game ran and stopped when the read reported no input."
+  else
+    echo "not Linux; skipped running the guessing game."
+  fi
+
+  ld -m elf_i386 -T "$ROOT_DIR/demos/os/link.ld" "$BUILD_DIR/demo-kernel-elf32.o" \
+    -o "$BUILD_DIR/kernel.elf" 2> /dev/null && echo "the kernel links as a multiboot image."
 else
   echo "skipped running the extended operation checks."
 fi

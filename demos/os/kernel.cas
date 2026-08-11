@@ -1,0 +1,59 @@
+; A freestanding multiboot kernel: no syscalls, no libc, nothing underneath it.
+; It writes straight into the VGA text buffer at 0xb8000, where each cell is a
+; character byte followed by an attribute byte.
+;
+;   commonasmc demos/os/kernel.cas --target i386-nasm -o kernel.asm
+;   nasm -f elf32 kernel.asm -o kernel.o
+;   ld -m elf_i386 -T demos/os/link.ld kernel.o -o kernel.elf
+;
+; The result is a multiboot image; qemu-system-i386 -kernel kernel.elf runs it.
+
+const VGA = 0xb8000
+const ATTR = 0x0f
+const CELLS = 2000
+
+.rodata
+; The multiboot header the bootloader looks for in the first 8 KiB. The three
+; fields have to sum to zero as 32-bit values.
+mb_magic: dword 0x1badb002
+mb_flags: dword 0
+mb_check: dword 0xe4524ffe
+
+banner: string "CommonASM kernel is running"
+
+.text
+global _start
+
+_start:
+  ; clear the screen: 2000 cells of a blank with the normal attribute
+  mov r0, VGA
+  mov r1, CELLS
+clear:
+  cmp r1, 0
+  je draw
+  store.b [r0], 32
+  inc r0
+  store.b [r0], ATTR
+  inc r0
+  dec r1
+  jmp clear
+
+draw:
+  ; write the banner, one character and one attribute byte per cell
+  mov r0, VGA
+  load_addr r1, banner
+  mov r2, banner_len
+write:
+  cmp r2, 0
+  je done
+  load.b r3, [r1]
+  store.b [r0], r3
+  inc r0
+  store.b [r0], ATTR
+  inc r0
+  inc r1
+  dec r2
+  jmp write
+
+done:
+  jmp done

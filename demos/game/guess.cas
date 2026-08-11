@@ -1,0 +1,87 @@
+; A guessing game, on Linux syscalls and nothing else: no libc, no runtime.
+;
+;   commonasmc demos/game/guess.cas --target x86_64-nasm -o guess.asm
+;   nasm -f elf64 guess.asm -o guess.o && ld guess.o -o guess
+;
+; The secret is stirred by how much the player types, so it is not the same
+; number every run without needing a clock the program cannot reach.
+
+const stdin = 0
+const stdout = 1
+const BUFSZ = 16
+
+.rodata
+intro: string "Guess a number from 1 to 100.\n"
+ask: string "> "
+too_low: string "Higher.\n"
+too_high: string "Lower.\n"
+win: string "Correct!\n"
+bye: string "\n"
+
+.bss
+buf: zero 16
+
+.text
+global _start
+
+_start:
+  syscall write, stdout, intro, intro_len
+
+  ; secret = 37 to start with; each read stirs it further
+  mov r10, 37
+
+round:
+  syscall write, stdout, ask, ask_len
+  ; the read reports how much arrived, so end of input is a quit rather than
+  ; a stale buffer being parsed again
+  syscall r4, read, stdin, buf, BUFSZ
+  cmp r4, 0
+  jle quit
+
+  ; parse the decimal the player typed, over exactly what was read
+  load_addr r1, buf
+  mov r0, 0
+  mov r2, r4
+
+parse:
+  cmp r2, 0
+  je parsed
+  load.b r3, [r1]
+  cmp r3, 48
+  jl parsed
+  cmp r3, 57
+  jg parsed
+  mul r0, 10
+  sub r3, 48
+  add r0, r3
+  inc r1
+  dec r2
+  jmp parse
+
+parsed:
+  ; stir the secret: a step of an ordinary linear congruential sequence,
+  ; folded into 1..100
+  mul r10, 1103515245
+  add r10, 12345
+  and r10, 0x7fffffff
+  mov r11, r10
+  mod r11, 100
+  add r11, 1
+
+  cmp r0, r11
+  je correct
+  jl low
+  syscall write, stdout, too_high, too_high_len
+  jmp round
+
+low:
+  syscall write, stdout, too_low, too_low_len
+  jmp round
+
+correct:
+  syscall write, stdout, win, win_len
+  syscall exit, 0
+
+quit:
+  syscall write, stdout, bye, bye_len
+  syscall exit, 0
