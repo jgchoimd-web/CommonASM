@@ -42,7 +42,8 @@ fi
 grep -q "unknown target" "$BUILD_DIR/unknown-info.txt"
 
 "$BUILD_DIR/commonasmc" - --target wasm -o - < "$ROOT_DIR/examples/hello.cas" > "$BUILD_DIR/stdout.wat"
-grep -q "wasm.syscall write" "$BUILD_DIR/stdout.wat"
+grep -q "(module" "$BUILD_DIR/stdout.wat"
+grep -q "call \$fd_write" "$BUILD_DIR/stdout.wat"
 
 for example in "$ROOT_DIR"/examples/*.cas; do
   name=$(basename "$example" .cas)

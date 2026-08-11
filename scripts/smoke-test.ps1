@@ -133,7 +133,8 @@ Get-Content -Raw -Path (Join-Path $RootDir "examples/hello.cas") |
 if ($LASTEXITCODE -ne 0) {
     throw "stdin/stdout pipeline failed"
 }
-Assert-Contains $StdoutPath "wasm.syscall write"
+Assert-Contains $StdoutPath "(module"
+Assert-Contains $StdoutPath "call `$fd_write"
 
 Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas" | ForEach-Object {
     $Name = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
