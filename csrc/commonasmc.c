@@ -3504,10 +3504,15 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
    them appear here. That leaves the callee-saved set and eight temporaries
    for the sixteen virtual registers, with $t8 and $t9 held back for a
    deferred comparison and $v1 as the scratch. $at is left alone because the
-   assembler's own macros - la, a wide li, the comparing branches - use it. */
+   assembler's own macros - la, a wide li, the comparing branches - use it.
+
+   The temporaries are spelled by number because o32 and n64 disagree about
+   their names: $8-$11 are $t0-$t3 under o32 but $a4-$a7 under n64, so "$t7"
+   is not even a register name on a 64-bit assembler. $s0-$s7, $v1, $a3 and
+   $t8-$t9 mean the same thing under both. */
 static const char *mips_regs[] = {
     "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7",
-    "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7"
+    "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15"
 };
 
 /* $a3 doubles as the second scratch. It carries a syscall argument, but a
