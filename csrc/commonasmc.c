@@ -149,6 +149,7 @@ typedef enum {
     CLASS_MMIX,
     CLASS_DCPU,
     CLASS_MIPS,
+    CLASS_PPC,
     CLASS_ENCODING
 } TargetClass;
 
@@ -232,13 +233,13 @@ static const TargetDesc target_table[] = {
     {"mips32-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
     {"mips64-gnu", CLASS_MIPS, GROUP_LEGACY, TF_64BIT},
     {"micromips-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
-    {"power1-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"power2-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"ppc603-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"ppcg4-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"ppcg5-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"power9-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"power10-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"power1-gnu", CLASS_PPC, GROUP_LEGACY, 0},
+    {"power2-gnu", CLASS_PPC, GROUP_LEGACY, 0},
+    {"ppc603-gnu", CLASS_PPC, GROUP_LEGACY, 0},
+    {"ppcg4-gnu", CLASS_PPC, GROUP_LEGACY, 0},
+    {"ppcg5-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
+    {"power9-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
+    {"power10-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
     {"sparcv8-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"sparcv9-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"alpha-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
@@ -718,6 +719,10 @@ static bool is_mips_target(const char *target) {
     return target_has_class(target, CLASS_MIPS);
 }
 
+static bool is_ppc_target(const char *target) {
+    return target_has_class(target, CLASS_PPC);
+}
+
 static bool is_vm_ir_target(const char *target) {
     return target_has_class(target, CLASS_VM_IR);
 }
@@ -804,7 +809,7 @@ static int target_word_bits(const char *target) {
     if (!desc) return 64;
     if (desc->cls == CLASS_DCPU) return 16;
     if (desc->cls == CLASS_I386) return 32;
-    if (desc->cls == CLASS_MIPS) return (desc->flags & TF_64BIT) ? 64 : 32;
+    if (desc->cls == CLASS_MIPS || desc->cls == CLASS_PPC) return (desc->flags & TF_64BIT) ? 64 : 32;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
     return 64;
 }
@@ -890,6 +895,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_RV64: return "GNU RISC-V 64 assembly";
         case CLASS_I386: return "NASM i386 assembly";
         case CLASS_MIPS: return "GNU MIPS assembly";
+        case CLASS_PPC: return "GNU PowerPC assembly";
         case CLASS_GENERIC:
         case CLASS_LEGACY: return "assembly-style text output";
         case CLASS_VM_IR: return "VM or compiler IR-style text output";
@@ -1418,7 +1424,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -3899,6 +3905,313 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     line_error(line_no, op, "unsupported instruction or wrong argument count for MIPS");
 }
 
+/* --------------------------------------------------------------- PowerPC */
+
+/* r1 is the stack pointer, r2 is reserved, r0 reads as zero in some operand
+   positions and is the only place the link register can be parked, r3-r8
+   carry the syscall convention, and r31 is the frame pointer. That leaves the
+   callee-saved block for the sixteen virtual registers, with r11 and r12 as
+   the scratch pair, and nothing spills. */
+static const char *ppc_regs[] = {
+    "14", "15", "16", "17", "18", "19", "20", "21",
+    "22", "23", "24", "25", "26", "27", "28", "29"
+};
+
+#define PPC_SCRATCH "11"
+#define PPC_SCRATCH2 "12"
+
+/* PowerPC decides signedness at the comparison rather than at the branch, so
+   the compare is held until the branch says which it wanted. */
+static DeferredCompare ppc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mr", "li"};
+
+static bool ppc_is_64(const char *target) {
+    return target_word_bits(target) == 64;
+}
+
+static const char *ppc_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return ppc_regs[reg];
+}
+
+static bool ppc_fits_imm16(const char *value, long long *out) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) {
+        if (!constant_value(value, &parsed)) return false;
+        if (parsed < -32768 || parsed > 32767) return false;
+        *out = parsed;
+        return true;
+    }
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0 || parsed < -32768 || parsed > 32767) return false;
+    *out = parsed;
+    return true;
+}
+
+/* Builds any value in a register: a 16-bit literal in one instruction, a
+   wider one in two, and an address through its high and low halves. */
+static void ppc_load_operand(Buffer *text, const char *reg, const char *value) {
+    long long number;
+    if (ppc_fits_imm16(value, &number)) {
+        buf_appendf(text, "  li %s, %lld\n", reg, number);
+        return;
+    }
+    if (is_int(value) || constant_value(value, &number)) {
+        unsigned long long bits;
+        if (is_int(value)) number = strtoll(value, NULL, 0);
+        bits = (unsigned long long)number;
+        buf_appendf(text, "  lis %s, %llu\n", reg, (bits >> 16) & 0xffffu);
+        buf_appendf(text, "  ori %s, %s, %llu\n", reg, reg, bits & 0xffffu);
+        return;
+    }
+    buf_appendf(text, "  lis %s, %s@ha\n", reg, value);
+    buf_appendf(text, "  addi %s, %s, %s@l\n", reg, reg, value);
+}
+
+static const char *ppc_operand_reg(Buffer *text, const char *value, const char *scratch,
+                                   int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return ppc_regs[reg];
+    if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    ppc_load_operand(text, scratch, value);
+    return scratch;
+}
+
+static void ppc_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                             const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        snprintf(out, out_size, "%lld(%s)", addr.offset, ppc_reg(addr.base, line_no, op));
+        return;
+    }
+    ppc_load_operand(text, scratch, addr.symbol);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, scratch);
+}
+
+static void emit_ppc_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"3", "4", "5", "6", "7", "8"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (op_is(args[0], "exit")) number = 1;
+    else if (op_is(args[0], "read")) number = 3;
+    else if (op_is(args[0], "write")) number = 4;
+    else if (op_is(args[0], "open")) number = 5;
+    else if (op_is(args[0], "close")) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* No virtual register maps onto r0 or r3-r8, so nothing needs saving. */
+    for (int i = 0; i < count; i++) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0) buf_appendf(text, "  mr %s, %s\n", arg_regs[i], ppc_regs[reg]);
+        else ppc_load_operand(text, arg_regs[i], args[i + 1]);
+    }
+    buf_appendf(text, "  li 0, %d\n", number);
+    buf_append(text, "  sc\n");
+    if (result) buf_appendf(text, "  mr %s, 3\n", ppc_reg(result, line_no, "syscall"));
+}
+
+static void emit_ppc_instruction(Buffer *text, const char *target, const char *op, const char *size,
+                                 char **args, int argc, int line_no) {
+    const bool wide = ppc_is_64(target);
+    const char *word_load = wide ? "ld" : "lwz";
+    const char *word_store = wide ? "std" : "stw";
+    const int slot = wide ? 8 : 4;
+
+    if (!is_conditional_branch(op) && !op_is(op, "cmp")) {
+        if (op_is(op, "call")) {
+            ppc_cmp.state = CMP_NONE;
+        } else if (argc >= 1 && writes_first_arg(op)) {
+            int dst = virtual_reg_index(args[0]);
+            if (dst >= 0 && compare_reads(&ppc_cmp, ppc_regs[dst])) {
+                /* The comparison is settled where it stood, using a spare
+                   condition field so the branch below still finds it. */
+                ppc_cmp.state = CMP_SNAPSHOT;
+            }
+        }
+    }
+
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_appendf(text, "  addi 1, 1, -%d\n", slot * 2);
+        buf_append(text, "  mflr 0\n");
+        buf_appendf(text, "  %s 0, %d(1)\n", word_store, slot);
+        buf_appendf(text, "  %s 31, 0(1)\n", word_store);
+        buf_append(text, "  mr 31, 1\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (ppc_fits_imm16(args[0], &frame) && frame != -32768) {
+            buf_appendf(text, "  addi 1, 1, %lld\n", -frame);
+        } else {
+            ppc_load_operand(text, PPC_SCRATCH, args[0]);
+            buf_appendf(text, "  subf 1, %s, 1\n", PPC_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  mr 1, 31\n");
+        buf_appendf(text, "  %s 31, 0(1)\n", word_load);
+        buf_appendf(text, "  %s 0, %d(1)\n", word_load, slot);
+        buf_append(text, "  mtlr 0\n");
+        buf_appendf(text, "  addi 1, 1, %d\n", slot * 2);
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) buf_appendf(text, "  mr %s, %s\n", dst, ppc_regs[src]);
+        else ppc_load_operand(text, dst, args[1]);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        ppc_load_operand(text, ppc_reg(args[0], line_no, op), args[1]);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        const char *dst = ppc_reg(args[0], line_no, op);
+        const char *mnemonic = size[0] == 'b' ? "lbz" : size[0] == 'w' ? "lhz" :
+                               size[0] == 'd' ? "lwz" : word_load;
+        ppc_emit_address(text, args[1], addr, sizeof(addr), PPC_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        const char *mnemonic = size[0] == 'b' ? "stb" : size[0] == 'w' ? "sth" :
+                               size[0] == 'd' ? "stw" : word_store;
+        const char *value;
+        ppc_emit_address(text, args[0], addr, sizeof(addr), PPC_SCRATCH, line_no, op);
+        value = ppc_operand_reg(text, args[1], PPC_SCRATCH2, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
+        return;
+    }
+    if (op_is(op, "add") && argc == 2) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        long long value;
+        if (ppc_fits_imm16(args[1], &value)) buf_appendf(text, "  addi %s, %s, %lld\n", dst, dst, value);
+        else buf_appendf(text, "  add %s, %s, %s\n", dst, dst,
+                         ppc_operand_reg(text, args[1], PPC_SCRATCH, line_no, op));
+        return;
+    }
+    if (op_is(op, "sub") && argc == 2) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        long long value;
+        if (ppc_fits_imm16(args[1], &value) && value != -32768) {
+            buf_appendf(text, "  addi %s, %s, %lld\n", dst, dst, -value);
+        } else {
+            /* subf computes the second operand minus the first. */
+            buf_appendf(text, "  subf %s, %s, %s\n", dst,
+                        ppc_operand_reg(text, args[1], PPC_SCRATCH, line_no, op), dst);
+        }
+        return;
+    }
+    if ((op_is(op, "and") || op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
+        /* The immediate forms of and record a condition field, which would
+           destroy a comparison waiting for its branch, so every operand goes
+           through a register. */
+        const char *dst = ppc_reg(args[0], line_no, op);
+        const char *src = ppc_operand_reg(text, args[1], PPC_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s, %s\n", op_is(op, "xor") ? "xor" : op, dst, dst, src);
+        return;
+    }
+    if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        const char *src = ppc_operand_reg(text, args[1], PPC_SCRATCH, line_no, op);
+        const char *mul = wide ? "mulld" : "mullw";
+        const char *div = wide ? "divd" : "divw";
+        if (op_is(op, "mul")) buf_appendf(text, "  %s %s, %s, %s\n", mul, dst, dst, src);
+        else if (op_is(op, "div")) buf_appendf(text, "  %s %s, %s, %s\n", div, dst, dst, src);
+        else {
+            /* No remainder instruction: divide, multiply back, subtract. */
+            buf_appendf(text, "  %s %s, %s, %s\n", div, PPC_SCRATCH2, dst, src);
+            buf_appendf(text, "  %s %s, %s, %s\n", mul, PPC_SCRATCH2, PPC_SCRATCH2, src);
+            buf_appendf(text, "  subf %s, %s, %s\n", dst, PPC_SCRATCH2, dst);
+        }
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *regop = op_is(op, "shl") ? (wide ? "sld" : "slw") :
+                            op_is(op, "shr") ? (wide ? "srd" : "srw") : (wide ? "srad" : "sraw");
+        const char *immop = op_is(op, "shl") ? (wide ? "sldi" : "slwi") :
+                            op_is(op, "shr") ? (wide ? "srdi" : "srwi") : (wide ? "sradi" : "srawi");
+        if (src >= 0) buf_appendf(text, "  %s %s, %s, %s\n", regop, dst, dst, ppc_regs[src]);
+        else buf_appendf(text, "  %s %s, %s, %s\n", immop, dst, dst, args[1]);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = ppc_reg(args[0], line_no, op);
+        if (op_is(op, "neg")) buf_appendf(text, "  neg %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  nor %s, %s, %s\n", dst, dst, dst);
+        else buf_appendf(text, "  addi %s, %s, %s\n", dst, dst, op_is(op, "inc") ? "1" : "-1");
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        int src = virtual_reg_index(args[1]);
+        compare_record(&ppc_cmp, ppc_reg(args[0], line_no, op),
+                       src >= 0 ? ppc_regs[src] : args[1], src >= 0);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        /* The comparison is emitted here, because only the branch says
+           whether it was meant to be signed. */
+        const bool unsigned_test = op_is(op, "ja") || op_is(op, "jb") ||
+                                   op_is(op, "jae") || op_is(op, "jbe");
+        const char *form = wide ? (unsigned_test ? "cmpld" : "cmpd")
+                                : (unsigned_test ? "cmplw" : "cmpw");
+        const char *branch = op_is(op, "je") ? "beq" : op_is(op, "jne") ? "bne" :
+                             op_is(op, "jg") || op_is(op, "ja") ? "bgt" :
+                             op_is(op, "jl") || op_is(op, "jb") ? "blt" :
+                             op_is(op, "jge") || op_is(op, "jae") ? "bge" : "ble";
+        if (ppc_cmp.state == CMP_NONE) {
+            line_error(line_no, op, "conditional jump with no preceding cmp");
+        }
+        if (ppc_cmp.rhs_is_reg) {
+            buf_appendf(text, "  %s %s, %s\n", form, ppc_cmp.lhs, ppc_cmp.rhs);
+        } else {
+            long long value;
+            if (ppc_fits_imm16(ppc_cmp.rhs, &value)) {
+                buf_appendf(text, "  %si %s, %lld\n", form, ppc_cmp.lhs, value);
+            } else {
+                ppc_load_operand(text, PPC_SCRATCH, ppc_cmp.rhs);
+                buf_appendf(text, "  %s %s, %s\n", form, ppc_cmp.lhs, PPC_SCRATCH);
+            }
+        }
+        buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = ppc_operand_reg(text, args[0], PPC_SCRATCH, line_no, op);
+        buf_appendf(text, "  addi 1, 1, -%d\n", slot);
+        buf_appendf(text, "  %s %s, 0(1)\n", word_store, value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_appendf(text, "  %s %s, 0(1)\n", word_load, ppc_reg(args[0], line_no, op));
+        buf_appendf(text, "  addi 1, 1, %d\n", slot);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  blr\n"); return; }
+    if (op_is(op, "syscall")) { emit_ppc_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for PowerPC");
+}
+
 /* ---------------------------------------------------------- inline assembly */
 
 /* The operand text a backend uses for a virtual register, which is what an
@@ -4748,7 +5061,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -4758,7 +5071,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -4800,6 +5113,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
     else if (is_generic_arch_target(target)) emit_generic_instruction(text, target, base_op, size, args, argc, line_no);
@@ -5161,7 +5475,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -5473,6 +5787,7 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
 
 
 

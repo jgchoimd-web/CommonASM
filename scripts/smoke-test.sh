@@ -310,6 +310,32 @@ else
   echo "no 64-bit MIPS assembler found; skipped assembling the mips64-gnu output."
 fi
 
+if command -v powerpc-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for target in power1-gnu power2-gnu ppc603-gnu ppcg4-gnu; do
+      "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/ppc-${target}-${name}.s"
+      powerpc-linux-gnu-as -o "$BUILD_DIR/ppc-${target}-${name}.o" "$BUILD_DIR/ppc-${target}-${name}.s"
+    done
+  done
+  echo "the PowerPC assembler accepted every 32-bit PowerPC output."
+else
+  echo "no PowerPC assembler found; skipped assembling the PowerPC output."
+fi
+
+if command -v powerpc64-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for target in ppcg5-gnu power9-gnu power10-gnu; do
+      "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/ppc64-${target}-${name}.s"
+      powerpc64-linux-gnu-as -o "$BUILD_DIR/ppc64-${target}-${name}.o" "$BUILD_DIR/ppc64-${target}-${name}.s"
+    done
+  done
+  echo "the 64-bit PowerPC assembler accepted every 64-bit PowerPC output."
+else
+  echo "no 64-bit PowerPC assembler found; skipped assembling it."
+fi
+
 if command -v clang > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
