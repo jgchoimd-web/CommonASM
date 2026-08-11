@@ -668,6 +668,7 @@ static bool is_symbol(const char *text) {
    every is_*_target() predicate below settles into a field compare. */
 static const TargetDesc *target_lookup(const char *name) {
     static const TargetDesc *cached = NULL;
+    if (!name) return NULL;
     if (cached && strcmp(cached->name, name) == 0) {
         return cached;
     }
@@ -3324,6 +3325,11 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
    gets a working version of it without a hand-written sequence per backend. */
 static void emit_cas(Buffer *text, const char *target, int line_no, const char *fmt, ...) CAS_PRINTF(4, 5);
 
+/* When set, emit_cas() collects CommonASM text instead of compiling it. That
+   is how a whole assembly file is read back into a source the ordinary
+   pipeline can then compile for a different machine. */
+static Buffer *cas_sink = NULL;
+
 static void emit_cas(Buffer *text, const char *target, int line_no, const char *fmt, ...) {
     char line[256];
     va_list args;
@@ -3333,6 +3339,10 @@ static void emit_cas(Buffer *text, const char *target, int line_no, const char *
     va_end(args);
     if (written < 0 || (size_t)written >= sizeof(line)) {
         die("could not expand an extended instruction");
+    }
+    if (cas_sink) {
+        buf_appendf(cas_sink, "  %s\n", line);
+        return;
     }
     emit_text_line(text, line, line_no, target);
 }
@@ -3906,7 +3916,7 @@ static const LiftRule lift_x86[] = {
 };
 
 static const LiftRule lift_a64[] = {
-    {"mov", "mov", LIFT_DST_SRC}, {"add", "add", LIFT_DST_A_B},
+    {"mov", "mov", LIFT_DST_SRC}, {"movz", "mov", LIFT_DST_SRC},{"add", "add", LIFT_DST_A_B},
     {"sub", "sub", LIFT_DST_A_B}, {"and", "and", LIFT_DST_A_B},
     {"orr", "or", LIFT_DST_A_B}, {"eor", "xor", LIFT_DST_A_B},
     {"mul", "mul", LIFT_DST_A_B}, {"sdiv", "div", LIFT_DST_A_B},
@@ -3977,8 +3987,102 @@ static const LiftRule *lift_rules_for(const char *selector, char *comment_out, s
     return NULL;
 }
 
-/* An operand a lifted instruction can use: a {rN} placeholder, or a literal
-   in any of the spellings these assemblers accept. */
+/* The machine registers a family hands to virtual registers, which is what
+   lets a plain assembly file be read back: a name in this table is virtual
+   register N, and a name outside it is one the compiler never allocates and
+   so cannot be reconstructed. */
+static const char *const *lift_register_table(const char *family, int *count) {
+    if (strcmp(family, "x86_64") == 0 || target_has_class(family, CLASS_X86_64)) {
+        *count = X86_MAPPED_COUNT; return x86_regs;
+    }
+    if (strcmp(family, "i386") == 0 || target_has_class(family, CLASS_I386)) {
+        *count = I386_MAPPED_COUNT; return i386_regs;
+    }
+    if (strcmp(family, "aarch64") == 0 || target_has_flag(family, TF_AARCH64)) {
+        *count = 16; return aarch64_regs;
+    }
+    if (strcmp(family, "arm32") == 0 || target_has_flag(family, TF_ARM32)) {
+        *count = ARM_MAPPED_COUNT; return arm_regs;
+    }
+    if (strcmp(family, "riscv64") == 0 || target_has_class(family, CLASS_RV64)) {
+        *count = 16; return rv_regs;
+    }
+    if (strcmp(family, "mips") == 0 || target_has_class(family, CLASS_MIPS)) {
+        *count = 16; return mips_regs;
+    }
+    *count = 0;
+    return NULL;
+}
+
+/* Registers each family uses for its own purposes - frame, scratch, the
+   syscall convention. They appear in compiler output but are not virtual
+   registers, so an operand naming one cannot be read back and is reported
+   rather than mistaken for a symbol. */
+static const char *const lift_reserved_x86[] = {
+    "rax", "rsp", "rbp", "r11", "eax", "esp", "ebp", "edx", "al", "ax", "cl", NULL
+};
+static const char *const lift_reserved_a64[] = {
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+    "x16", "x17", "x18", "x29", "x30", "sp", NULL
+};
+static const char *const lift_reserved_arm[] = {
+    "r3", "r7", "r12", "sp", "lr", "pc", "fp", "ip", NULL
+};
+static const char *const lift_reserved_rv[] = {
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+    "s0", "s10", "s11", "sp", "ra", "zero", NULL
+};
+static const char *const lift_reserved_mips[] = {
+    "$zero", "$at", "$v0", "$v1", "$a0", "$a1", "$a2", "$a3",
+    "$t8", "$t9", "$k0", "$k1", "$gp", "$sp", "$fp", "$ra", NULL
+};
+
+/* Set while a whole assembly file is being read back, so the lifting rules
+   also accept real register names rather than only {rN} placeholders. */
+static const char *const *lift_regs = NULL;
+static int lift_reg_count = 0;
+static const char *const *lift_reserved = NULL;
+
+/* Every backend materialises a literal it cannot fold into an instruction by
+   loading it into a scratch register first. Reading that back one line at a
+   time would fail on the scratch, so the value is remembered against the
+   register and substituted where the next instruction uses it - which is what
+   turns "movz x16, #3" and "mul x19, x19, x16" back into "mul r0, 3". */
+#define LIFT_MEMO_MAX 8
+static char lift_memo_reg[LIFT_MEMO_MAX][16];
+static char lift_memo_val[LIFT_MEMO_MAX][64];
+static int lift_memo_count = 0;
+
+static const char *lift_memo_lookup(const char *reg) {
+    for (int i = 0; i < lift_memo_count; i++) {
+        if (strcmp(lift_memo_reg[i], reg) == 0) return lift_memo_val[i];
+    }
+    return NULL;
+}
+
+static void lift_memo_set(const char *reg, const char *value) {
+    for (int i = 0; i < lift_memo_count; i++) {
+        if (strcmp(lift_memo_reg[i], reg) == 0) {
+            snprintf(lift_memo_val[i], sizeof(lift_memo_val[i]), "%s", value);
+            return;
+        }
+    }
+    if (lift_memo_count == LIFT_MEMO_MAX) return;
+    snprintf(lift_memo_reg[lift_memo_count], sizeof(lift_memo_reg[0]), "%s", reg);
+    snprintf(lift_memo_val[lift_memo_count], sizeof(lift_memo_val[0]), "%s", value);
+    lift_memo_count++;
+}
+
+static bool lift_is_reserved(const char *name) {
+    for (int i = 0; lift_reserved && lift_reserved[i]; i++) {
+        if (strcmp(lift_reserved[i], name) == 0) return true;
+    }
+    return false;
+}
+
+/* An operand a lifted instruction can use: a {rN} placeholder, a machine
+   register the compiler allocates, or a literal in any of the spellings these
+   assemblers accept. */
 static bool lift_operand(const char *text, char *out, size_t out_size) {
     size_t len = strlen(text);
     if (len >= 4 && text[0] == '{' && text[len - 1] == '}') {
@@ -3990,10 +4094,64 @@ static bool lift_operand(const char *text, char *out, size_t out_size) {
         snprintf(out, out_size, "%s", name);
         return true;
     }
+    for (int i = 0; i < lift_reg_count; i++) {
+        if (strcmp(lift_regs[i], text) == 0) {
+            snprintf(out, out_size, "r%d", i);
+            return true;
+        }
+    }
+    {
+        const char *remembered = lift_memo_lookup(text);
+        if (remembered) {
+            snprintf(out, out_size, "%s", remembered);
+            return true;
+        }
+    }
+    if (lift_is_reserved(text)) return false;
     if (text[0] == '#' || text[0] == '$') text++;
-    if (!is_int(text)) return false;
+    if (!is_int(text) && !(lift_regs && is_symbol(text))) return false;
     snprintf(out, out_size, "%s", text);
     return true;
+}
+
+typedef struct {
+    const char *mnemonic;
+    const char *cas_op;
+} BranchRule;
+
+static const BranchRule branch_x86[] = {
+    {"je", "je"}, {"jne", "jne"}, {"jg", "jg"}, {"jl", "jl"}, {"jge", "jge"},
+    {"jle", "jle"}, {"ja", "ja"}, {"jb", "jb"}, {"jae", "jae"}, {"jbe", "jbe"},
+    {"jmp", "jmp"}, {"call", "call"}, {NULL, NULL}
+};
+static const BranchRule branch_a64[] = {
+    {"b.eq", "je"}, {"b.ne", "jne"}, {"b.gt", "jg"}, {"b.lt", "jl"},
+    {"b.ge", "jge"}, {"b.le", "jle"}, {"b.hi", "ja"}, {"b.lo", "jb"},
+    {"b.hs", "jae"}, {"b.ls", "jbe"}, {"b", "jmp"}, {"bl", "call"}, {NULL, NULL}
+};
+static const BranchRule branch_arm[] = {
+    {"beq", "je"}, {"bne", "jne"}, {"bgt", "jg"}, {"blt", "jl"},
+    {"bge", "jge"}, {"ble", "jle"}, {"bhi", "ja"}, {"blo", "jb"},
+    {"bhs", "jae"}, {"bls", "jbe"}, {"b", "jmp"}, {"bl", "call"}, {NULL, NULL}
+};
+/* RISC-V and MIPS fuse the comparison into the branch, so reading one back
+   yields the compare the source had before the backend folded it. */
+static const BranchRule branch_fused[] = {
+    {"beq", "je"}, {"bne", "jne"}, {"bgt", "jg"}, {"blt", "jl"},
+    {"bge", "jge"}, {"ble", "jle"}, {"bgtu", "ja"}, {"bltu", "jb"},
+    {"bgeu", "jae"}, {"bleu", "jbe"}, {NULL, NULL}
+};
+
+static const BranchRule *lift_branch_table(const char *family, bool *fused) {
+    *fused = false;
+    if (strcmp(family, "x86_64") == 0 || strcmp(family, "i386") == 0 ||
+        target_has_class(family, CLASS_X86_64) || target_has_class(family, CLASS_I386)) {
+        return branch_x86;
+    }
+    if (strcmp(family, "aarch64") == 0 || target_has_flag(family, TF_AARCH64)) return branch_a64;
+    if (strcmp(family, "arm32") == 0 || target_has_flag(family, TF_ARM32)) return branch_arm;
+    *fused = true;
+    return branch_fused;
 }
 
 /* A virtual register the lifted sequence can borrow, avoiding up to three
@@ -4094,6 +4252,7 @@ static void lift_line(Buffer *text, const LiftRule *rules, const char *selector,
     size_t len = strlen(line);
     if (len == 0) return;
     if (line[len - 1] == ':') {
+        lift_memo_count = 0;
         emit_cas(text, target, line_no, "%s", line);
         return;
     }
@@ -4102,6 +4261,102 @@ static void lift_line(Buffer *text, const LiftRule *rules, const char *selector,
     if (*space) {
         *space++ = '\0';
         argc = split_args(space, args, 8);
+    }
+    /* A literal being parked in a scratch register is remembered rather than
+       emitted; the instruction that reads it back gets the literal instead.
+       This has to come first, because the scratch is not a virtual register
+       and every other rule would refuse it. */
+    if (lift_regs && argc >= 2 && lift_is_reserved(args[0])) {
+        const char *literal = args[1];
+        bool is_move = strcmp(line, "mov") == 0 || strcmp(line, "movz") == 0 ||
+                       strcmp(line, "li") == 0 || strcmp(line, "dli") == 0 ||
+                       strcmp(line, "move") == 0 || strcmp(line, "la") == 0;
+        if (strcmp(line, "ldr") == 0 && literal[0] == '=') {
+            is_move = true;
+            literal++;
+        }
+        if (literal[0] == '#' || literal[0] == '$') literal++;
+        if (is_move && argc == 2 && (is_int(literal) || is_symbol(literal))) {
+            lift_memo_set(args[0], literal);
+            return;
+        }
+        /* movk fills in a further halfword of a value movz started. */
+        if (strcmp(line, "movk") == 0 && argc == 3) {
+            const char *known = lift_memo_lookup(args[0]);
+            const char *part = args[1];
+            const char *shift = strchr(args[2], '#');
+            if (known && shift && is_int(known)) {
+                char combined[64];
+                unsigned long long base = strtoull(known, NULL, 0);
+                if (part[0] == '#') part++;
+                base |= strtoull(part, NULL, 0) << strtoull(shift + 1, NULL, 0);
+                snprintf(combined, sizeof(combined), "%llu", base);
+                lift_memo_set(args[0], combined);
+                return;
+            }
+        }
+    }
+    /* Shapes that stand for an operation rather than being one: ARM negates
+       by reverse-subtracting from zero and loads a wide literal through the
+       pool, and MIPS inverts by NOR-ing against the zero register. */
+    if (strcmp(line, "rsb") == 0 && argc == 3 &&
+        lift_operand(args[0], ops[0], sizeof(ops[0])) &&
+        lift_operand(args[1], ops[1], sizeof(ops[1]))) {
+        const char *zero = args[2];
+        if (zero[0] == '#') zero++;
+        if (strcmp(zero, "0") == 0) {
+            if (strcmp(ops[0], ops[1]) != 0) emit_cas(text, target, line_no, "mov %s, %s", ops[0], ops[1]);
+            emit_cas(text, target, line_no, "neg %s", ops[0]);
+            return;
+        }
+    }
+    if (strcmp(line, "nor") == 0 && argc == 3 && strcmp(args[2], "$zero") == 0 &&
+        lift_operand(args[0], ops[0], sizeof(ops[0])) &&
+        lift_operand(args[1], ops[1], sizeof(ops[1]))) {
+        if (strcmp(ops[0], ops[1]) != 0) emit_cas(text, target, line_no, "mov %s, %s", ops[0], ops[1]);
+        emit_cas(text, target, line_no, "not %s", ops[0]);
+        return;
+    }
+    if (strcmp(line, "ldr") == 0 && argc == 2 && args[1][0] == '=') {
+        char value[64];
+        if (lift_operand(args[1] + 1, value, sizeof(value)) &&
+            lift_operand(args[0], ops[0], sizeof(ops[0]))) {
+            emit_cas(text, target, line_no, "mov %s, %s", ops[0], value);
+            return;
+        }
+    }
+    /* Returns, unconditional jumps and calls, spelled differently everywhere. */
+    if (strcmp(line, "ret") == 0 || strcmp(line, "blr") == 0 ||
+        (strcmp(line, "bx") == 0 && argc == 1 && strcmp(args[0], "lr") == 0) ||
+        (strcmp(line, "jr") == 0 && argc == 1 && strcmp(args[0], "$ra") == 0)) {
+        emit_cas(text, target, line_no, "ret");
+        return;
+    }
+    if ((strcmp(line, "j") == 0 || strcmp(line, "jal") == 0) && argc == 1) {
+        emit_cas(text, target, line_no, "%s %s", strcmp(line, "j") == 0 ? "jmp" : "call", args[0]);
+        return;
+    }
+    {
+        bool fused = false;
+        const BranchRule *branches = lift_branch_table(selector, &fused);
+        for (const BranchRule *b = branches; b->mnemonic; b++) {
+            if (strcmp(b->mnemonic, line) != 0) continue;
+            if (fused && argc == 3) {
+                /* The compare the backend folded in comes back out. */
+                if (lift_operand(args[0], ops[0], sizeof(ops[0])) &&
+                    lift_operand(args[1], ops[1], sizeof(ops[1]))) {
+                    emit_cas(text, target, line_no, "cmp %s, %s", ops[0], ops[1]);
+                    emit_cas(text, target, line_no, "%s %s", b->cas_op, args[2]);
+                    return;
+                }
+                break;
+            }
+            if (!fused && argc == 1) {
+                emit_cas(text, target, line_no, "%s %s", b->cas_op, args[0]);
+                return;
+            }
+            break;
+        }
     }
     if (rules == lift_x86 && strcmp(line, "lea") == 0 &&
         lift_lea(text, args, argc, target, line_no)) {
@@ -4151,8 +4406,30 @@ static void lift_line(Buffer *text, const LiftRule *rules, const char *selector,
                 else if (strcmp(kind, "asr") == 0) shift_op = "sar";
                 else break;
             }
-            /* d = a op b has to be expressed as a two-address sequence, and
-               the value of b must survive being written into d. */
+            /* Some backends write the operands the other way round - ARM's
+               multiply requires it before ARMv6 - so for an operation where
+               that makes no difference, the shape is normalised first. */
+            if (!shift_op && strcmp(ops[0], ops[2]) == 0 && strcmp(ops[0], ops[1]) != 0 &&
+                (strcmp(rule->cas_op, "add") == 0 || strcmp(rule->cas_op, "and") == 0 ||
+                 strcmp(rule->cas_op, "or") == 0 || strcmp(rule->cas_op, "xor") == 0 ||
+                 strcmp(rule->cas_op, "mul") == 0)) {
+                char swap[64];
+                snprintf(swap, sizeof(swap), "%s", ops[1]);
+                snprintf(ops[1], sizeof(ops[1]), "%s", ops[2]);
+                snprintf(ops[2], sizeof(ops[2]), "%s", swap);
+            }
+            /* d = a op b has to become a two-address sequence. When d is
+               already a, or when writing a into d cannot disturb b, no
+               register has to be borrowed - which is the usual case. */
+            if (!shift_op && strcmp(ops[0], ops[1]) == 0) {
+                emit_cas(text, target, line_no, "%s %s, %s", rule->cas_op, ops[0], ops[2]);
+                return;
+            }
+            if (!shift_op && strcmp(ops[0], ops[2]) != 0) {
+                emit_cas(text, target, line_no, "mov %s, %s", ops[0], ops[1]);
+                emit_cas(text, target, line_no, "%s %s, %s", rule->cas_op, ops[0], ops[2]);
+                return;
+            }
             ext_pick_scratch(target, ops[0], ops[1], &scratch_a, &scratch_b);
             emit_cas(text, target, line_no, "push r%d", scratch_a);
             emit_cas(text, target, line_no, "mov r%d, %s", scratch_a, ops[2]);
@@ -4197,6 +4474,141 @@ static bool translate_asm_block(Buffer *text, const char *selector, const char *
         if (*trimmed) lift_line(text, rules, selector, trimmed, target, line_no);
     }
     return true;
+}
+
+/* ------------------------------------------- reading a whole assembly file */
+
+/* Maps one directive of a compiler-emitted assembly file back to the
+   CommonASM it came from. Returns false when the line is not a directive. */
+static bool cas_from_directive(Buffer *out, char *line) {
+    char *colon;
+    char *rest;
+    /* Things that describe the output format rather than the program. */
+    if (strncmp(line, "default rel", 11) == 0 || strncmp(line, ".option", 7) == 0 ||
+        strncmp(line, ".syntax", 7) == 0 || strcmp(line, ".arm") == 0 ||
+        strcmp(line, ".thumb") == 0 || strncmp(line, "alignb", 6) == 0) {
+        return true;
+    }
+    if (strncmp(line, "section ", 8) == 0 || strncmp(line, ".section ", 9) == 0) {
+        const char *name = strchr(line, '.');
+        if (name && strchr(name + 1, '.')) name = strchr(name + 1, '.');
+        buf_appendf(out, "%s\n", name ? name : ".text");
+        return true;
+    }
+    if (strcmp(line, ".text") == 0 || strcmp(line, ".data") == 0 ||
+        strcmp(line, ".rodata") == 0 || strcmp(line, ".bss") == 0) {
+        buf_appendf(out, "%s\n", line);
+        return true;
+    }
+    if (strncmp(line, "global ", 7) == 0 || strncmp(line, ".globl ", 7) == 0) {
+        buf_appendf(out, "global %s\n", trim(line + 7));
+        return true;
+    }
+    if (strncmp(line, "extern ", 7) == 0 || strncmp(line, ".extern ", 8) == 0) {
+        buf_appendf(out, "extern %s\n", trim(line + (line[0] == '.' ? 8 : 7)));
+        return true;
+    }
+    if (strncmp(line, ".equ ", 5) == 0) {
+        char *comma = strchr(line, ',');
+        if (!comma) return false;
+        *comma = '\0';
+        buf_appendf(out, "const %s = %s\n", trim(line + 5), trim(comma + 1));
+        return true;
+    }
+    if (strncmp(line, "align ", 6) == 0 || strncmp(line, ".balign ", 8) == 0) {
+        buf_appendf(out, "align %s\n", trim(strchr(line, ' ')));
+        return true;
+    }
+    /* "NAME equ VALUE" has no leading marker, so it is checked by shape. */
+    rest = strstr(line, " equ ");
+    if (rest && !strchr(line, ':')) {
+        *rest = '\0';
+        buf_appendf(out, "const %s = %s\n", trim(line), trim(rest + 5));
+        return true;
+    }
+    colon = strchr(line, ':');
+    if (colon) {
+        char *body;
+        *colon = '\0';
+        body = trim(colon + 1);
+        if (*body == '\0') {
+            buf_appendf(out, "%s:\n", trim(line));
+            return true;
+        }
+        {
+            static const struct { const char *asm_dir; const char *cas_dir; } data_dirs[] = {
+                {"db", "bytes"}, {"dw", "word"}, {"dd", "dword"}, {"dq", "qword"},
+                {".byte", "bytes"}, {".word", "word"}, {".long", "dword"},
+                {".quad", "qword"}, {".zero", "zero"}, {"resb", "zero"}, {NULL, NULL}
+            };
+            for (int i = 0; data_dirs[i].asm_dir; i++) {
+                size_t len = strlen(data_dirs[i].asm_dir);
+                if (strncmp(body, data_dirs[i].asm_dir, len) == 0 && isspace((unsigned char)body[len])) {
+                    buf_appendf(out, "%s: %s %s\n", trim(line), data_dirs[i].cas_dir, trim(body + len));
+                    return true;
+                }
+            }
+            /* A reservation counted in words becomes the same number of bytes. */
+            if ((strncmp(body, "resq", 4) == 0 || strncmp(body, "resd", 4) == 0 ||
+                 strncmp(body, "resw", 4) == 0) && isspace((unsigned char)body[4])) {
+                long long units = strtoll(trim(body + 4), NULL, 0);
+                int scale = body[3] == 'q' ? 8 : body[3] == 'd' ? 4 : 2;
+                buf_appendf(out, "%s: zero %lld\n", trim(line), units * scale);
+                return true;
+            }
+            if (strncmp(body, "times ", 6) == 0) {
+                buf_appendf(out, "%s: zero %s\n", trim(line), trim(strtok(trim(body + 6), " \t")));
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Reads a whole assembly file back into the CommonASM it came from, so it can
+   be compiled for a different machine. This works on assembly written in the
+   registers the compiler allocates; a sequence that stands for a CommonASM
+   construct rather than an instruction - a syscall, a prologue, spill traffic
+   - is reported rather than guessed at. */
+static Buffer reconstruct_cas(const char *source, const char *family) {
+    Buffer out;
+    char comment[8];
+    const LiftRule *rules = lift_rules_for(family, comment, sizeof(comment));
+    const char *cursor = source;
+    int line_no = 0;
+    if (!rules) {
+        die("--from needs one of x86_64, i386, aarch64, arm32, riscv64, mips");
+    }
+    lift_regs = lift_register_table(family, &lift_reg_count);
+    lift_reserved = rules == lift_x86 ? lift_reserved_x86 :
+                    rules == lift_a64 ? (strcmp(comment, "@") == 0 ? lift_reserved_arm : lift_reserved_a64) :
+                    rules == lift_rv ? lift_reserved_rv : lift_reserved_mips;
+    buf_init(&out);
+    cas_sink = &out;
+    while (*cursor) {
+        char work[1024];
+        const char *newline = strchr(cursor, '\n');
+        size_t len = newline ? (size_t)(newline - cursor) : strlen(cursor);
+        char *trimmed;
+        char *mark;
+        line_no++;
+        if (len >= sizeof(work)) len = sizeof(work) - 1;
+        memcpy(work, cursor, len);
+        work[len] = '\0';
+        cursor = newline ? newline + 1 : cursor + strlen(cursor);
+        mark = strstr(work, comment);
+        if (mark) *mark = '\0';
+        trimmed = trim(work);
+        if (!*trimmed) continue;
+        if (cas_from_directive(&out, trimmed)) continue;
+        lift_line(NULL, rules, family, trimmed, family, line_no);
+    }
+    cas_sink = NULL;
+    lift_regs = NULL;
+    lift_reg_count = 0;
+    lift_reserved = NULL;
+    return out;
 }
 
 static void emit_text_line(Buffer *text, char *line, int line_no, const char *target) {
@@ -4876,6 +5288,8 @@ int main(int argc, char **argv) {
     const char *input = NULL;
     const char *target = NULL;
     const char *output = NULL;
+    const char *from_family = NULL;
+    bool emit_cas_only = false;
     int opt_level = 0;
     char *source;
     Buffer compiled;
@@ -4910,15 +5324,35 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "--optimize") == 0 || strcmp(argv[i], "--optimize=1") == 0) opt_level = 1;
         else if (strcmp(argv[i], "--emulate-extended") == 0) force_extended_fallback = true;
         else if (strcmp(argv[i], "--translate-asm") == 0) translate_inline_asm = true;
+        else if (strcmp(argv[i], "--from") == 0 && i + 1 < argc) from_family = argv[++i];
+        else if (strcmp(argv[i], "--emit-cas") == 0) emit_cas_only = true;
         else if (strcmp(argv[i], "--optimize=0") == 0) opt_level = 0;
         else if (strncmp(argv[i], "-O", 2) == 0 || strncmp(argv[i], "--optimize=", 11) == 0) die("unsupported optimization level; use -O0 or -O1");
         else if (!input) input = argv[i];
         else die(usage_text);
     }
-    if (!input || !target) die(usage_text);
-    if (!is_supported_target(target)) die("unknown target; run commonasmc --list-targets");
+    if (!input) die(usage_text);
+    if (!target && !(from_family && emit_cas_only)) die(usage_text);
+    if (target && !is_supported_target(target)) die("unknown target; run commonasmc --list-targets");
     source = read_file(input);
+    if (from_family) {
+        /* The input is assembly rather than CommonASM, so it is read back
+           into CommonASM first and then compiled like any other source. */
+        Buffer recovered = reconstruct_cas(source, from_family);
+        free(source);
+        source = recovered.data;
+    }
     set_diagnostic_source(strcmp(input, "-") == 0 ? "<stdin>" : input, source);
+    if (emit_cas_only) {
+        Buffer shown;
+        shown.data = source;
+        shown.len = strlen(source);
+        shown.cap = shown.len + 1;
+        write_file_or_stdout(output, &shown);
+        free(source);
+        symbol_set_free(&known_constants);
+        return 0;
+    }
     compiled = compile_source(source, target, opt_level);
     write_file_or_stdout(output, &compiled);
     free(source);
@@ -4926,6 +5360,8 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
 
 
 

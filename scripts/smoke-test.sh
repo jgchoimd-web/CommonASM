@@ -191,6 +191,53 @@ if command -v nasm > /dev/null 2>&1 && [ "$(uname -m)" = "x86_64" ]; then
   fi
   grep -q "no asm block" "$BUILD_DIR/translate-nope.txt"
   echo "an unmatched asm run still fails without --translate-asm."
+
+  # A whole assembly file read back into CommonASM and compiled again has to
+  # land on the assembly it started from, for every family that can be read.
+  cat > "$BUILD_DIR/roundtrip.cas" <<'CAS'
+.text
+global compute
+
+compute:
+  mov r0, 7
+  mul r0, 3
+  add r0, 5
+  sub r0, 2
+  and r0, 255
+  xor r1, r1
+  or r1, r0
+  shl r1, 2
+  shr r1, 1
+  mov r2, r1
+  neg r2
+  not r2
+  inc r0
+  dec r0
+  cmp r0, 26
+  je done
+  jne other
+  mov r1, 0
+other:
+  mov r2, 1
+done:
+  ret
+CAS
+  for pair in "x86_64:x86_64-nasm" "i386:i386-nasm" "aarch64:aarch64-gnu" \
+              "arm32:armv7a-gnu" "riscv64:riscv64-gnu" "mips:mips32-gnu"; do
+    family=${pair%%:*}
+    rt_target=${pair##*:}
+    "$BUILD_DIR/commonasmc" "$BUILD_DIR/roundtrip.cas" --target "$rt_target" \
+      -o "$BUILD_DIR/rt-${family}-1.s"
+    "$BUILD_DIR/commonasmc" "$BUILD_DIR/rt-${family}-1.s" --from "$family" --emit-cas \
+      -o "$BUILD_DIR/rt-${family}.cas"
+    "$BUILD_DIR/commonasmc" "$BUILD_DIR/rt-${family}.cas" --target "$rt_target" \
+      -o "$BUILD_DIR/rt-${family}-2.s"
+    if ! cmp -s "$BUILD_DIR/rt-${family}-1.s" "$BUILD_DIR/rt-${family}-2.s"; then
+      echo "$family assembly did not survive being read back"
+      exit 1
+    fi
+  done
+  echo "every family's assembly reads back into the CommonASM it came from."
 else
   echo "skipped running the extended operation checks."
 fi
