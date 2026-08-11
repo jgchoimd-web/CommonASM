@@ -1,0 +1,46 @@
+; The extended operations. Each one is a single instruction on a machine that
+; has it, and expands into ordinary CommonASM on a machine that does not, so
+; the same source runs everywhere and is fast where the hardware allows.
+;
+;   commonasmc examples/extended.cas --target aarch64-gnu   -> clz, rev, ror
+;   commonasmc examples/extended.cas --target riscv64-zbb   -> cpop, clz, rev8
+;   commonasmc examples/extended.cas --target riscv64-gnu   -> expanded
+;
+; Run commonasmc --target-info TARGET to see which are native there, and pass
+; --emulate-extended to expand them even on a target that has them.
+
+const stdout = 1
+
+.data
+msg: string "extended ops\n"
+
+.text
+global _start
+
+_start:
+  ; kept inside 32 bits so the example also builds for the 32-bit targets
+  mov r0, 0x89abcdef
+
+  ; how many bits are set
+  mov r1, r0
+  popcnt r1
+
+  ; where the highest and lowest set bits are
+  mov r2, r0
+  clz r2
+  mov r3, r0
+  ctz r3
+
+  ; byte order
+  mov r4, r0
+  bswap r4
+
+  ; rotations, by a constant and by a register
+  mov r5, r0
+  rol r5, 13
+  mov r6, r0
+  mov r7, 13
+  ror r6, r7
+
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0

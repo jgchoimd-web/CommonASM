@@ -249,20 +249,62 @@ if ($RegressRvText -match "(?m)^  b(eq|ne|lt|ge|gt|le)u? a[0-7],") {
 # every backend an assembler is available for.
 $Examples = Get-ChildItem -Path (Join-Path $RootDir "examples") -Filter "*.cas"
 
+# Truncation is promoted to an error: an immediate too wide for the encoding
+# assembles with only a warning otherwise, and silently loses its top bits.
+$NasmStrict = "-w+error=number-overflow"
+$HostObjFormat = if ($IsWindowsPlatform) { "win64" } else { "elf64" }
+
 if (Get-Command nasm -ErrorAction SilentlyContinue) {
     foreach ($Example in $Examples) {
         $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
         foreach ($Level in @("-O0", "-O1")) {
-            foreach ($Pair in @(@{T = "x86_64-nasm"; F = "elf64"; P = "asm64" }, @{T = "i386-nasm"; F = "elf32"; P = "asm32" })) {
-                $AsmPath = Join-Path $BuildPath "$($Pair.P)-$Name$Level-pwsh.asm"
-                Invoke-Native $CompilerExe @($Example.FullName, "--target", $Pair.T, $Level, "-o", $AsmPath)
-                Invoke-Native "nasm" @("-f", $Pair.F, $AsmPath, "-o", (Join-Path $BuildPath "$($Pair.P)-$Name$Level-pwsh.o"))
+            # Built twice: once letting the target use its own instructions for
+            # the extended operations, once with them all expanded.
+            foreach ($Mode in @(@{N = "native"; A = @() }, @{N = "emulated"; A = @("--emulate-extended") })) {
+                foreach ($Pair in @(@{T = "x86_64-nasm"; F = "elf64"; P = "asm64" }, @{T = "i386-nasm"; F = "elf32"; P = "asm32" })) {
+                    $Stem = "$($Pair.P)-$($Mode.N)-$Name$Level-pwsh"
+                    $AsmPath = Join-Path $BuildPath "$Stem.asm"
+                    Invoke-Native $CompilerExe (@($Example.FullName, "--target", $Pair.T, $Level) + $Mode.A + @("-o", $AsmPath))
+                    Invoke-Native "nasm" @("-f", $Pair.F, $NasmStrict, $AsmPath, "-o", (Join-Path $BuildPath "$Stem.o"))
+                }
             }
         }
     }
-    Write-Host "nasm accepted every x86_64 and i386 output."
+    Write-Host "nasm accepted every x86_64 and i386 output, native and expanded."
 } else {
     Write-Host "nasm not found; skipped assembling the x86_64 and i386 output."
+}
+
+# The strongest check available: build the extended operations both ways and
+# run them against a reference implementation.
+if ((Get-Command nasm -ErrorAction SilentlyContinue) -and (Get-Command $Compiler -ErrorAction SilentlyContinue)) {
+    foreach ($Mode in @(@{N = "native"; A = @() }, @{N = "emulated"; A = @("--emulate-extended") })) {
+        $AsmPath = Join-Path $BuildPath "extkernel-$($Mode.N)-pwsh.asm"
+        $ObjPath = Join-Path $BuildPath "extkernel-$($Mode.N)-pwsh.o"
+        $RunPath = Join-Path $BuildPath "extrun-$($Mode.N)-pwsh$(if ($IsWindowsPlatform) { '.exe' } else { '' })"
+        Invoke-Native $CompilerExe (@((Join-Path $RootDir "tests/extended-kernel.cas"), "--target", "x86_64-nasm") + $Mode.A + @("-o", $AsmPath))
+        Invoke-Native "nasm" @("-f", $HostObjFormat, $NasmStrict, $AsmPath, "-o", $ObjPath)
+        Invoke-Native $Compiler @((Join-Path $RootDir "tests/extended-driver.c"), $ObjPath, "-o", $RunPath)
+        Write-Host "  extended operations, $($Mode.N):"
+        Invoke-Native $RunPath @()
+    }
+    Write-Host "extended operations agree with the reference, native and expanded."
+} else {
+    Write-Host "skipped running the extended operation checks."
+}
+
+if (Get-Command riscv64-linux-gnu-as -ErrorAction SilentlyContinue) {
+    foreach ($Example in $Examples) {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
+        foreach ($Target in @("riscv64-gnu", "riscv64-zbb")) {
+            $AsmPath = Join-Path $BuildPath "rv-$Target-$Name-pwsh.s"
+            Invoke-Native $CompilerExe @($Example.FullName, "--target", $Target, "-o", $AsmPath)
+            Invoke-Native "riscv64-linux-gnu-as" @("-o", (Join-Path $BuildPath "rv-$Target-$Name-pwsh.o"), $AsmPath)
+        }
+    }
+    Write-Host "the RISC-V assembler accepted every riscv64-gnu and riscv64-zbb output."
+} else {
+    Write-Host "no RISC-V assembler found; skipped assembling the RISC-V output."
 }
 
 if (Get-Command clang -ErrorAction SilentlyContinue) {

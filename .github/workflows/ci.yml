@@ -18,8 +18,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install assembler
-        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install assemblers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm binutils-riscv64-linux-gnu gcc-multilib
 
       - name: Run POSIX smoke tests
         run: make smoke

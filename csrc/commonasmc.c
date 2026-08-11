@@ -18,7 +18,7 @@ typedef struct {
 typedef struct {
     char base[64];
     char symbol[128];
-    long offset;
+    long long offset;
     bool has_base;
     bool has_symbol;
 } Address;
@@ -161,13 +161,32 @@ typedef enum {
 } TargetGroup;
 
 /* Sub-family bits, for the places where one class still needs to tell its
-   members apart (register file, addressing syntax, branch mnemonics). */
+   members apart (register file, addressing syntax, branch mnemonics), plus
+   the per-target instruction availability the extended operations below key
+   off. ARM in particular gained clz, rev and rbit in different architecture
+   revisions, so those cannot be decided by family. */
 enum {
     TF_ARM32 = 1u << 0,
     TF_AARCH64 = 1u << 1,
     TF_RV_GENERIC = 1u << 2,
     TF_IA64 = 1u << 3,
-    TF_LOONG = 1u << 4
+    TF_LOONG = 1u << 4,
+    TF_HAS_CLZ = 1u << 5,   /* ARMv5 and later */
+    TF_HAS_REV = 1u << 6,   /* ARMv6 and later */
+    TF_HAS_RBIT = 1u << 7,  /* ARMv6T2 and later */
+    TF_RV_ZBB = 1u << 8     /* RISC-V bit-manipulation extension */
+};
+
+/* Operations the language offers on every target but that only some machines
+   have an instruction for. Where the instruction exists it is emitted
+   directly; where it does not, the operation is expanded into ordinary
+   CommonASM and lowered like any other code. */
+enum {
+    CAP_POPCNT = 1u << 0,
+    CAP_CLZ = 1u << 1,
+    CAP_CTZ = 1u << 2,
+    CAP_BSWAP = 1u << 3,
+    CAP_ROT = 1u << 4
 };
 
 typedef struct {
@@ -184,16 +203,19 @@ static const TargetDesc target_table[] = {
     {"x86_64-nasm", CLASS_X86_64, GROUP_PRIMARY, 0},
     {"riscv64-gnu", CLASS_RV64, GROUP_PRIMARY, 0},
     {"rv64i-gnu", CLASS_RV64, GROUP_PRIMARY, 0},
+    /* Same lowering as riscv64-gnu, but allowed to use the bit-manipulation
+       instructions. Adding it costs one row, which is what the table is for. */
+    {"riscv64-zbb", CLASS_RV64, GROUP_PRIMARY, TF_RV_ZBB},
 
     {"i386-nasm", CLASS_I386, GROUP_I386, 0},
     {"ia32-nasm", CLASS_I386, GROUP_I386, 0},
 
     {"armv4-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32},
-    {"armv5-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32},
-    {"armv7a-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32},
+    {"armv5-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ},
+    {"armv7a-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ | TF_HAS_REV | TF_HAS_RBIT},
     {"aarch64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_AARCH64},
-    {"thumb-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32},
-    {"thumb2-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32},
+    {"thumb-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ},
+    {"thumb2-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ | TF_HAS_REV | TF_HAS_RBIT},
     {"rv32i-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_RV_GENERIC},
     {"rv128i-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_RV_GENERIC},
     {"ia64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_IA64},
@@ -305,7 +327,7 @@ static const TargetDesc target_table[] = {
 
 #define TARGET_COUNT (sizeof(target_table) / sizeof(target_table[0]))
 /* Open-addressing set of the constant names the source has defined. Names are
-   heap copies, so a long label is stored whole instead of being cut to fit a
+   heap copies, so a long long label is stored whole instead of being cut to fit a
    fixed cell, and the table grows instead of capping how many may exist. */
 typedef struct {
     char **slots;
@@ -319,6 +341,7 @@ static int diagnostic_line_count = 0;
 static const char *diagnostic_path = NULL;
 static const char *usage_text =
     "usage: commonasmc input.cas|- --target TARGET [-o output|-] [-O0|-O1]\n"
+    "                  [--emulate-extended]\n"
     "       commonasmc --list-targets\n"
     "       commonasmc --target-info TARGET\n"
     "       commonasmc --version\n"
@@ -600,14 +623,14 @@ static void strip_comment(char *line) {
 static bool is_int(const char *text) {
     char *end = NULL;
     /* Called on every operand, most of which are not numbers at all. The
-       leading character rules those out without entering strtol; the set
-       accepted here is exactly the set strtol would start on. */
+       leading character rules those out without entering strtoll; the set
+       accepted here is exactly the set strtoll would start on. */
     if (!isdigit((unsigned char)text[0]) && text[0] != '-' && text[0] != '+' &&
         !isspace((unsigned char)text[0])) {
         return false;
     }
     errno = 0;
-    strtol(text, &end, 0);
+    strtoll(text, &end, 0);
     return errno == 0 && end && *end == '\0' && end != text;
 }
 
@@ -707,6 +730,89 @@ static bool is_supported_target(const char *target) {
     return target_lookup(target) != NULL;
 }
 
+/* Which extended operations this target has an instruction for. Everything
+   else is expanded into ordinary CommonASM, so the operation still works, it
+   just costs more. */
+/* Set by --emulate-extended, which makes every extended operation take the
+   expanded path. It exists for machines that lack the optional instructions
+   their architecture defines - an x86-64 without POPCNT, say - and it lets the
+   expansions be tested on a target that would otherwise never use them. */
+static bool force_extended_fallback = false;
+
+static unsigned target_caps(const char *target) {
+    const TargetDesc *desc = target_lookup(target);
+    if (!desc || force_extended_fallback) return 0;
+    switch (desc->cls) {
+        case CLASS_X86_64:
+            /* popcnt needs POPCNT and lzcnt/tzcnt need LZCNT/BMI1; both are
+               reported by --target-info so the requirement is not hidden. */
+            return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
+        case CLASS_I386:
+            /* bswap is 486, and the rotates are 386. bsr and bsf could serve
+               for clz and ctz but they leave the result undefined for a zero
+               input, so those are expanded instead. */
+            return CAP_BSWAP | CAP_ROT;
+        case CLASS_RV64:
+            return (desc->flags & TF_RV_ZBB) ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT) : 0;
+        case CLASS_GENERIC:
+            if (desc->flags & TF_AARCH64) {
+                return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
+            }
+            if (desc->flags & TF_ARM32) {
+                unsigned caps = CAP_ROT; /* the barrel shifter is always there */
+                if (desc->flags & TF_HAS_CLZ) caps |= CAP_CLZ;
+                if (desc->flags & TF_HAS_REV) caps |= CAP_BSWAP;
+                /* ctz is rbit followed by clz, so it needs both. */
+                if ((desc->flags & TF_HAS_RBIT) && (desc->flags & TF_HAS_CLZ)) caps |= CAP_CTZ;
+                return caps;
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+/* The natural register width, which the expansions need in order to build the
+   right masks and shift distances. */
+static int target_word_bits(const char *target) {
+    const TargetDesc *desc = target_lookup(target);
+    if (!desc) return 64;
+    if (desc->cls == CLASS_DCPU) return 16;
+    if (desc->cls == CLASS_I386) return 32;
+    if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
+    return 64;
+}
+
+/* The highest virtual register a target can actually name, which is what the
+   expansions have to stay inside when they borrow one. */
+static int target_max_vreg(const char *target) {
+    return target_has_class(target, CLASS_DCPU) ? 7 : 15;
+}
+
+typedef struct {
+    const char *name;
+    unsigned cap;
+    int argc;
+} ExtendedOp;
+
+static const ExtendedOp extended_ops[] = {
+    {"popcnt", CAP_POPCNT, 1},
+    {"clz", CAP_CLZ, 1},
+    {"ctz", CAP_CTZ, 1},
+    {"bswap", CAP_BSWAP, 1},
+    {"rol", CAP_ROT, 2},
+    {"ror", CAP_ROT, 2}
+};
+
+#define EXTENDED_OP_COUNT (sizeof(extended_ops) / sizeof(extended_ops[0]))
+
+static const ExtendedOp *extended_op_lookup(const char *name) {
+    for (size_t i = 0; i < EXTENDED_OP_COUNT; i++) {
+        if (strcmp(extended_ops[i].name, name) == 0) return &extended_ops[i];
+    }
+    return NULL;
+}
+
 static const char *group_title(TargetGroup group) {
     switch (group) {
         case GROUP_PRIMARY: return "Primary";
@@ -798,6 +904,32 @@ static void print_target_info(const char *target) {
     printf("support: %s\n", target_support_level(target));
     printf("output: %s\n", target_output_kind(target));
     printf("note: %s\n", target_portability_note(target));
+    printf("word: %d-bit\n", target_word_bits(target));
+    {
+        unsigned caps = target_caps(target);
+        printf("extended native:");
+        if (caps == 0) {
+            printf(" none");
+        } else {
+            for (size_t i = 0; i < EXTENDED_OP_COUNT; i++) {
+                if (caps & extended_ops[i].cap) printf(" %s", extended_ops[i].name);
+            }
+        }
+        printf("\n");
+        printf("extended expanded:");
+        if (caps == (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT)) {
+            printf(" none");
+        } else {
+            for (size_t i = 0; i < EXTENDED_OP_COUNT; i++) {
+                if (!(caps & extended_ops[i].cap)) printf(" %s", extended_ops[i].name);
+            }
+        }
+        printf("\n");
+        if (target_has_class(target, CLASS_X86_64) && caps != 0) {
+            printf("requires: POPCNT for popcnt, LZCNT/BMI1 for clz and ctz;"
+                   " use --emulate-extended for CPUs without them\n");
+        }
+    }
 }
 
 static size_t symbol_hash(const char *text) {
@@ -874,7 +1006,7 @@ static bool is_known_constant(const char *name) {
 }
 
 /* Runs on every operand of every instruction, so it reads the digits directly
-   rather than going through strtol. */
+   rather than going through strtoll. */
 static int virtual_reg_index(const char *name) {
     const char *p = name + 1;
     int value = 0;
@@ -1034,10 +1166,10 @@ static unsigned scan_mentioned_vregs(const char *source) {
     unsigned mask = 0;
     for (const char *p = source; *p; p++) {
         char *end = NULL;
-        long value;
+        long long value;
         if (*p != 'r' || !isdigit((unsigned char)p[1])) continue;
         if (p != source && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.')) continue;
-        value = strtol(p + 1, &end, 10);
+        value = strtoll(p + 1, &end, 10);
         if (end && value >= 0 && value <= 15 && !is_symbol_char(*end)) {
             mask |= 1u << (unsigned)value;
         }
@@ -1074,6 +1206,19 @@ static const char *x86_operand(const char *value, int line_no, const char *op) {
    one instruction, which x86 cannot encode. */
 static bool x86_needs_scratch(const char *dst, const char *src) {
     return x86_reg_is_spilled(dst) && x86_reg_is_spilled(src);
+}
+
+/* Outside mov, an x86-64 instruction carries at most a sign-extended 32-bit
+   immediate. A wider one assembles with a truncation warning rather than an
+   error, so it has to be caught here and materialised instead. */
+static bool x86_imm_too_wide(const char *value) {
+    long long parsed;
+    char *end = NULL;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0) return true;
+    return parsed < -2147483647LL - 1 || parsed > 2147483647LL;
 }
 
 static int split_args(char *arg_text, char **args, int max_args) {
@@ -1126,7 +1271,7 @@ static bool parse_address(const char *text, Address *addr) {
     if (sign) {
         char sign_char = *sign;
         *sign = '\0';
-        addr->offset = strtol(trim(sign + 1), NULL, 0);
+        addr->offset = strtoll(trim(sign + 1), NULL, 0);
         if (sign_char == '-') {
             addr->offset = -addr->offset;
         }
@@ -1157,7 +1302,7 @@ static void x86_emit_address(Buffer *text, const char *addr_text, char *out, siz
     }
     if (!addr.has_base) {
         if (addr.offset == 0) snprintf(out, out_size, "[rel %s]", addr.symbol);
-        else snprintf(out, out_size, "[rel %s%+ld]", addr.symbol, addr.offset);
+        else snprintf(out, out_size, "[rel %s%+lld]", addr.symbol, addr.offset);
         return;
     }
     if (x86_reg_is_spilled(addr.base)) {
@@ -1167,7 +1312,7 @@ static void x86_emit_address(Buffer *text, const char *addr_text, char *out, siz
         base = x86_reg(addr.base, line_no, op);
     }
     if (addr.offset == 0) snprintf(out, out_size, "[%s]", base);
-    else snprintf(out, out_size, "[%s%+ld]", base, addr.offset);
+    else snprintf(out, out_size, "[%s%+lld]", base, addr.offset);
 }
 
 static void rv_emit_address_setup(Buffer *text, const char *addr_text, const char *scratch, int line_no, const char *op) {
@@ -1176,7 +1321,7 @@ static void rv_emit_address_setup(Buffer *text, const char *addr_text, const cha
     if (!parse_address(addr_text, &addr)) {
         line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
-    snprintf(offset, sizeof(offset), "%ld", addr.offset);
+    snprintf(offset, sizeof(offset), "%lld", addr.offset);
     if (addr.has_base) {
         buf_appendf(text, "%s", "");
     } else {
@@ -1191,7 +1336,7 @@ static void rv_emit_address_setup(Buffer *text, const char *addr_text, const cha
     }
 }
 
-static const char *rv_address_base(const char *addr_text, const char *scratch, int line_no, const char *op, long *offset) {
+static const char *rv_address_base(const char *addr_text, const char *scratch, int line_no, const char *op, long long *offset) {
     Address addr;
     if (!parse_address(addr_text, &addr)) {
         line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
@@ -1253,7 +1398,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
             byte_count++;
         }
         buf_append(out, "\n");
-        /* Sized from the label itself so that a long name keeps its whole
+        /* Sized from the label itself so that a long long name keeps its whole
            "<name>_len" spelling instead of being cut to fit a fixed buffer. */
         char *len_name = xmalloc(strlen(name) + sizeof("_len"));
         sprintf(len_name, "%s_len", name);
@@ -1436,23 +1581,23 @@ static void generic_format_address(const char *text, const char *target, char *o
     Address addr;
     if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     if (is_i386_target(target)) {
-        if (addr.has_base) snprintf(out, out_size, "[%s%s%ld]", generic_reg_for_target(addr.base, target, line_no, op), addr.offset < 0 ? "" : "+", addr.offset);
-        else snprintf(out, out_size, "[%s%s%ld]", addr.symbol, addr.offset < 0 ? "" : "+", addr.offset);
+        if (addr.has_base) snprintf(out, out_size, "[%s%s%lld]", generic_reg_for_target(addr.base, target, line_no, op), addr.offset < 0 ? "" : "+", addr.offset);
+        else snprintf(out, out_size, "[%s%s%lld]", addr.symbol, addr.offset < 0 ? "" : "+", addr.offset);
         if (addr.offset == 0) {
             if (addr.has_base) snprintf(out, out_size, "[%s]", generic_reg_for_target(addr.base, target, line_no, op));
             else snprintf(out, out_size, "[%s]", addr.symbol);
         }
     } else if (is_arm32_target(target) || is_aarch64_target(target)) {
-        if (addr.has_base) snprintf(out, out_size, "[%s, #%ld]", generic_reg_for_target(addr.base, target, line_no, op), addr.offset);
-        else snprintf(out, out_size, "=%s%+ld", addr.symbol, addr.offset);
+        if (addr.has_base) snprintf(out, out_size, "[%s, #%lld]", generic_reg_for_target(addr.base, target, line_no, op), addr.offset);
+        else snprintf(out, out_size, "=%s%+lld", addr.symbol, addr.offset);
         if (addr.has_base && addr.offset == 0) snprintf(out, out_size, "[%s]", generic_reg_for_target(addr.base, target, line_no, op));
     } else if (is_rv_generic_target(target) || is_loong_target(target)) {
-        if (addr.has_base) snprintf(out, out_size, "%ld(%s)", addr.offset, generic_reg_for_target(addr.base, target, line_no, op));
-        else snprintf(out, out_size, "%s%+ld", addr.symbol, addr.offset);
+        if (addr.has_base) snprintf(out, out_size, "%lld(%s)", addr.offset, generic_reg_for_target(addr.base, target, line_no, op));
+        else snprintf(out, out_size, "%s%+lld", addr.symbol, addr.offset);
         if (addr.has_symbol && addr.offset == 0) snprintf(out, out_size, "%s", addr.symbol);
     } else if (is_ia64_target(target)) {
-        if (addr.has_base) snprintf(out, out_size, "[%s],%ld", generic_reg_for_target(addr.base, target, line_no, op), addr.offset);
-        else snprintf(out, out_size, "%s%+ld", addr.symbol, addr.offset);
+        if (addr.has_base) snprintf(out, out_size, "[%s],%lld", generic_reg_for_target(addr.base, target, line_no, op), addr.offset);
+        else snprintf(out, out_size, "%s%+lld", addr.symbol, addr.offset);
         if (addr.has_symbol && addr.offset == 0) snprintf(out, out_size, "%s", addr.symbol);
     } else {
         snprintf(out, out_size, "%s", text);
@@ -1462,8 +1607,8 @@ static void generic_format_address(const char *text, const char *target, char *o
 static void mmix_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
     Address addr;
     if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
-    if (addr.has_base) snprintf(out, out_size, "%ld,%s", addr.offset, mmix_reg(addr.base, line_no, op));
-    else snprintf(out, out_size, "%s%+ld", addr.symbol, addr.offset);
+    if (addr.has_base) snprintf(out, out_size, "%lld,%s", addr.offset, mmix_reg(addr.base, line_no, op));
+    else snprintf(out, out_size, "%s%+lld", addr.symbol, addr.offset);
 }
 
 static void dcpu_format_address(const char *text, char *out, size_t out_size, int line_no, const char *op) {
@@ -1471,10 +1616,10 @@ static void dcpu_format_address(const char *text, char *out, size_t out_size, in
     if (!parse_address(text, &addr)) line_error_token(line_no, text, op, "expected address like [r0 + 8] or [symbol + 8]");
     if (addr.has_base) {
         if (addr.offset == 0) snprintf(out, out_size, "[%s]", dcpu_reg(addr.base, line_no, op));
-        else snprintf(out, out_size, "[%s%+ld]", dcpu_reg(addr.base, line_no, op), addr.offset);
+        else snprintf(out, out_size, "[%s%+lld]", dcpu_reg(addr.base, line_no, op), addr.offset);
     } else {
         if (addr.offset == 0) snprintf(out, out_size, "[%s]", addr.symbol);
-        else snprintf(out, out_size, "[%s%+ld]", addr.symbol, addr.offset);
+        else snprintf(out, out_size, "[%s%+lld]", addr.symbol, addr.offset);
     }
 }
 
@@ -1766,7 +1911,7 @@ static void i386_emit_address(Buffer *text, const char *addr_text, char *out, si
     }
     if (!addr.has_base) {
         if (addr.offset == 0) snprintf(out, out_size, "[%s]", addr.symbol);
-        else snprintf(out, out_size, "[%s%+ld]", addr.symbol, addr.offset);
+        else snprintf(out, out_size, "[%s%+lld]", addr.symbol, addr.offset);
         return;
     }
     if (i386_reg_is_spilled(addr.base)) {
@@ -1776,7 +1921,7 @@ static void i386_emit_address(Buffer *text, const char *addr_text, char *out, si
         base = i386_reg(addr.base, line_no, op);
     }
     if (addr.offset == 0) snprintf(out, out_size, "[%s]", base);
-    else snprintf(out, out_size, "[%s%+ld]", base, addr.offset);
+    else snprintf(out, out_size, "[%s%+lld]", base, addr.offset);
 }
 
 static const char *i386_size_word(const char *size) {
@@ -1880,7 +2025,18 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+    if (op_is(op, "bswap") && argc == 1) {
+        if (i386_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+            buf_appendf(text, "  bswap %s\n", I386_SCRATCH);
+            buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  bswap %s\n", i386_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar") ||
+         op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
         bool dst_mem = i386_reg_is_spilled(args[0]);
         if (virtual_reg_index(args[1]) < 0) {
             buf_appendf(text, "  %s %s%s, %s\n", op, dst_mem ? "dword " : "",
@@ -1982,12 +2138,12 @@ static void arm_load_spill_base(Buffer *text, const char *reg) {
 
 /* An immediate has to be an 8-bit value under an even rotation. Rather than
    model that, anything outside 0-255 goes through the literal pool. */
-static bool arm_fits_imm(const char *value, long *out) {
+static bool arm_fits_imm(const char *value, long long *out) {
     char *end = NULL;
-    long parsed;
+    long long parsed;
     if (!is_int(value)) return false;
     errno = 0;
-    parsed = strtol(value, &end, 0);
+    parsed = strtoll(value, &end, 0);
     if (parsed < 0 || parsed > 255) return false;
     *out = parsed;
     return true;
@@ -2044,7 +2200,7 @@ static void arm_emit_address(Buffer *text, const char *addr_text, char *out, siz
         base = scratch;
     }
     if (addr.offset == 0) snprintf(out, out_size, "[%s]", base);
-    else snprintf(out, out_size, "[%s, #%ld]", base, addr.offset);
+    else snprintf(out, out_size, "[%s, #%lld]", base, addr.offset);
 }
 
 static int arm_vreg_of(const char *physical) {
@@ -2100,10 +2256,10 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
     if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
-        long frame;
+        long long frame;
         buf_append(text, "  push {fp, lr}\n  mov fp, sp\n");
         if (strcmp(args[0], "0") == 0) return;
-        if (arm_fits_imm(args[0], &frame)) buf_appendf(text, "  sub sp, sp, #%ld\n", frame);
+        if (arm_fits_imm(args[0], &frame)) buf_appendf(text, "  sub sp, sp, #%lld\n", frame);
         else {
             buf_appendf(text, "  ldr %s, =%s\n", ARM_SCRATCH, args[0]);
             buf_appendf(text, "  sub sp, sp, %s\n", ARM_SCRATCH);
@@ -2113,9 +2269,9 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
     if (op_is(op, "leave") && argc == 0) { buf_append(text, "  mov sp, fp\n  pop {fp, lr}\n"); return; }
     if (op_is(op, "mov") && argc == 2) {
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
-        long imm;
+        long long imm;
         if (virtual_reg_index(args[0]) < 0) line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
-        if (arm_fits_imm(args[1], &imm)) buf_appendf(text, "  mov %s, #%ld\n", dst, imm);
+        if (arm_fits_imm(args[1], &imm)) buf_appendf(text, "  mov %s, #%lld\n", dst, imm);
         else {
             const char *src = arm_value_reg(text, args[1], dst, line_no, op);
             if (strcmp(src, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, src);
@@ -2154,11 +2310,11 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
                              op_is(op, "shl") ? "lsl" : op_is(op, "shr") ? "lsr" :
                              op_is(op, "sar") ? "asr" : op;
         const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
-        long imm;
+        long long imm;
         /* mul takes no immediate, and on ARMv4/v5 its destination must differ
            from its first source, so it always goes through registers. */
         if (strcmp(op, "mul") != 0 && arm_fits_imm(args[1], &imm)) {
-            buf_appendf(text, "  %s %s, %s, #%ld\n", native, dst, dst, imm);
+            buf_appendf(text, "  %s %s, %s, #%lld\n", native, dst, dst, imm);
         } else {
             const char *src = arm_value_reg(text, args[1], ARM_SCRATCH, line_no, op);
             if (op_is(op, "mul")) buf_appendf(text, "  mul %s, %s, %s\n", dst, src, dst);
@@ -2194,6 +2350,36 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
+    if ((op_is(op, "clz") || op_is(op, "ctz") || op_is(op, "bswap")) && argc == 1) {
+        const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
+        if (op_is(op, "clz")) buf_appendf(text, "  clz %s, %s\n", dst, dst);
+        else if (op_is(op, "bswap")) buf_appendf(text, "  rev %s, %s\n", dst, dst);
+        else {
+            buf_appendf(text, "  rbit %s, %s\n", dst, dst);
+            buf_appendf(text, "  clz %s, %s\n", dst, dst);
+        }
+        arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
+        return;
+    }
+    if ((op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
+        /* ARM rotates right only, so a left rotation goes the other way by
+           the complement of the distance. */
+        const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
+        if (is_int(args[1])) {
+            long long amount = strtoll(args[1], NULL, 0) & 31;
+            if (op_is(op, "rol")) amount = (32 - amount) & 31;
+            buf_appendf(text, "  ror %s, %s, #%lld\n", dst, dst, amount);
+        } else {
+            const char *src = arm_value_reg(text, args[1], ARM_SCRATCH, line_no, op);
+            if (op_is(op, "rol")) {
+                buf_appendf(text, "  rsb %s, %s, #32\n", ARM_SCRATCH, src);
+                src = ARM_SCRATCH;
+            }
+            buf_appendf(text, "  ror %s, %s, %s\n", dst, dst, src);
+        }
+        arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
+        return;
+    }
     if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") ||
          op_is(op, "dec")) && argc == 1) {
         const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
@@ -2205,8 +2391,8 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
     }
     if (op_is(op, "cmp") && argc == 2) {
         const char *lhs = arm_value_reg(text, args[0], ARM_SCRATCH2, line_no, op);
-        long imm;
-        if (arm_fits_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%ld\n", lhs, imm);
+        long long imm;
+        if (arm_fits_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%lld\n", lhs, imm);
         else buf_appendf(text, "  cmp %s, %s\n", lhs, arm_value_reg(text, args[1], ARM_SCRATCH, line_no, op));
         return;
     }
@@ -2261,24 +2447,24 @@ static const char *a64_reg_w(const char *physical) {
    movz/movk so no literal pool is needed; a label becomes its address, and a
    name the source declared as a constant stays an immediate. */
 static void a64_load_operand(Buffer *text, const char *reg, const char *value) {
-    long number;
+    long long number;
     if (is_int(value)) {
-        unsigned long bits;
+        unsigned long long bits;
         int shift;
         bool started = false;
         char *end = NULL;
         errno = 0;
-        number = strtol(value, &end, 0);
-        bits = (unsigned long)number;
+        number = strtoll(value, &end, 0);
+        bits = (unsigned long long)number;
         for (shift = 0; shift < 64; shift += 16) {
-            unsigned long part = (bits >> shift) & 0xffffu;
+            unsigned long long part = (bits >> shift) & 0xffffu;
             if (part == 0 && started) continue;
             if (!started) {
-                if (shift == 0) buf_appendf(text, "  movz %s, #%lu\n", reg, part);
-                else buf_appendf(text, "  movz %s, #%lu, lsl #%d\n", reg, part, shift);
+                if (shift == 0) buf_appendf(text, "  movz %s, #%llu\n", reg, part);
+                else buf_appendf(text, "  movz %s, #%llu, lsl #%d\n", reg, part, shift);
                 started = true;
             } else {
-                buf_appendf(text, "  movk %s, #%lu, lsl #%d\n", reg, part, shift);
+                buf_appendf(text, "  movk %s, #%llu, lsl #%d\n", reg, part, shift);
             }
         }
         if (!started) buf_appendf(text, "  movz %s, #0\n", reg);
@@ -2307,12 +2493,12 @@ static const char *a64_operand_reg(Buffer *text, const char *value, const char *
 
 /* add and sub take a 12-bit unsigned immediate; everything else has to go
    through a register. */
-static bool a64_fits_add_imm(const char *value, long *out) {
+static bool a64_fits_add_imm(const char *value, long long *out) {
     char *end = NULL;
-    long parsed;
+    long long parsed;
     if (!is_int(value)) return false;
     errno = 0;
-    parsed = strtol(value, &end, 0);
+    parsed = strtoll(value, &end, 0);
     if (parsed < 0 || parsed > 4095) return false;
     *out = parsed;
     return true;
@@ -2326,7 +2512,7 @@ static void a64_emit_address(Buffer *text, const char *addr_text, char *out, siz
     }
     if (addr.has_base) {
         if (addr.offset == 0) snprintf(out, out_size, "[%s]", a64_reg(addr.base, line_no, op));
-        else snprintf(out, out_size, "[%s, #%ld]", a64_reg(addr.base, line_no, op), addr.offset);
+        else snprintf(out, out_size, "[%s, #%lld]", a64_reg(addr.base, line_no, op), addr.offset);
         return;
     }
     /* A bare symbol has no addressing mode of its own, so its address is
@@ -2334,7 +2520,7 @@ static void a64_emit_address(Buffer *text, const char *addr_text, char *out, siz
     buf_appendf(text, "  adrp %s, %s\n", A64_SCRATCH2, addr.symbol);
     buf_appendf(text, "  add %s, %s, :lo12:%s\n", A64_SCRATCH2, A64_SCRATCH2, addr.symbol);
     if (addr.offset == 0) snprintf(out, out_size, "[%s]", A64_SCRATCH2);
-    else snprintf(out, out_size, "[%s, #%ld]", A64_SCRATCH2, addr.offset);
+    else snprintf(out, out_size, "[%s, #%lld]", A64_SCRATCH2, addr.offset);
 }
 
 static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
@@ -2366,12 +2552,12 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
     if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
-        long frame;
+        long long frame;
         buf_append(text, "  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n");
         if (strcmp(args[0], "0") == 0) return;
         if (a64_fits_add_imm(args[0], &frame)) {
             /* The stack pointer must stay 16-byte aligned. */
-            buf_appendf(text, "  sub sp, sp, #%ld\n", (frame + 15) & ~15L);
+            buf_appendf(text, "  sub sp, sp, #%lld\n", (frame + 15) & ~15L);
         } else {
             a64_load_operand(text, A64_SCRATCH, args[0]);
             buf_appendf(text, "  sub sp, sp, %s\n", A64_SCRATCH);
@@ -2418,9 +2604,9 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
     }
     if ((op_is(op, "add") || op_is(op, "sub")) && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
-        long imm;
+        long long imm;
         if (a64_fits_add_imm(args[1], &imm)) {
-            buf_appendf(text, "  %s %s, %s, #%ld\n", op, dst, dst, imm);
+            buf_appendf(text, "  %s %s, %s, #%lld\n", op, dst, dst, imm);
         } else {
             const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
             buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, src);
@@ -2452,6 +2638,47 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
+    if ((op_is(op, "clz") || op_is(op, "ctz") || op_is(op, "bswap")) && argc == 1) {
+        const char *dst = a64_reg(args[0], line_no, op);
+        if (op_is(op, "clz")) buf_appendf(text, "  clz %s, %s\n", dst, dst);
+        else if (op_is(op, "bswap")) buf_appendf(text, "  rev %s, %s\n", dst, dst);
+        else {
+            /* Counting trailing zeros is counting leading zeros of the
+               bit-reversed value. */
+            buf_appendf(text, "  rbit %s, %s\n", dst, dst);
+            buf_appendf(text, "  clz %s, %s\n", dst, dst);
+        }
+        return;
+    }
+    if (op_is(op, "popcnt") && argc == 1) {
+        /* The population count lives on the vector side: move across, count
+           bits per byte, sum the bytes, move back. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        buf_appendf(text, "  fmov d0, %s\n", dst);
+        buf_append(text, "  cnt v0.8b, v0.8b\n");
+        buf_append(text, "  addv b0, v0.8b\n");
+        buf_appendf(text, "  fmov %s, s0\n", a64_reg_w(dst));
+        return;
+    }
+    if ((op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
+        /* AArch64 only rotates right, so a left rotation is a right rotation
+           by the complement of the distance. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        int bits = 64;
+        if (is_int(args[1])) {
+            long long amount = strtoll(args[1], NULL, 0) & (bits - 1);
+            if (op_is(op, "rol")) amount = (bits - amount) & (bits - 1);
+            buf_appendf(text, "  ror %s, %s, #%lld\n", dst, dst, amount);
+        } else {
+            const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+            if (op_is(op, "rol")) {
+                buf_appendf(text, "  neg %s, %s\n", A64_SCRATCH, src);
+                src = A64_SCRATCH;
+            }
+            buf_appendf(text, "  ror %s, %s, %s\n", dst, dst, src);
+        }
+        return;
+    }
     if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
         const char *native = op_is(op, "shl") ? "lsl" : op_is(op, "shr") ? "lsr" : "asr";
@@ -2473,8 +2700,8 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
     }
     if (op_is(op, "cmp") && argc == 2) {
         const char *lhs = a64_reg(args[0], line_no, op);
-        long imm;
-        if (a64_fits_add_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%ld\n", lhs, imm);
+        long long imm;
+        if (a64_fits_add_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%lld\n", lhs, imm);
         else buf_appendf(text, "  cmp %s, %s\n", lhs, a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op));
         return;
     }
@@ -2608,7 +2835,10 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         buf_append(text, "  mov rsp, rbp\n  pop rbp\n"); return;
     }
     if (op_is(op, "mov") && argc == 2) {
-        if (x86_needs_scratch(args[0], args[1])) {
+        /* mov is the one instruction that can carry a full 64-bit immediate,
+           but only into a register: a memory destination still takes imm32. */
+        if (x86_needs_scratch(args[0], args[1]) ||
+            (x86_reg_is_spilled(args[0]) && x86_imm_too_wide(args[1]))) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
             buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
         } else if (x86_reg_is_spilled(args[0])) {
@@ -2658,7 +2888,32 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+    if ((op_is(op, "popcnt") || op_is(op, "clz") || op_is(op, "ctz")) && argc == 1) {
+        /* lzcnt and tzcnt need LZCNT/BMI1, and popcnt needs POPCNT;
+           --target-info reports that so the requirement is not hidden. All
+           three write a register, so a spilled destination round-trips. */
+        const char *mnemonic = op_is(op, "popcnt") ? "popcnt" : op_is(op, "clz") ? "lzcnt" : "tzcnt";
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  %s %s, qword %s\n", mnemonic, X86_SCRATCH, x86_reg(args[0], line_no, op));
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  %s %s, %s\n", mnemonic, x86_reg(args[0], line_no, op), x86_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if (op_is(op, "bswap") && argc == 1) {
+        /* bswap takes a register only. */
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+            buf_appendf(text, "  bswap %s\n", X86_SCRATCH);
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  bswap %s\n", x86_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar") ||
+         op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
         bool dst_mem = x86_reg_is_spilled(args[0]);
         if (virtual_reg_index(args[1]) < 0) {
             if (dst_mem) buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
@@ -2685,9 +2940,10 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
     }
     if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
          op_is(op, "or") || op_is(op, "xor") || op_is(op, "cmp")) && argc == 2) {
-        if (x86_needs_scratch(args[0], args[1])) {
+        if (x86_needs_scratch(args[0], args[1]) || x86_imm_too_wide(args[1])) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
-            buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), X86_SCRATCH);
+            buf_appendf(text, "  %s %s%s, %s\n", op, x86_reg_is_spilled(args[0]) ? "qword " : "",
+                        x86_reg(args[0], line_no, op), X86_SCRATCH);
         } else if (x86_reg_is_spilled(args[0])) {
             buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
         } else {
@@ -2700,7 +2956,18 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         return;
     }
     if (op_is(op, "mul") && argc == 2) {
-        /* imul cannot write to memory. */
+        /* imul cannot write to memory, and takes no 64-bit immediate. */
+        if (x86_imm_too_wide(args[1])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_operand(args[1], line_no, op));
+            if (x86_reg_is_spilled(args[0])) {
+                buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+                buf_appendf(text, "  imul %s, %s\n", X86_SCRATCH, X86_ADDR_SCRATCH);
+                buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+            } else {
+                buf_appendf(text, "  imul %s, %s\n", x86_reg(args[0], line_no, op), X86_ADDR_SCRATCH);
+            }
+            return;
+        }
         if (x86_reg_is_spilled(args[0])) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
             buf_appendf(text, "  imul %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
@@ -2727,6 +2994,12 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         return;
     }
     if (op_is(op, "push") && argc == 1) {
+        /* push takes imm32 at most. */
+        if (x86_imm_too_wide(args[0])) {
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[0], line_no, op));
+            buf_appendf(text, "  push %s\n", X86_SCRATCH);
+            return;
+        }
         buf_appendf(text, "  push %s%s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_operand(args[0], line_no, op));
         return;
     }
@@ -2764,16 +3037,16 @@ static char rv_cmp_lhs[64];
 static char rv_cmp_rhs[64];
 static bool rv_cmp_rhs_is_reg = false;
 
-static bool rv_parse_long(const char *text, long *value) {
+static bool rv_parse_long(const char *text, long long *value) {
     char *end = NULL;
     errno = 0;
-    *value = strtol(text, &end, 0);
+    *value = strtoll(text, &end, 0);
     return errno == 0 && end && *end == '\0' && end != text;
 }
 
 /* addi and friends take a signed 12-bit immediate; wider values must be
    materialised into a register first. */
-static bool rv_fits_imm12(long value) {
+static bool rv_fits_imm12(long long value) {
     return value >= -2048 && value <= 2047;
 }
 
@@ -2861,14 +3134,14 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
-        long frame;
+        long long frame;
         buf_append(text, "  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
         if (strcmp(args[0], "0") == 0) {
             return;
         }
         /* A frame wider than a 12-bit immediate cannot ride along in addi. */
-        if (rv_parse_long(args[0], &frame) && frame != LONG_MIN && rv_fits_imm12(-frame)) {
-            buf_appendf(text, "  addi sp, sp, %ld\n", -frame);
+        if (rv_parse_long(args[0], &frame) && frame != LLONG_MIN && rv_fits_imm12(-frame)) {
+            buf_appendf(text, "  addi sp, sp, %lld\n", -frame);
         } else {
             buf_appendf(text, "  li %s, %s\n", RV_SCRATCH, args[0]);
             buf_appendf(text, "  sub sp, sp, %s\n", RV_SCRATCH);
@@ -2886,12 +3159,12 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     }
     if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "  la %s, %s\n", rv_reg(args[0], line_no, op), args[1]); return; }
     if ((op_is(op, "load") || op_is(op, "store")) && argc == 2) {
-        long off = 0;
+        long long off = 0;
         const char *base;
         if (op_is(op, "load")) {
             rv_emit_address_setup(text, args[1], "a6", line_no, op);
             base = rv_address_base(args[1], "a6", line_no, op, &off);
-            char offstr[32]; snprintf(offstr, sizeof(offstr), "%ld", off);
+            char offstr[32]; snprintf(offstr, sizeof(offstr), "%lld", off);
             buf_appendf(text, "  %s %s, ", rv_load_op(size), rv_reg(args[0], line_no, op));
             buf_append(text, offstr); buf_appendf(text, "(%s)\n", base);
         } else {
@@ -2899,7 +3172,7 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
             if (src < 0) buf_appendf(text, "  li a7, %s\n", args[1]);
             rv_emit_address_setup(text, args[0], "a6", line_no, op);
             base = rv_address_base(args[0], "a6", line_no, op, &off);
-            char offstr[32]; snprintf(offstr, sizeof(offstr), "%ld", off);
+            char offstr[32]; snprintf(offstr, sizeof(offstr), "%lld", off);
             buf_appendf(text, "  %s %s, ", rv_store_op(size), src >= 0 ? rv_regs[src] : "a7");
             buf_append(text, offstr); buf_appendf(text, "(%s)\n", base);
         }
@@ -2909,7 +3182,7 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
          op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
         int src = virtual_reg_index(args[1]);
         const char *dst = rv_reg(args[0], line_no, op);
-        long value;
+        long long value;
         if (src >= 0) {
             buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, rv_regs[src]);
             return;
@@ -2918,13 +3191,13 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
            lowering spelled that by writing a minus in front of the operand
            text, which turned "sub r0, -5" into "addi t0, t0, --5"; negating
            the parsed value instead keeps both signs working. */
-        if (rv_parse_long(args[1], &value) && !(op_is(op, "sub") && value == LONG_MIN)) {
-            long applied = op_is(op, "sub") ? -value : value;
+        if (rv_parse_long(args[1], &value) && !(op_is(op, "sub") && value == LLONG_MIN)) {
+            long long applied = op_is(op, "sub") ? -value : value;
             if (rv_fits_imm12(applied)) {
                 const char *immop = op_is(op, "and") ? "andi" :
                                     op_is(op, "or") ? "ori" :
                                     op_is(op, "xor") ? "xori" : "addi";
-                buf_appendf(text, "  %s %s, %s, %ld\n", immop, dst, dst, applied);
+                buf_appendf(text, "  %s %s, %s, %lld\n", immop, dst, dst, applied);
                 return;
             }
         }
@@ -2932,6 +3205,29 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
            be materialised into a register first. */
         buf_appendf(text, "  li %s, %s\n", RV_SCRATCH, args[1]);
         buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, RV_SCRATCH);
+        return;
+    }
+    if ((op_is(op, "popcnt") || op_is(op, "clz") || op_is(op, "ctz") || op_is(op, "bswap")) && argc == 1) {
+        /* Only reached on a target whose capabilities include these, which
+           today means the bit-manipulation extension. */
+        const char *dst = rv_reg(args[0], line_no, op);
+        const char *native = op_is(op, "popcnt") ? "cpop" : op_is(op, "clz") ? "clz" :
+                             op_is(op, "ctz") ? "ctz" : "rev8";
+        buf_appendf(text, "  %s %s, %s\n", native, dst, dst);
+        return;
+    }
+    if ((op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
+        const char *dst = rv_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) {
+            buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, rv_regs[src]);
+        } else {
+            /* There is only a rotate-right immediate, so a left rotation uses
+               the complement of the distance. */
+            long long amount = strtoll(args[1], NULL, 0) & 63;
+            if (op_is(op, "rol")) amount = (64 - amount) & 63;
+            buf_appendf(text, "  rori %s, %s, %lld\n", dst, dst, amount);
+        }
         return;
     }
     if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
@@ -2987,6 +3283,194 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
 
+/* --------------------------------------------- extended operation fallback */
+
+static void emit_text_line(Buffer *text, char *line, int line_no, const char *target);
+
+/* Emits one line of CommonASM through the normal path. The expansions below
+   are written in the language itself, so a target without the instruction
+   gets a working version of it without a hand-written sequence per backend. */
+static void emit_cas(Buffer *text, const char *target, int line_no, const char *fmt, ...) CAS_PRINTF(4, 5);
+
+static void emit_cas(Buffer *text, const char *target, int line_no, const char *fmt, ...) {
+    char line[256];
+    va_list args;
+    int written;
+    va_start(args, fmt);
+    written = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        die("could not expand an extended instruction");
+    }
+    emit_text_line(text, line, line_no, target);
+}
+
+/* Picks two virtual registers the expansion can borrow. They are saved and
+   restored around it, so an expansion leaves nothing behind but its result. */
+static void ext_pick_scratch(const char *target, const char *dst, const char *other, int *s1, int *s2) {
+    int avoid_a = virtual_reg_index(dst);
+    int avoid_b = other ? virtual_reg_index(other) : -1;
+    int picked = 0;
+    *s1 = *s2 = -1;
+    /* Counting down from the highest register the target can name, so the
+       borrowed ones are the least likely to be in use. */
+    for (int i = target_max_vreg(target); i >= 0 && picked < 2; i--) {
+        if (i == avoid_a || i == avoid_b) continue;
+        if (picked == 0) *s1 = i; else *s2 = i;
+        picked++;
+    }
+}
+
+/* The masks the population count folds with, cut down to the target word. */
+static void ext_popcount_masks(int bits, char *m1, char *m2, char *m4, char *h01, size_t size) {
+    unsigned long long width = bits >= 64 ? ~0ull : ((1ull << bits) - 1u);
+    snprintf(m1, size, "0x%llx", 0x5555555555555555ull & width);
+    snprintf(m2, size, "0x%llx", 0x3333333333333333ull & width);
+    snprintf(m4, size, "0x%llx", 0x0f0f0f0f0f0f0f0full & width);
+    snprintf(h01, size, "0x%llx", 0x0101010101010101ull & width);
+}
+
+static void ext_expand_popcnt(Buffer *text, const char *target, int line_no, const char *dst) {
+    char m1[24], m2[24], m4[24], h01[24];
+    int bits = target_word_bits(target);
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    ext_popcount_masks(bits, m1, m2, m4, h01, sizeof(m1));
+    /* The usual SWAR fold: pair counts, then nibble counts, then a multiply
+       that sums every byte into the top one. */
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "shr r%d, 1", s1);
+    emit_cas(text, target, line_no, "and r%d, %s", s1, m1);
+    emit_cas(text, target, line_no, "sub %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "shr r%d, 2", s1);
+    emit_cas(text, target, line_no, "and r%d, %s", s1, m2);
+    emit_cas(text, target, line_no, "and %s, %s", dst, m2);
+    emit_cas(text, target, line_no, "add %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "shr r%d, 4", s1);
+    emit_cas(text, target, line_no, "add %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "and %s, %s", dst, m4);
+    emit_cas(text, target, line_no, "mul %s, %s", dst, h01);
+    emit_cas(text, target, line_no, "shr %s, %d", dst, bits - 8);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_clz(Buffer *text, const char *target, int line_no, const char *dst) {
+    int bits = target_word_bits(target);
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    /* Smear the highest set bit down, then count the zeros that survived.
+       An all-zero input smears to zero and correctly reports the full width. */
+    emit_cas(text, target, line_no, "push r%d", s1);
+    for (int shift = 1; shift < bits; shift *= 2) {
+        emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+        emit_cas(text, target, line_no, "shr r%d, %d", s1, shift);
+        emit_cas(text, target, line_no, "or %s, r%d", dst, s1);
+    }
+    emit_cas(text, target, line_no, "not %s", dst);
+    emit_cas(text, target, line_no, "popcnt %s", dst);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_ctz(Buffer *text, const char *target, int line_no, const char *dst) {
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    /* Isolate the lowest set bit, then count the bits below it. Zero isolates
+       to zero, and zero minus one is all ones, which reports the full width. */
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "neg r%d", s1);
+    emit_cas(text, target, line_no, "and %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "sub %s, 1", dst);
+    emit_cas(text, target, line_no, "popcnt %s", dst);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_bswap(Buffer *text, const char *target, int line_no, const char *dst) {
+    int bits = target_word_bits(target);
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    emit_cas(text, target, line_no, "push r%d", s1);
+    /* Swap neighbouring bytes, then neighbouring pairs, and so on up to the
+       two halves of the word. */
+    for (int width = 8; width < bits; width *= 2) {
+        char mask[24];
+        unsigned long long pattern = 0;
+        unsigned long long field = width == 8 ? 0xffull : (width == 16 ? 0xffffull : 0xffffffffull);
+        if (width * 2 < bits) {
+            for (int shift = 0; shift < bits; shift += width * 2) {
+                pattern |= field << shift;
+            }
+            snprintf(mask, sizeof(mask), "0x%llx", pattern);
+            emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+            emit_cas(text, target, line_no, "shr r%d, %d", s1, width);
+            emit_cas(text, target, line_no, "and r%d, %s", s1, mask);
+            emit_cas(text, target, line_no, "and %s, %s", dst, mask);
+            emit_cas(text, target, line_no, "shl %s, %d", dst, width);
+            emit_cas(text, target, line_no, "or %s, r%d", dst, s1);
+        } else {
+            /* The final step swaps the two halves, where no mask is needed
+               because the bits that would be masked shift out anyway. */
+            emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+            emit_cas(text, target, line_no, "shr r%d, %d", s1, width);
+            emit_cas(text, target, line_no, "shl %s, %d", dst, width);
+            emit_cas(text, target, line_no, "or %s, r%d", dst, s1);
+        }
+    }
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_rotate(Buffer *text, const char *target, int line_no,
+                              const char *dst, const char *amount, bool left) {
+    int bits = target_word_bits(target);
+    int s1, s2;
+    ext_pick_scratch(target, dst, amount, &s1, &s2);
+    /* One shift each way, with the distances reduced modulo the word size so
+       that a rotation of zero leaves the value alone instead of shifting by a
+       full word, which is undefined. */
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "push r%d", s2);
+    emit_cas(text, target, line_no, "mov r%d, %s", s2, amount);
+    emit_cas(text, target, line_no, "and r%d, %d", s2, bits - 1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "%s %s, r%d", left ? "shl" : "shr", dst, s2);
+    emit_cas(text, target, line_no, "neg r%d", s2);
+    emit_cas(text, target, line_no, "and r%d, %d", s2, bits - 1);
+    emit_cas(text, target, line_no, "%s r%d, r%d", left ? "shr" : "shl", s1, s2);
+    emit_cas(text, target, line_no, "or %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "pop r%d", s2);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+}
+
+/* True when the operation was handled here, either because the target has no
+   instruction for it or because it is not an extended operation at all. */
+static bool emit_extended_fallback(Buffer *text, const char *target, const char *op,
+                                   char **args, int argc, int line_no) {
+    const ExtendedOp *ext = extended_op_lookup(op);
+    if (!ext) return false;
+    if (argc != ext->argc) {
+        line_error(line_no, op, "wrong argument count for extended operation");
+    }
+    if (virtual_reg_index(args[0]) < 0) {
+        line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
+    }
+    if ((target_caps(target) & ext->cap) != 0) {
+        return false; /* the backend has an instruction for it */
+    }
+    if (strcmp(op, "popcnt") == 0) ext_expand_popcnt(text, target, line_no, args[0]);
+    else if (strcmp(op, "clz") == 0) ext_expand_clz(text, target, line_no, args[0]);
+    else if (strcmp(op, "ctz") == 0) ext_expand_ctz(text, target, line_no, args[0]);
+    else if (strcmp(op, "bswap") == 0) ext_expand_bswap(text, target, line_no, args[0]);
+    else ext_expand_rotate(text, target, line_no, args[0], args[1], strcmp(op, "rol") == 0);
+    return true;
+}
+
 static void emit_text_line(Buffer *text, char *line, int line_no, const char *target) {
     char *space;
     char *args[16];
@@ -3038,6 +3522,25 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (!size) {
         line_error(line_no, line, "unknown size suffix");
     }
+    /* A 32-bit machine cannot hold a wider immediate. Catching it here gives
+       a diagnostic pointing at the source line instead of an assembler error
+       about a file the user did not write. */
+    if (target_word_bits(target) < 64) {
+        for (int i = 0; i < argc; i++) {
+            char *end = NULL;
+            long long parsed;
+            if (!is_int(args[i])) continue;
+            errno = 0;
+            parsed = strtoll(args[i], &end, 0);
+            if (errno != 0 || parsed > 4294967295LL || parsed < -2147483647LL - 1) {
+                line_error_token(line_no, args[i], base_op,
+                                 "immediate does not fit this target's 32-bit word");
+            }
+        }
+    }
+    /* An extended operation the target has no instruction for is expanded
+       into ordinary CommonASM here, before any backend sees it. */
+    if (emit_extended_fallback(text, target, base_op, args, argc, line_no)) return;
     if (strcmp(target, "x86_64-nasm") == 0) emit_x86_instruction(text, base_op, size, args, argc, line_no);
     else if (is_rv64_target(target)) emit_rv_instruction(text, base_op, size, args, argc, line_no);
     else if (strcmp(target, "mmixal") == 0) emit_mmix_instruction(text, base_op, size, args, argc, line_no);
@@ -3069,7 +3572,7 @@ typedef struct {
        travels with the text. Recovering it by re-parsing on every following
        instruction was the single largest cost of -O1. */
     char pending_reg[128];
-    long pending_value;
+    long long pending_value;
 } Optimizer;
 
 /* emit_text_line() rewrites the line it is given in place, so it needs a
@@ -3091,10 +3594,10 @@ static void emit_text_line_copy(Buffer *text, const char *line, int line_no, con
     emit_text_line(text, line_scratch, line_no, target);
 }
 
-static bool opt_parse_long(const char *text, long *value) {
+static bool opt_parse_long(const char *text, long long *value) {
     char *end = NULL;
     errno = 0;
-    *value = strtol(text, &end, 0);
+    *value = strtoll(text, &end, 0);
     return errno == 0 && end && *end == '\0' && end != text;
 }
 
@@ -3136,8 +3639,8 @@ static bool opt_parse_instruction(const char *line, OptInstruction *out) {
     return true;
 }
 
-static bool opt_is_mov_imm(const OptInstruction *ins, char *reg, long *value) {
-    long parsed;
+static bool opt_is_mov_imm(const OptInstruction *ins, char *reg, long long *value) {
+    long long parsed;
     if (ins->label || ins->directive || strcmp(ins->base_op, "mov") != 0 || ins->argc != 2) return false;
     if (virtual_reg_index(ins->args[0]) < 0 || !opt_parse_long(ins->args[1], &parsed)) return false;
     if (reg) memcpy(reg, ins->args[0], strlen(ins->args[0]) + 1);
@@ -3145,7 +3648,7 @@ static bool opt_is_mov_imm(const OptInstruction *ins, char *reg, long *value) {
     return true;
 }
 
-static bool opt_set_pending(Optimizer *opt, const char *line, int line_no, const char *reg, long value) {
+static bool opt_set_pending(Optimizer *opt, const char *line, int line_no, const char *reg, long long value) {
     if (strlen(line) >= sizeof(opt->pending)) return false;
     snprintf(opt->pending, sizeof(opt->pending), "%s", line);
     snprintf(opt->pending_reg, sizeof(opt->pending_reg), "%s", reg);
@@ -3161,48 +3664,48 @@ static void opt_flush(Buffer *text, const char *target, Optimizer *opt) {
     opt->has_pending = false;
 }
 
-static bool opt_safe_add(long a, long b, long *out) {
-    if ((b > 0 && a > LONG_MAX - b) || (b < 0 && a < LONG_MIN - b)) return false;
+static bool opt_safe_add(long long a, long long b, long long *out) {
+    if ((b > 0 && a > LLONG_MAX - b) || (b < 0 && a < LLONG_MIN - b)) return false;
     *out = a + b;
     return true;
 }
 
-static bool opt_safe_sub(long a, long b, long *out) {
-    if ((b < 0 && a > LONG_MAX + b) || (b > 0 && a < LONG_MIN + b)) return false;
+static bool opt_safe_sub(long long a, long long b, long long *out) {
+    if ((b < 0 && a > LLONG_MAX + b) || (b > 0 && a < LLONG_MIN + b)) return false;
     *out = a - b;
     return true;
 }
 
-static bool opt_safe_mul(long a, long b, long *out) {
+static bool opt_safe_mul(long long a, long long b, long long *out) {
     if (a == 0 || b == 0) {
         *out = 0;
         return true;
     }
-    if (a == -1 && b == LONG_MIN) return false;
-    if (b == -1 && a == LONG_MIN) return false;
+    if (a == -1 && b == LLONG_MIN) return false;
+    if (b == -1 && a == LLONG_MIN) return false;
     if (a > 0) {
-        if (b > 0 && a > LONG_MAX / b) return false;
-        if (b < 0 && b < LONG_MIN / a) return false;
+        if (b > 0 && a > LLONG_MAX / b) return false;
+        if (b < 0 && b < LLONG_MIN / a) return false;
     } else {
-        if (b > 0 && a < LONG_MIN / b) return false;
-        if (b < 0 && a < LONG_MAX / b) return false;
+        if (b > 0 && a < LLONG_MIN / b) return false;
+        if (b < 0 && a < LLONG_MAX / b) return false;
     }
     *out = a * b;
     return true;
 }
 
-static bool opt_compute_binary(const char *op, long lhs, long rhs, long *result) {
-    const long bits = (long)(sizeof(long) * CHAR_BIT);
+static bool opt_compute_binary(const char *op, long long lhs, long long rhs, long long *result) {
+    const long long bits = (long long)(sizeof(long long) * CHAR_BIT);
     if (op_is(op, "add")) return opt_safe_add(lhs, rhs, result);
     if (op_is(op, "sub")) return opt_safe_sub(lhs, rhs, result);
     if (op_is(op, "mul")) return opt_safe_mul(lhs, rhs, result);
     if (op_is(op, "div")) {
-        if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
+        if (rhs == 0 || (lhs == LLONG_MIN && rhs == -1)) return false;
         *result = lhs / rhs;
         return true;
     }
     if (op_is(op, "mod")) {
-        if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
+        if (rhs == 0 || (lhs == LLONG_MIN && rhs == -1)) return false;
         *result = lhs % rhs;
         return true;
     }
@@ -3216,7 +3719,7 @@ static bool opt_compute_binary(const char *op, long lhs, long rhs, long *result)
     if (op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) {
         if (lhs < 0 || rhs < 0 || rhs >= bits - 1) return false;
         if (op_is(op, "shl")) {
-            if (lhs > (LONG_MAX >> rhs)) return false;
+            if (lhs > (LLONG_MAX >> rhs)) return false;
             *result = lhs << rhs;
         } else {
             *result = lhs >> rhs;
@@ -3227,7 +3730,7 @@ static bool opt_compute_binary(const char *op, long lhs, long rhs, long *result)
 }
 
 static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_t line_out_size, bool *skip) {
-    long value;
+    long long value;
     int dst;
     int src;
     *skip = false;
@@ -3283,9 +3786,9 @@ static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_
 
 static bool opt_try_absorb_pending(Optimizer *opt, const OptInstruction *current, const char *current_line, int line_no) {
     char current_reg[128];
-    long current_value;
-    long rhs;
-    long result;
+    long long current_value;
+    long long rhs;
+    long long result;
     if (!opt->has_pending) return false;
     if (opt_is_mov_imm(current, current_reg, &current_value) && strcmp(opt->pending_reg, current_reg) == 0) {
         return opt_set_pending(opt, current_line, line_no, current_reg, current_value);
@@ -3293,7 +3796,7 @@ static bool opt_try_absorb_pending(Optimizer *opt, const OptInstruction *current
     if (current->label || current->directive || current->argc != 2) return false;
     if (strcmp(current->args[0], opt->pending_reg) != 0 || !opt_parse_long(current->args[1], &rhs)) return false;
     if (!opt_compute_binary(current->base_op, opt->pending_value, rhs, &result)) return false;
-    snprintf(opt->pending, sizeof(opt->pending), "mov %s, %ld", opt->pending_reg, result);
+    snprintf(opt->pending, sizeof(opt->pending), "mov %s, %lld", opt->pending_reg, result);
     opt->pending_value = result;
     opt->pending_line_no = line_no;
     return true;
@@ -3304,7 +3807,7 @@ static void emit_text_line_optimized(Buffer *text, const char *line, int line_no
     OptInstruction current;
     char rewritten[512];
     char current_reg[128];
-    long current_value;
+    long long current_value;
     const char *candidate = line;
     bool skip = false;
     if (!opt->enabled) {
@@ -3474,6 +3977,9 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         if (bss.len) { buf_append(&out, "\nsection .bss\n"); buf_append(&out, bss.data); }
         buf_append(&out, "\nsection .text\n");
     } else if (rv) {
+        /* A target that advertises the bit-manipulation instructions has to
+           tell the assembler it may use them. */
+        if (target_has_flag(target, TF_RV_ZBB)) buf_append(&out, ".option arch, +zbb\n");
         buf_append(&out, constants.data);
         if (rodata.len) { buf_append(&out, ".section .rodata\n"); buf_append(&out, rodata.data); }
         if (data.len) { buf_append(&out, ".section .data\n"); buf_append(&out, data.data); }
@@ -3534,6 +4040,8 @@ int main(int argc, char **argv) {
         puts("Use --target-info TARGET to inspect one target.");
         puts("Use --version to print the compiler version.");
         puts("Use -O1, -O, or --optimize to enable peephole code optimization.");
+        puts("Use --emulate-extended to expand popcnt, clz, ctz, bswap, rol and ror");
+        puts("instead of using the target's instructions for them.");
         return 0;
     }
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -3553,6 +4061,7 @@ int main(int argc, char **argv) {
         else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) output = argv[++i];
         else if (strcmp(argv[i], "-O0") == 0 || strcmp(argv[i], "--no-optimize") == 0) opt_level = 0;
         else if (strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "--optimize") == 0 || strcmp(argv[i], "--optimize=1") == 0) opt_level = 1;
+        else if (strcmp(argv[i], "--emulate-extended") == 0) force_extended_fallback = true;
         else if (strcmp(argv[i], "--optimize=0") == 0) opt_level = 0;
         else if (strncmp(argv[i], "-O", 2) == 0 || strncmp(argv[i], "--optimize=", 11) == 0) die("unsupported optimization level; use -O0 or -O1");
         else if (!input) input = argv[i];
@@ -3569,4 +4078,6 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
 

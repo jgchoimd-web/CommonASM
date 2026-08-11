@@ -236,6 +236,38 @@ Virtual registers keep their values across everything the compiler emits,
 including `syscall`, which saves and restores whatever the call would
 otherwise overwrite.
 
+## Extended operations
+
+A portable assembly that can only reach the instructions every machine shares
+is just a slow mid-level language. These operations exist so that a program
+can use what a machine actually has: each one becomes the target's own
+instruction where there is one, and expands into ordinary CommonASM where
+there is not. Nothing has to use them, and using them never costs portability.
+
+- `popcnt rD`: number of set bits
+- `clz rD`: leading zeros, the word width for zero
+- `ctz rD`: trailing zeros, the word width for zero
+- `bswap rD`: reverse byte order
+- `rol rD, n` / `ror rD, n`: rotate, by a constant or a register
+
+What that means in practice, for `popcnt`:
+
+| target | emitted |
+| --- | --- |
+| `riscv64-zbb` | `cpop t0, t0` |
+| `aarch64-gnu` | `fmov`, `cnt`, `addv`, `fmov` |
+| `x86_64-nasm` | `popcnt rbx, rbx` |
+| `riscv64-gnu` | 22 instructions, no bit-manipulation extension needed |
+
+`commonasmc --target-info TARGET` reports which are native there and which
+expand. `--emulate-extended` forces the expansion everywhere, which is what to
+use for a CPU that lacks the optional instruction its architecture defines --
+an x86-64 without POPCNT, say.
+
+Both paths are checked by running them: `tests/extended-kernel.cas` is built
+twice, once each way, linked against `tests/extended-driver.c` and required to
+agree with a reference implementation on every input.
+
 `cmp a, b` records the relation between `a` and `b` for the following
 conditional jump. Signed jumps use `jg`/`jl`/`jge`/`jle`; unsigned jumps use
 `ja`/`jb`/`jae`/`jbe`.

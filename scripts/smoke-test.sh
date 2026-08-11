@@ -129,19 +129,63 @@ fi
 
 # Whether the output assembles is checked directly, not just grepped for, on
 # every backend an assembler is available for.
+# Truncation is promoted to an error: an immediate too wide for the encoding
+# assembles with only a warning otherwise, and silently loses its top bits.
+NASM_STRICT="-w+error=number-overflow"
+
 if command -v nasm > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
     for level in -O0 -O1; do
-      "$BUILD_DIR/commonasmc" "$example" --target x86_64-nasm "$level" -o "$BUILD_DIR/asm-${name}${level}.asm"
-      nasm -f elf64 "$BUILD_DIR/asm-${name}${level}.asm" -o "$BUILD_DIR/asm-${name}${level}.o"
-      "$BUILD_DIR/commonasmc" "$example" --target i386-nasm "$level" -o "$BUILD_DIR/asm32-${name}${level}.asm"
-      nasm -f elf32 "$BUILD_DIR/asm32-${name}${level}.asm" -o "$BUILD_DIR/asm32-${name}${level}.o"
+      # Compiled twice: once letting the target use its own instructions for
+      # the extended operations, once with them all expanded.
+      for mode in native emulated; do
+        if [ "$mode" = emulated ]; then ext=--emulate-extended; else ext=; fi
+        "$BUILD_DIR/commonasmc" "$example" --target x86_64-nasm "$level" $ext \
+          -o "$BUILD_DIR/asm-${mode}-${name}${level}.asm"
+        nasm -f elf64 $NASM_STRICT "$BUILD_DIR/asm-${mode}-${name}${level}.asm" \
+          -o "$BUILD_DIR/asm-${mode}-${name}${level}.o"
+        "$BUILD_DIR/commonasmc" "$example" --target i386-nasm "$level" $ext \
+          -o "$BUILD_DIR/asm32-${mode}-${name}${level}.asm"
+        nasm -f elf32 $NASM_STRICT "$BUILD_DIR/asm32-${mode}-${name}${level}.asm" \
+          -o "$BUILD_DIR/asm32-${mode}-${name}${level}.o"
+      done
     done
   done
-  echo "nasm accepted every x86_64 and i386 output."
+  echo "nasm accepted every x86_64 and i386 output, native and expanded."
 else
   echo "nasm not found; skipped assembling the x86_64 and i386 output."
+fi
+
+# The strongest check available: build the extended operations both ways and
+# run them against a reference implementation.
+if command -v nasm > /dev/null 2>&1 && [ "$(uname -m)" = "x86_64" ]; then
+  for mode in native emulated; do
+    if [ "$mode" = emulated ]; then ext=--emulate-extended; else ext=; fi
+    "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/extended-kernel.cas" --target x86_64-nasm $ext \
+      -o "$BUILD_DIR/extkernel-$mode.asm"
+    nasm -f elf64 $NASM_STRICT "$BUILD_DIR/extkernel-$mode.asm" -o "$BUILD_DIR/extkernel-$mode.o"
+    "$CC" "$ROOT_DIR/tests/extended-driver.c" "$BUILD_DIR/extkernel-$mode.o" \
+      -o "$BUILD_DIR/extrun-$mode"
+    echo "  extended operations, $mode:"
+    "$BUILD_DIR/extrun-$mode"
+  done
+  echo "extended operations agree with the reference, native and expanded."
+else
+  echo "skipped running the extended operation checks."
+fi
+
+if command -v riscv64-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for target in riscv64-gnu riscv64-zbb; do
+      "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/rv-${target}-${name}.s"
+      riscv64-linux-gnu-as -o "$BUILD_DIR/rv-${target}-${name}.o" "$BUILD_DIR/rv-${target}-${name}.s"
+    done
+  done
+  echo "the RISC-V assembler accepted every riscv64-gnu and riscv64-zbb output."
+else
+  echo "no RISC-V assembler found; skipped assembling the RISC-V output."
 fi
 
 if command -v clang > /dev/null 2>&1; then

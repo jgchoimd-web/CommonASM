@@ -1,0 +1,69 @@
+; Compiled and linked against tests/extended-driver.c, which feeds inputs in
+; and checks the results against its own implementations. This is how the
+; extended operations are checked by running them rather than by reading them:
+; the same source is built twice, once letting the target use its instructions
+; and once with --emulate-extended forcing the expansions, and both have to
+; agree with the reference.
+
+.data
+cas_in: qword 0
+cas_popcnt: qword 0
+cas_clz: qword 0
+cas_ctz: qword 0
+cas_bswap: qword 0
+cas_rol: qword 0
+cas_ror: qword 0
+cas_rol_reg: qword 0
+cas_ror_reg: qword 0
+
+.text
+global cas_run
+global cas_in
+global cas_popcnt
+global cas_clz
+global cas_ctz
+global cas_bswap
+global cas_rol
+global cas_ror
+global cas_rol_reg
+global cas_ror_reg
+
+func cas_run
+  load.q r0, [cas_in]
+  popcnt r0
+  store.q [cas_popcnt], r0
+
+  load.q r0, [cas_in]
+  clz r0
+  store.q [cas_clz], r0
+
+  load.q r0, [cas_in]
+  ctz r0
+  store.q [cas_ctz], r0
+
+  load.q r0, [cas_in]
+  bswap r0
+  store.q [cas_bswap], r0
+
+  load.q r0, [cas_in]
+  rol r0, 13
+  store.q [cas_rol], r0
+
+  load.q r0, [cas_in]
+  ror r0, 13
+  store.q [cas_ror], r0
+
+  ; the same rotations with the distance in a register, which takes a
+  ; different path in every backend
+  load.q r0, [cas_in]
+  mov r1, 13
+  rol r0, r1
+  store.q [cas_rol_reg], r0
+
+  load.q r0, [cas_in]
+  mov r1, 13
+  ror r0, r1
+  store.q [cas_ror_reg], r0
+
+  ret
+endfunc
