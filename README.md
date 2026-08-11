@@ -33,9 +33,16 @@ a claim:
   `thumb2-gnu` (clang)
 - `riscv64-gnu` / `rv64i-gnu`, `riscv64-zbb` (binutils)
 - `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu` (binutils)
+- `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`,
+  `power9-gnu`, `power10-gnu` (binutils)
 
-The rest of the target list is assembly-shaped text rather than assembly, and
-says so under `--target-info`.
+Every family in the list below that claims to emit assembly is in that set.
+The rest is assembly-shaped text rather than assembly, and says so under
+`--target-info`.
+
+`demos/` has two programs written in the language rather than about it: a
+freestanding multiboot kernel and a guessing game on raw syscalls. What
+writing them changed is recorded in `demos/README.md`.
 
 Primary:
 
@@ -223,6 +230,17 @@ Text:
 - `syscall open, path, flags, mode`
 - `syscall close, fd`
 - `syscall exit, code`
+- `syscall rD, read, fd, buffer, length`
+
+A syscall may name a register first, which receives its result — how many
+bytes a read delivered, the descriptor an open returned, or a negative errno.
+Without it there is no way to tell a short read from a full one:
+
+```asm
+  syscall r4, read, stdin, buf, 16
+  cmp r4, 0
+  jle end_of_input
+```
 
 Virtual registers are `r0` through `r15`. A backend never maps one onto a
 register it needs for itself: the stack and frame pointers, its scratch
