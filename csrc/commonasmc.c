@@ -599,9 +599,22 @@ static void strip_comment(char *line) {
 
 static bool is_int(const char *text) {
     char *end = NULL;
+    /* Called on every operand, most of which are not numbers at all. The
+       leading character rules those out without entering strtol; the set
+       accepted here is exactly the set strtol would start on. */
+    if (!isdigit((unsigned char)text[0]) && text[0] != '-' && text[0] != '+' &&
+        !isspace((unsigned char)text[0])) {
+        return false;
+    }
     errno = 0;
     strtol(text, &end, 0);
     return errno == 0 && end && *end == '\0' && end != text;
+}
+
+/* Opcode dispatch is a chain of these, so the first character is compared
+   inline and the call is only reached by a candidate that could still match. */
+static bool op_is(const char *op, const char *name) {
+    return op[0] == name[0] && strcmp(op + 1, name + 1) == 0;
 }
 
 static bool is_symbol_char(char ch) {
@@ -860,44 +873,48 @@ static bool is_known_constant(const char *name) {
     return symbol_set_contains(&known_constants, name);
 }
 
+/* Runs on every operand of every instruction, so it reads the digits directly
+   rather than going through strtol. */
 static int virtual_reg_index(const char *name) {
-    if (name[0] == 'r' && isdigit((unsigned char)name[1])) {
-        char *end = NULL;
-        long value = strtol(name + 1, &end, 10);
-        if (end && *end == '\0' && value >= 0 && value <= 15) {
-            return (int)value;
+    const char *p = name + 1;
+    int value = 0;
+    if (name[0] != 'r' || !isdigit((unsigned char)*p)) {
+        return -1;
+    }
+    while (*p == '0' && isdigit((unsigned char)p[1])) {
+        p++;
+    }
+    for (; isdigit((unsigned char)*p); p++) {
+        value = value * 10 + (*p - '0');
+        if (value > 15) {
+            return -1;
         }
     }
-    return -1;
+    return *p == '\0' ? value : -1;
 }
 
-/* Writes the operand naming virtual register idx at the given size, and
-   reports whether it came out as a memory reference. x86 allows at most one
-   memory operand per instruction, so callers that pair two operands must
+/* The operand naming virtual register idx at the given size. A mapped
+   register is a table entry and is returned as-is; only a spill slot has to
+   be formatted, and those come out of a small rotation because no emitted
+   instruction holds more than a handful of operands at once. x86 allows at
+   most one memory operand per instruction, so callers that pair two operands
    route one through X86_SCRATCH when both are spilled. */
-static bool x86_vreg_operand(int idx, const char *size, char *out, size_t out_size) {
-    if (idx < X86_MAPPED_COUNT) {
-        const char *const *table = x86_regs;
-        if (strcmp(size, "b") == 0) table = x86_regs_b;
-        else if (strcmp(size, "w") == 0) table = x86_regs_w;
-        else if (strcmp(size, "d") == 0) table = x86_regs_d;
-        snprintf(out, out_size, "%s", table[idx]);
-        return false;
-    }
-    x86_spill_used |= 1u << (idx - X86_MAPPED_COUNT);
-    snprintf(out, out_size, "[rel %s+%d]", X86_SPILL_SYMBOL, (idx - X86_MAPPED_COUNT) * 8);
-    return true;
-}
-
-/* Spilled registers need a formatted string rather than a pointer into a
-   static table, so operand text is handed out from a small rotation. No
-   emitted instruction holds more than a handful of operands at once. */
 static const char *x86_operand_text(int idx, const char *size) {
     static char pool[8][48];
     static unsigned next = 0;
-    char *slot = pool[next];
+    char *slot;
+    if (idx < X86_MAPPED_COUNT) {
+        switch (size[0]) {
+            case 'b': return x86_regs_b[idx];
+            case 'w': return x86_regs_w[idx];
+            case 'd': return x86_regs_d[idx];
+            default: return x86_regs[idx];
+        }
+    }
+    slot = pool[next];
     next = (next + 1) % 8;
-    x86_vreg_operand(idx, size, slot, sizeof(pool[0]));
+    x86_spill_used |= 1u << (idx - X86_MAPPED_COUNT);
+    snprintf(slot, sizeof(pool[0]), "[rel %s+%d]", X86_SPILL_SYMBOL, (idx - X86_MAPPED_COUNT) * 8);
     return slot;
 }
 
@@ -967,16 +984,24 @@ static const char *generic_reg_for_target(const char *value, const char *target,
     return rv_regs[reg];
 }
 
+/* Splits "load.q" into its opcode and size suffix. Runs once per line, so the
+   opcode is copied rather than formatted. */
 static const char *size_suffix_or_default(const char *op, char *base_op, size_t base_size) {
     const char *dot = strchr(op, '.');
+    size_t len = dot ? (size_t)(dot - op) : strlen(op);
+    if (len >= base_size) {
+        len = base_size - 1;
+    }
+    memcpy(base_op, op, len);
+    base_op[len] = '\0';
     if (!dot) {
-        snprintf(base_op, base_size, "%s", op);
         return "q";
     }
-    snprintf(base_op, base_size, "%.*s", (int)(dot - op), op);
-    if (strcmp(dot + 1, "b") == 0 || strcmp(dot + 1, "w") == 0 ||
-        strcmp(dot + 1, "d") == 0 || strcmp(dot + 1, "q") == 0) {
-        return dot + 1;
+    if (dot[1] != '\0' && dot[2] == '\0') {
+        switch (dot[1]) {
+            case 'b': case 'w': case 'd': case 'q': return dot + 1;
+            default: break;
+        }
     }
     return NULL;
 }
@@ -1468,90 +1493,90 @@ static void emit_dcpu_syscall(Buffer *text, char **args, int argc, int line_no) 
 
 static void emit_mmix_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
     (void)size;
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "        SUBU $254,$254,%s\n", args[0]); return; }
-    if (strcmp(op, "leave") == 0 && argc == 0) return;
-    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "        SET %s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op)); return; }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "        LDA %s,%s\n", mmix_reg(args[0], line_no, op), args[1]); return; }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) { buf_appendf(text, "        SUBU $254,$254,%s\n", args[0]); return; }
+    if (op_is(op, "leave") && argc == 0) return;
+    if (op_is(op, "mov") && argc == 2) { buf_appendf(text, "        SET %s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op)); return; }
+    if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "        LDA %s,%s\n", mmix_reg(args[0], line_no, op), args[1]); return; }
+    if (op_is(op, "load") && argc == 2) {
         char addr[256]; mmix_format_address(args[1], addr, sizeof(addr), line_no, op);
         buf_appendf(text, "        LDO %s,%s\n", mmix_reg(args[0], line_no, op), addr); return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256]; mmix_format_address(args[0], addr, sizeof(addr), line_no, op);
         buf_appendf(text, "        STO %s,%s\n", mmix_operand(args[1], line_no, op), addr); return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
-         strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) && argc == 2) {
-        const char *native = strcmp(op, "add") == 0 ? "ADD" : strcmp(op, "sub") == 0 ? "SUB" : strcmp(op, "mul") == 0 ? "MUL" : strcmp(op, "div") == 0 ? "DIV" : strcmp(op, "and") == 0 ? "AND" : strcmp(op, "or") == 0 ? "OR" : "XOR";
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "and") || op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
+        const char *native = op_is(op, "add") ? "ADD" : op_is(op, "sub") ? "SUB" : op_is(op, "mul") ? "MUL" : op_is(op, "div") ? "DIV" : op_is(op, "and") ? "AND" : op_is(op, "or") ? "OR" : "XOR";
         buf_appendf(text, "        %s %s,%s,", native, mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
         buf_append(text, mmix_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
     }
-    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
-        const char *native = strcmp(op, "shl") == 0 ? "SL" : "SR";
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *native = op_is(op, "shl") ? "SL" : "SR";
         buf_appendf(text, "        %s %s,%s,", native, mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
         buf_append(text, mmix_operand(args[1], line_no, op)); buf_append(text, "\n"); return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
-        if (strcmp(op, "neg") == 0) buf_appendf(text, "        NEG %s,0,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
-        else if (strcmp(op, "not") == 0) buf_appendf(text, "        NOR %s,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
-        else buf_appendf(text, strcmp(op, "inc") == 0 ? "        ADD %s,%s,1\n" : "        SUB %s,%s,1\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        if (op_is(op, "neg")) buf_appendf(text, "        NEG %s,0,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+        else if (op_is(op, "not")) buf_appendf(text, "        NOR %s,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
+        else buf_appendf(text, op_is(op, "inc") ? "        ADD %s,%s,1\n" : "        SUB %s,%s,1\n", mmix_reg(args[0], line_no, op), mmix_reg(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "mod") == 0 && argc == 2) { buf_append(text, "        % mod is target-runtime dependent on MMIX; quotient/remainder omitted\n"); return; }
-    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "        CMP $48,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op)); return; }
-    if (strcmp(op, "je") == 0 && argc == 1) { buf_appendf(text, "        BZ $48,%s\n", args[0]); return; }
-    if (strcmp(op, "jne") == 0 && argc == 1) { buf_appendf(text, "        BNZ $48,%s\n", args[0]); return; }
-    if ((strcmp(op, "jg") == 0 || strcmp(op, "ja") == 0) && argc == 1) { buf_appendf(text, "        BP $48,%s\n", args[0]); return; }
-    if ((strcmp(op, "jl") == 0 || strcmp(op, "jb") == 0) && argc == 1) { buf_appendf(text, "        BN $48,%s\n", args[0]); return; }
-    if ((strcmp(op, "jge") == 0 || strcmp(op, "jae") == 0) && argc == 1) { buf_appendf(text, "        BNN $48,%s\n", args[0]); return; }
-    if ((strcmp(op, "jle") == 0 || strcmp(op, "jbe") == 0) && argc == 1) { buf_appendf(text, "        BNP $48,%s\n", args[0]); return; }
-    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "        STO %s,0,$254\n        SUBU $254,$254,8\n", mmix_operand(args[0], line_no, op)); return; }
-    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "        ADDU $254,$254,8\n        LDO %s,0,$254\n", mmix_reg(args[0], line_no, op)); return; }
-    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "        JMP %s\n", args[0]); return; }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "        PUSHJ $15,%s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "        POP 0,0\n"); return; }
-    if (strcmp(op, "syscall") == 0) { emit_mmix_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "mod") && argc == 2) { buf_append(text, "        % mod is target-runtime dependent on MMIX; quotient/remainder omitted\n"); return; }
+    if (op_is(op, "cmp") && argc == 2) { buf_appendf(text, "        CMP $48,%s,%s\n", mmix_reg(args[0], line_no, op), mmix_operand(args[1], line_no, op)); return; }
+    if (op_is(op, "je") && argc == 1) { buf_appendf(text, "        BZ $48,%s\n", args[0]); return; }
+    if (op_is(op, "jne") && argc == 1) { buf_appendf(text, "        BNZ $48,%s\n", args[0]); return; }
+    if ((op_is(op, "jg") || op_is(op, "ja")) && argc == 1) { buf_appendf(text, "        BP $48,%s\n", args[0]); return; }
+    if ((op_is(op, "jl") || op_is(op, "jb")) && argc == 1) { buf_appendf(text, "        BN $48,%s\n", args[0]); return; }
+    if ((op_is(op, "jge") || op_is(op, "jae")) && argc == 1) { buf_appendf(text, "        BNN $48,%s\n", args[0]); return; }
+    if ((op_is(op, "jle") || op_is(op, "jbe")) && argc == 1) { buf_appendf(text, "        BNP $48,%s\n", args[0]); return; }
+    if (op_is(op, "push") && argc == 1) { buf_appendf(text, "        STO %s,0,$254\n        SUBU $254,$254,8\n", mmix_operand(args[0], line_no, op)); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "        ADDU $254,$254,8\n        LDO %s,0,$254\n", mmix_reg(args[0], line_no, op)); return; }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "        JMP %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "        PUSHJ $15,%s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "        POP 0,0\n"); return; }
+    if (op_is(op, "syscall")) { emit_mmix_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for MMIX");
 }
 
 static void emit_dcpu_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
     (void)size;
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, ":%s\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "        SUB SP, %s\n", args[0]); return; }
-    if (strcmp(op, "leave") == 0 && argc == 0) return;
-    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), args[1]); return; }
-    if (strcmp(op, "load") == 0 && argc == 2) { char addr[256]; dcpu_format_address(args[1], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), addr); return; }
-    if (strcmp(op, "store") == 0 && argc == 2) { char addr[256]; dcpu_format_address(args[0], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", addr, dcpu_operand(args[1], line_no, op)); return; }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
-         strcmp(op, "mod") == 0 || strcmp(op, "and") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0) && argc == 2) {
-        const char *native = strcmp(op, "or") == 0 ? "BOR" : strcmp(op, "shl") == 0 ? "SHL" : strcmp(op, "shr") == 0 ? "SHR" : strcmp(op, "and") == 0 ? "AND" : strcmp(op, "xor") == 0 ? "XOR" : strcmp(op, "mod") == 0 ? "MOD" : strcmp(op, "mul") == 0 ? "MUL" : strcmp(op, "div") == 0 ? "DIV" : strcmp(op, "sub") == 0 ? "SUB" : "ADD";
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, ":%s\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) { buf_appendf(text, "        SUB SP, %s\n", args[0]); return; }
+    if (op_is(op, "leave") && argc == 0) return;
+    if (op_is(op, "mov") && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
+    if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), args[1]); return; }
+    if (op_is(op, "load") && argc == 2) { char addr[256]; dcpu_format_address(args[1], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), addr); return; }
+    if (op_is(op, "store") && argc == 2) { char addr[256]; dcpu_format_address(args[0], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", addr, dcpu_operand(args[1], line_no, op)); return; }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "mod") || op_is(op, "and") || op_is(op, "xor") || op_is(op, "shl") || op_is(op, "shr")) && argc == 2) {
+        const char *native = op_is(op, "or") ? "BOR" : op_is(op, "shl") ? "SHL" : op_is(op, "shr") ? "SHR" : op_is(op, "and") ? "AND" : op_is(op, "xor") ? "XOR" : op_is(op, "mod") ? "MOD" : op_is(op, "mul") ? "MUL" : op_is(op, "div") ? "DIV" : op_is(op, "sub") ? "SUB" : "ADD";
         buf_appendf(text, "        %s %s, %s\n", native, dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return;
     }
-    if (strcmp(op, "or") == 0 && argc == 2) { buf_appendf(text, "        BOR %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 || strcmp(op, "sar") == 0) && argc >= 1) {
-        if (strcmp(op, "neg") == 0) { buf_appendf(text, "        XOR %s, 0xffff\n        ADD %s, 1\n", dcpu_reg(args[0], line_no, op), dcpu_reg(args[0], line_no, op)); return; }
-        if (strcmp(op, "not") == 0) { buf_appendf(text, "        XOR %s, 0xffff\n", dcpu_reg(args[0], line_no, op)); return; }
-        if (strcmp(op, "inc") == 0) { buf_appendf(text, "        ADD %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
-        if (strcmp(op, "dec") == 0) { buf_appendf(text, "        SUB %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
+    if (op_is(op, "or") && argc == 2) { buf_appendf(text, "        BOR %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") || op_is(op, "sar")) && argc >= 1) {
+        if (op_is(op, "neg")) { buf_appendf(text, "        XOR %s, 0xffff\n        ADD %s, 1\n", dcpu_reg(args[0], line_no, op), dcpu_reg(args[0], line_no, op)); return; }
+        if (op_is(op, "not")) { buf_appendf(text, "        XOR %s, 0xffff\n", dcpu_reg(args[0], line_no, op)); return; }
+        if (op_is(op, "inc")) { buf_appendf(text, "        ADD %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
+        if (op_is(op, "dec")) { buf_appendf(text, "        SUB %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
         line_error(line_no, op, "DCPU-16 has no portable arithmetic right shift");
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "        SET EX, %s\n        SUB EX, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
-    if (strcmp(op, "je") == 0 && argc == 1) { buf_appendf(text, "        IFE EX, 0\n        SET PC, %s\n", args[0]); return; }
-    if (strcmp(op, "jne") == 0 && argc == 1) { buf_appendf(text, "        IFN EX, 0\n        SET PC, %s\n", args[0]); return; }
-    if ((strcmp(op, "jg") == 0 || strcmp(op, "ja") == 0) && argc == 1) { buf_appendf(text, "        IFG EX, 0\n        SET PC, %s\n", args[0]); return; }
-    if ((strcmp(op, "jl") == 0 || strcmp(op, "jb") == 0) && argc == 1) { buf_appendf(text, "        IFL EX, 0\n        SET PC, %s\n", args[0]); return; }
-    if ((strcmp(op, "jge") == 0 || strcmp(op, "jae") == 0) && argc == 1) { buf_appendf(text, "        IFG EX, 0xffff\n        SET PC, %s\n", args[0]); return; }
-    if ((strcmp(op, "jle") == 0 || strcmp(op, "jbe") == 0) && argc == 1) { buf_appendf(text, "        IFL EX, 1\n        SET PC, %s\n", args[0]); return; }
-    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "        SET PC, %s\n", args[0]); return; }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "        JSR %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "        SET PC, POP\n"); return; }
-    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "        SET PUSH, %s\n", dcpu_operand(args[0], line_no, op)); return; }
-    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "        SET %s, POP\n", dcpu_reg(args[0], line_no, op)); return; }
-    if (strcmp(op, "syscall") == 0) { emit_dcpu_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "cmp") && argc == 2) { buf_appendf(text, "        SET EX, %s\n        SUB EX, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
+    if (op_is(op, "je") && argc == 1) { buf_appendf(text, "        IFE EX, 0\n        SET PC, %s\n", args[0]); return; }
+    if (op_is(op, "jne") && argc == 1) { buf_appendf(text, "        IFN EX, 0\n        SET PC, %s\n", args[0]); return; }
+    if ((op_is(op, "jg") || op_is(op, "ja")) && argc == 1) { buf_appendf(text, "        IFG EX, 0\n        SET PC, %s\n", args[0]); return; }
+    if ((op_is(op, "jl") || op_is(op, "jb")) && argc == 1) { buf_appendf(text, "        IFL EX, 0\n        SET PC, %s\n", args[0]); return; }
+    if ((op_is(op, "jge") || op_is(op, "jae")) && argc == 1) { buf_appendf(text, "        IFG EX, 0xffff\n        SET PC, %s\n", args[0]); return; }
+    if ((op_is(op, "jle") || op_is(op, "jbe")) && argc == 1) { buf_appendf(text, "        IFL EX, 1\n        SET PC, %s\n", args[0]); return; }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "        SET PC, %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "        JSR %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "        SET PC, POP\n"); return; }
+    if (op_is(op, "push") && argc == 1) { buf_appendf(text, "        SET PUSH, %s\n", dcpu_operand(args[0], line_no, op)); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "        SET %s, POP\n", dcpu_reg(args[0], line_no, op)); return; }
+    if (op_is(op, "syscall")) { emit_dcpu_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for DCPU-16");
 }
 
@@ -1590,39 +1615,39 @@ static void emit_generic_syscall(Buffer *text, const char *target, char **args, 
 static void emit_generic_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
     (void)size;
     const char *c = generic_comment(target);
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         if (is_i386_target(target)) buf_appendf(text, "  push ebp\n  mov ebp, esp\n  sub esp, %s\n", args[0]);
         else if (is_aarch64_target(target)) buf_appendf(text, "  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n  sub sp, sp, #%s\n", args[0]);
         else if (is_arm32_target(target)) buf_appendf(text, "  push {fp, lr}\n  mov fp, sp\n  sub sp, sp, #%s\n", args[0]);
         else buf_appendf(text, "  %s enter %s\n", c, args[0]);
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) {
+    if (op_is(op, "leave") && argc == 0) {
         if (is_i386_target(target)) buf_append(text, "  mov esp, ebp\n  pop ebp\n");
         else if (is_aarch64_target(target)) buf_append(text, "  mov sp, x29\n  ldp x29, x30, [sp], #16\n");
         else if (is_arm32_target(target)) buf_append(text, "  mov sp, fp\n  pop {fp, lr}\n");
         else buf_appendf(text, "  %s leave\n", c);
         return;
     }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "mov") && argc == 2) {
         if (is_i386_target(target)) buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         else if (is_arm32_target(target) || is_aarch64_target(target)) buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         else if (is_loong_target(target)) buf_appendf(text, "  ori %s, %s, 0\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         else buf_appendf(text, "  mov %s = %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) {
         if (is_i386_target(target)) buf_appendf(text, "  lea %s, [%s]\n", generic_reg_for_target(args[0], target, line_no, op), args[1]);
         else if (is_arm32_target(target) || is_aarch64_target(target)) buf_appendf(text, "  adr %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), args[1]);
         else if (is_rv_generic_target(target) || is_loong_target(target)) buf_appendf(text, "  la %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), args[1]);
         else buf_appendf(text, "  addl %s = @gprel(%s), gp\n", generic_reg_for_target(args[0], target, line_no, op), args[1]);
         return;
     }
-    if ((strcmp(op, "load") == 0 || strcmp(op, "store") == 0) && argc == 2) {
-        char addr[256]; generic_format_address(strcmp(op, "load") == 0 ? args[1] : args[0], target, addr, sizeof(addr), line_no, op);
-        if (strcmp(op, "load") == 0) {
+    if ((op_is(op, "load") || op_is(op, "store")) && argc == 2) {
+        char addr[256]; generic_format_address(op_is(op, "load") ? args[1] : args[0], target, addr, sizeof(addr), line_no, op);
+        if (op_is(op, "load")) {
             if (is_i386_target(target)) buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), addr);
             else if (is_arm32_target(target) || is_aarch64_target(target)) buf_appendf(text, "  ldr %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), addr);
             else if (is_rv_generic_target(target)) buf_appendf(text, "  lw %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), addr);
@@ -1637,10 +1662,10 @@ static void emit_generic_instruction(Buffer *text, const char *target, const cha
         }
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
-         strcmp(op, "mod") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 ||
-         strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
-        const char *native = strcmp(op, "shl") == 0 ? (is_i386_target(target) ? "shl" : "lsl") : strcmp(op, "shr") == 0 ? (is_i386_target(target) ? "shr" : "lsr") : strcmp(op, "sar") == 0 ? (is_i386_target(target) ? "sar" : "asr") : op;
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "mod") || op_is(op, "and") || op_is(op, "or") || op_is(op, "xor") ||
+         op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *native = op_is(op, "shl") ? (is_i386_target(target) ? "shl" : "lsl") : op_is(op, "shr") ? (is_i386_target(target) ? "shr" : "lsr") : op_is(op, "sar") ? (is_i386_target(target) ? "sar" : "asr") : op;
         if (is_i386_target(target)) {
             buf_appendf(text, "  %s %s, ", native, generic_reg_for_target(args[0], target, line_no, op));
             buf_append(text, generic_operand(args[1], target, line_no, op));
@@ -1652,32 +1677,32 @@ static void emit_generic_instruction(Buffer *text, const char *target, const cha
         }
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         if (is_i386_target(target)) {
-            if (strcmp(op, "not") == 0 || strcmp(op, "neg") == 0) buf_appendf(text, "  %s %s\n", op, generic_reg_for_target(args[0], target, line_no, op));
-            else buf_appendf(text, strcmp(op, "inc") == 0 ? "  inc %s\n" : "  dec %s\n", generic_reg_for_target(args[0], target, line_no, op));
+            if (op_is(op, "not") || op_is(op, "neg")) buf_appendf(text, "  %s %s\n", op, generic_reg_for_target(args[0], target, line_no, op));
+            else buf_appendf(text, op_is(op, "inc") ? "  inc %s\n" : "  dec %s\n", generic_reg_for_target(args[0], target, line_no, op));
         } else {
             buf_appendf(text, "  %s %s\n", op, generic_reg_for_target(args[0], target, line_no, op));
         }
         return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) {
+    if (op_is(op, "cmp") && argc == 2) {
         if (is_i386_target(target)) buf_appendf(text, "  cmp %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         else buf_appendf(text, "  cmp %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op));
         return;
     }
-    if ((strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 ||
-         strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 || strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 ||
-         strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0 || strcmp(op, "jmp") == 0) && argc == 1) {
-        const char *branch = strcmp(op, "jmp") == 0 ? (is_i386_target(target) ? "jmp" : "b") : op;
+    if ((op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") || op_is(op, "jl") ||
+         op_is(op, "jge") || op_is(op, "jle") || op_is(op, "ja") || op_is(op, "jb") ||
+         op_is(op, "jae") || op_is(op, "jbe") || op_is(op, "jmp")) && argc == 1) {
+        const char *branch = op_is(op, "jmp") ? (is_i386_target(target) ? "jmp" : "b") : op;
         buf_appendf(text, "  %s %s\n", branch, args[0]);
         return;
     }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  call %s\n" : "  bl %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, is_i386_target(target) ? "  ret\n" : "  ret\n"); return; }
-    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  push %s\n" : "  push {%s}\n", generic_operand(args[0], target, line_no, op)); return; }
-    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  pop %s\n" : "  pop {%s}\n", generic_reg_for_target(args[0], target, line_no, op)); return; }
-    if (strcmp(op, "syscall") == 0) { emit_generic_syscall(text, target, args, argc, line_no); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  call %s\n" : "  bl %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, is_i386_target(target) ? "  ret\n" : "  ret\n"); return; }
+    if (op_is(op, "push") && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  push %s\n" : "  push {%s}\n", generic_operand(args[0], target, line_no, op)); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, is_i386_target(target) ? "  pop %s\n" : "  pop {%s}\n", generic_reg_for_target(args[0], target, line_no, op)); return; }
+    if (op_is(op, "syscall")) { emit_generic_syscall(text, target, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for generic architecture");
 }
 
@@ -1693,14 +1718,14 @@ static bool i386_reg_is_spilled(const char *value) {
 static const char *i386_operand_text(int idx, const char *size) {
     static char pool[8][48];
     static unsigned next = 0;
-    char *slot = pool[next];
-    next = (next + 1) % 8;
+    char *slot;
     if (idx < I386_MAPPED_COUNT) {
-        snprintf(slot, sizeof(pool[0]), "%s", strcmp(size, "w") == 0 ? i386_regs_w[idx] : i386_regs[idx]);
-    } else {
-        i386_spill_used |= 1u << (idx - I386_MAPPED_COUNT);
-        snprintf(slot, sizeof(pool[0]), "[%s+%d]", X86_SPILL_SYMBOL, (idx - I386_MAPPED_COUNT) * 4);
+        return size[0] == 'w' ? i386_regs_w[idx] : i386_regs[idx];
     }
+    slot = pool[next];
+    next = (next + 1) % 8;
+    i386_spill_used |= 1u << (idx - I386_MAPPED_COUNT);
+    snprintf(slot, sizeof(pool[0]), "[%s+%d]", X86_SPILL_SYMBOL, (idx - I386_MAPPED_COUNT) * 4);
     return slot;
 }
 
@@ -1800,15 +1825,15 @@ static void emit_i386_syscall(Buffer *text, char **args, int argc, int line_no) 
 }
 
 static void emit_i386_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         buf_append(text, "  push ebp\n  mov ebp, esp\n");
         if (strcmp(args[0], "0") != 0) buf_appendf(text, "  sub esp, %s\n", args[0]);
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) { buf_append(text, "  mov esp, ebp\n  pop ebp\n"); return; }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "leave") && argc == 0) { buf_append(text, "  mov esp, ebp\n  pop ebp\n"); return; }
+    if (op_is(op, "mov") && argc == 2) {
         if (i386_reg_is_spilled(args[0]) && i386_reg_is_spilled(args[1])) {
             buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
             buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
@@ -1818,7 +1843,7 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) {
         if (i386_reg_is_spilled(args[0])) {
             buf_appendf(text, "  lea %s, [%s]\n", I386_SCRATCH, args[1]);
             buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
@@ -1827,7 +1852,7 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "load") && argc == 2) {
         char addr[256];
         bool spilled = i386_reg_is_spilled(args[0]);
         i386_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
@@ -1840,7 +1865,7 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         if (spilled) buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
         return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256];
         i386_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
         /* esi and edi have no 8-bit form on i386, and a spilled source would
@@ -1855,23 +1880,29 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         bool dst_mem = i386_reg_is_spilled(args[0]);
         if (virtual_reg_index(args[1]) < 0) {
             buf_appendf(text, "  %s %s%s, %s\n", op, dst_mem ? "dword " : "",
                         i386_reg(args[0], line_no, op), i386_operand(args[1], line_no, op));
             return;
         }
-        buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
-        buf_append(text, "  push ecx\n");
-        buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[1], line_no, op));
-        buf_appendf(text, "  %s %s, cl\n", op, I386_SCRATCH);
-        buf_append(text, "  pop ecx\n");
-        buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "dword " : "", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        {
+            /* A count already in ecx needs no borrowing. */
+            bool count_in_cl = strcmp(i386_operand(args[1], line_no, op), "ecx") == 0;
+            buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+            if (!count_in_cl) {
+                buf_append(text, "  push ecx\n");
+                buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[1], line_no, op));
+            }
+            buf_appendf(text, "  %s %s, cl\n", op, I386_SCRATCH);
+            if (!count_in_cl) buf_append(text, "  pop ecx\n");
+            buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "dword " : "", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        }
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor") || op_is(op, "cmp")) && argc == 2) {
         if (i386_reg_is_spilled(args[0]) && i386_reg_is_spilled(args[1])) {
             buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
             buf_appendf(text, "  %s dword %s, %s\n", op, i386_reg(args[0], line_no, op), I386_SCRATCH);
@@ -1881,12 +1912,12 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         buf_appendf(text, "  %s %s%s\n", op, i386_reg_is_spilled(args[0]) ? "dword " : "",
                     i386_reg(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "mul") == 0 && argc == 2) {
+    if (op_is(op, "mul") && argc == 2) {
         /* The one-operand "mul" multiplies edx:eax; the two-operand form the
            IR wants is imul, and it cannot write to memory. */
         if (i386_reg_is_spilled(args[0])) {
@@ -1898,36 +1929,36 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
-    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         /* idiv works on edx:eax, and both are scratch here, so nothing has to
            be saved. The divisor is copied out before cdq overwrites edx. */
         buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
         buf_append(text, "  push ecx\n");
         buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[1], line_no, op));
         buf_append(text, "  cdq\n  idiv ecx\n");
-        if (strcmp(op, "mod") == 0) buf_appendf(text, "  mov %s, edx\n", I386_SCRATCH);
+        if (op_is(op, "mod")) buf_appendf(text, "  mov %s, edx\n", I386_SCRATCH);
         buf_append(text, "  pop ecx\n");
         buf_appendf(text, "  mov %s%s, %s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
                     i386_reg(args[0], line_no, op), I386_SCRATCH);
         return;
     }
-    if (strcmp(op, "push") == 0 && argc == 1) {
+    if (op_is(op, "push") && argc == 1) {
         buf_appendf(text, "  push %s%s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
                     i386_operand(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "pop") == 0 && argc == 1) {
+    if (op_is(op, "pop") && argc == 1) {
         buf_appendf(text, "  pop %s%s\n", i386_reg_is_spilled(args[0]) ? "dword " : "",
                     i386_reg(args[0], line_no, op));
         return;
     }
-    if ((strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 ||
-         strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
-         strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0) && argc == 1) {
+    if ((op_is(op, "jmp") || op_is(op, "call") || op_is(op, "je") || op_is(op, "jne") ||
+         op_is(op, "jg") || op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") ||
+         op_is(op, "ja") || op_is(op, "jb") || op_is(op, "jae") || op_is(op, "jbe")) && argc == 1) {
         buf_appendf(text, "  %s %s\n", op, args[0]); return;
     }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
-    if (strcmp(op, "syscall") == 0) { emit_i386_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "syscall")) { emit_i386_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for i386");
 }
 
@@ -2066,9 +2097,9 @@ static void emit_arm_syscall(Buffer *text, char **args, int argc, int line_no) {
 }
 
 static void emit_arm_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         long frame;
         buf_append(text, "  push {fp, lr}\n  mov fp, sp\n");
         if (strcmp(args[0], "0") == 0) return;
@@ -2079,8 +2110,8 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) { buf_append(text, "  mov sp, fp\n  pop {fp, lr}\n"); return; }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "leave") && argc == 0) { buf_append(text, "  mov sp, fp\n  pop {fp, lr}\n"); return; }
+    if (op_is(op, "mov") && argc == 2) {
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
         long imm;
         if (virtual_reg_index(args[0]) < 0) line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
@@ -2092,13 +2123,13 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) {
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
         buf_appendf(text, "  ldr %s, =%s\n", dst, args[1]);
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
         const char *mnemonic = strcmp(size, "b") == 0 ? "ldrb" : strcmp(size, "w") == 0 ? "ldrh" : "ldr";
@@ -2108,7 +2139,7 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256];
         const char *mnemonic = strcmp(size, "b") == 0 ? "strb" : strcmp(size, "w") == 0 ? "strh" : "str";
         const char *src = arm_value_reg(text, args[1], ARM_SCRATCH2, line_no, op);
@@ -2116,12 +2147,12 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         buf_appendf(text, "  %s %s, %s\n", mnemonic, src, addr);
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "mul") == 0 ||
-         strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
-        const char *native = strcmp(op, "or") == 0 ? "orr" : strcmp(op, "xor") == 0 ? "eor" :
-                             strcmp(op, "shl") == 0 ? "lsl" : strcmp(op, "shr") == 0 ? "lsr" :
-                             strcmp(op, "sar") == 0 ? "asr" : op;
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor") || op_is(op, "mul") ||
+         op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *native = op_is(op, "or") ? "orr" : op_is(op, "xor") ? "eor" :
+                             op_is(op, "shl") ? "lsl" : op_is(op, "shr") ? "lsr" :
+                             op_is(op, "sar") ? "asr" : op;
         const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
         long imm;
         /* mul takes no immediate, and on ARMv4/v5 its destination must differ
@@ -2130,13 +2161,13 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
             buf_appendf(text, "  %s %s, %s, #%ld\n", native, dst, dst, imm);
         } else {
             const char *src = arm_value_reg(text, args[1], ARM_SCRATCH, line_no, op);
-            if (strcmp(op, "mul") == 0) buf_appendf(text, "  mul %s, %s, %s\n", dst, src, dst);
+            if (op_is(op, "mul")) buf_appendf(text, "  mul %s, %s, %s\n", dst, src, dst);
             else buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, src);
         }
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         /* ARM has no division instruction in the portable subset, so this is
            the EABI helper call. It takes r0 and r1 and clobbers r0-r3, so the
            virtual registers living there are saved around it. */
@@ -2151,8 +2182,8 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         }
         buf_append(text, "  ldr r1, [sp, #0]\n");
         buf_append(text, "  ldr r0, [sp, #4]\n");
-        buf_appendf(text, "  bl %s\n", strcmp(op, "div") == 0 ? "__aeabi_idiv" : "__aeabi_idivmod");
-        buf_appendf(text, "  mov %s, %s\n", ARM_SCRATCH2, strcmp(op, "div") == 0 ? "r0" : "r1");
+        buf_appendf(text, "  bl %s\n", op_is(op, "div") ? "__aeabi_idiv" : "__aeabi_idivmod");
+        buf_appendf(text, "  mov %s, %s\n", ARM_SCRATCH2, op_is(op, "div") ? "r0" : "r1");
         for (int i = 2; i >= 0; i--) {
             if (arm_must_preserve(clobbered[i])) buf_appendf(text, "  pop {%s}\n", clobbered[i]);
         }
@@ -2163,45 +2194,45 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 ||
-         strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") ||
+         op_is(op, "dec")) && argc == 1) {
         const char *dst = arm_dst_reg(text, args[0], ARM_SCRATCH2, line_no, op);
-        if (strcmp(op, "neg") == 0) buf_appendf(text, "  rsb %s, %s, #0\n", dst, dst);
-        else if (strcmp(op, "not") == 0) buf_appendf(text, "  mvn %s, %s\n", dst, dst);
-        else buf_appendf(text, "  %s %s, %s, #1\n", strcmp(op, "inc") == 0 ? "add" : "sub", dst, dst);
+        if (op_is(op, "neg")) buf_appendf(text, "  rsb %s, %s, #0\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  mvn %s, %s\n", dst, dst);
+        else buf_appendf(text, "  %s %s, %s, #1\n", op_is(op, "inc") ? "add" : "sub", dst, dst);
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) {
+    if (op_is(op, "cmp") && argc == 2) {
         const char *lhs = arm_value_reg(text, args[0], ARM_SCRATCH2, line_no, op);
         long imm;
         if (arm_fits_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%ld\n", lhs, imm);
         else buf_appendf(text, "  cmp %s, %s\n", lhs, arm_value_reg(text, args[1], ARM_SCRATCH, line_no, op));
         return;
     }
-    if (strcmp(op, "push") == 0 && argc == 1) {
+    if (op_is(op, "push") && argc == 1) {
         buf_appendf(text, "  push {%s}\n", arm_value_reg(text, args[0], ARM_SCRATCH2, line_no, op)); return;
     }
-    if (strcmp(op, "pop") == 0 && argc == 1) {
+    if (op_is(op, "pop") && argc == 1) {
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
         if (virtual_reg_index(args[0]) < 0) line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
         buf_appendf(text, "  pop {%s}\n", dst);
         arm_store_vreg(text, args[0], dst, ARM_SCRATCH);
         return;
     }
-    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  bx lr\n"); return; }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  bx lr\n"); return; }
     if (argc == 1) {
         const char *cond =
-            strcmp(op, "je") == 0 ? "eq" : strcmp(op, "jne") == 0 ? "ne" :
-            strcmp(op, "jg") == 0 ? "gt" : strcmp(op, "jl") == 0 ? "lt" :
-            strcmp(op, "jge") == 0 ? "ge" : strcmp(op, "jle") == 0 ? "le" :
-            strcmp(op, "ja") == 0 ? "hi" : strcmp(op, "jb") == 0 ? "lo" :
-            strcmp(op, "jae") == 0 ? "hs" : strcmp(op, "jbe") == 0 ? "ls" : NULL;
+            op_is(op, "je") ? "eq" : op_is(op, "jne") ? "ne" :
+            op_is(op, "jg") ? "gt" : op_is(op, "jl") ? "lt" :
+            op_is(op, "jge") ? "ge" : op_is(op, "jle") ? "le" :
+            op_is(op, "ja") ? "hi" : op_is(op, "jb") ? "lo" :
+            op_is(op, "jae") ? "hs" : op_is(op, "jbe") ? "ls" : NULL;
         if (cond) { buf_appendf(text, "  b%s %s\n", cond, args[0]); return; }
     }
-    if (strcmp(op, "syscall") == 0) { emit_arm_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "syscall")) { emit_arm_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for ARM");
 }
 
@@ -2332,9 +2363,9 @@ static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
 }
 
 static void emit_a64_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         long frame;
         buf_append(text, "  stp x29, x30, [sp, #-16]!\n  mov x29, sp\n");
         if (strcmp(args[0], "0") == 0) return;
@@ -2347,10 +2378,10 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) {
+    if (op_is(op, "leave") && argc == 0) {
         buf_append(text, "  mov sp, x29\n  ldp x29, x30, [sp], #16\n"); return;
     }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "mov") && argc == 2) {
         if (virtual_reg_index(args[1]) >= 0) {
             buf_appendf(text, "  mov %s, %s\n", a64_reg(args[0], line_no, op), a64_reg(args[1], line_no, op));
         } else {
@@ -2358,13 +2389,13 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
         buf_appendf(text, "  adrp %s, %s\n", dst, args[1]);
         buf_appendf(text, "  add %s, %s, :lo12:%s\n", dst, dst, args[1]);
         return;
     }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = a64_reg(args[0], line_no, op);
         a64_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
@@ -2374,7 +2405,7 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         else buf_appendf(text, "  ldr %s, %s\n", dst, addr);
         return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256];
         const char *src;
         a64_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
@@ -2385,7 +2416,7 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         else buf_appendf(text, "  str %s, %s\n", src, addr);
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub")) && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
         long imm;
         if (a64_fits_add_imm(args[1], &imm)) {
@@ -2396,22 +2427,22 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 ||
-         strcmp(op, "mul") == 0) && argc == 2) {
+    if ((op_is(op, "and") || op_is(op, "or") || op_is(op, "xor") ||
+         op_is(op, "mul")) && argc == 2) {
         /* The logical immediate encoding is a bitmask pattern rather than a
            plain range, and mul has no immediate form at all, so every
            non-register operand is materialised. */
         const char *dst = a64_reg(args[0], line_no, op);
         const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
-        const char *native = strcmp(op, "and") == 0 ? "and" : strcmp(op, "or") == 0 ? "orr" :
-                             strcmp(op, "xor") == 0 ? "eor" : "mul";
+        const char *native = op_is(op, "and") ? "and" : op_is(op, "or") ? "orr" :
+                             op_is(op, "xor") ? "eor" : "mul";
         buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, src);
         return;
     }
-    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
         const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
-        if (strcmp(op, "div") == 0) {
+        if (op_is(op, "div")) {
             buf_appendf(text, "  sdiv %s, %s, %s\n", dst, dst, src);
         } else {
             /* AArch64 has no remainder instruction: quotient, then subtract
@@ -2421,9 +2452,9 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         const char *dst = a64_reg(args[0], line_no, op);
-        const char *native = strcmp(op, "shl") == 0 ? "lsl" : strcmp(op, "shr") == 0 ? "lsr" : "asr";
+        const char *native = op_is(op, "shl") ? "lsl" : op_is(op, "shr") ? "lsr" : "asr";
         if (is_int(args[1])) {
             buf_appendf(text, "  %s %s, %s, #%s\n", native, dst, dst, args[1]);
         } else {
@@ -2432,117 +2463,117 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 ||
-         strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") ||
+         op_is(op, "dec")) && argc == 1) {
         const char *dst = a64_reg(args[0], line_no, op);
-        if (strcmp(op, "neg") == 0) buf_appendf(text, "  neg %s, %s\n", dst, dst);
-        else if (strcmp(op, "not") == 0) buf_appendf(text, "  mvn %s, %s\n", dst, dst);
-        else buf_appendf(text, "  %s %s, %s, #1\n", strcmp(op, "inc") == 0 ? "add" : "sub", dst, dst);
+        if (op_is(op, "neg")) buf_appendf(text, "  neg %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  mvn %s, %s\n", dst, dst);
+        else buf_appendf(text, "  %s %s, %s, #1\n", op_is(op, "inc") ? "add" : "sub", dst, dst);
         return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) {
+    if (op_is(op, "cmp") && argc == 2) {
         const char *lhs = a64_reg(args[0], line_no, op);
         long imm;
         if (a64_fits_add_imm(args[1], &imm)) buf_appendf(text, "  cmp %s, #%ld\n", lhs, imm);
         else buf_appendf(text, "  cmp %s, %s\n", lhs, a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op));
         return;
     }
-    if (strcmp(op, "push") == 0 && argc == 1) {
+    if (op_is(op, "push") && argc == 1) {
         /* The stack pointer has to stay 16-byte aligned, so a single register
            still moves it by 16. */
         buf_appendf(text, "  str %s, [sp, #-16]!\n", a64_operand_reg(text, args[0], A64_SCRATCH, line_no, op));
         return;
     }
-    if (strcmp(op, "pop") == 0 && argc == 1) {
+    if (op_is(op, "pop") && argc == 1) {
         buf_appendf(text, "  ldr %s, [sp], #16\n", a64_reg(args[0], line_no, op)); return;
     }
-    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
     if (argc == 1) {
         const char *cond =
-            strcmp(op, "je") == 0 ? "eq" : strcmp(op, "jne") == 0 ? "ne" :
-            strcmp(op, "jg") == 0 ? "gt" : strcmp(op, "jl") == 0 ? "lt" :
-            strcmp(op, "jge") == 0 ? "ge" : strcmp(op, "jle") == 0 ? "le" :
-            strcmp(op, "ja") == 0 ? "hi" : strcmp(op, "jb") == 0 ? "lo" :
-            strcmp(op, "jae") == 0 ? "hs" : strcmp(op, "jbe") == 0 ? "ls" : NULL;
+            op_is(op, "je") ? "eq" : op_is(op, "jne") ? "ne" :
+            op_is(op, "jg") ? "gt" : op_is(op, "jl") ? "lt" :
+            op_is(op, "jge") ? "ge" : op_is(op, "jle") ? "le" :
+            op_is(op, "ja") ? "hi" : op_is(op, "jb") ? "lo" :
+            op_is(op, "jae") ? "hs" : op_is(op, "jbe") ? "ls" : NULL;
         if (cond) { buf_appendf(text, "  b.%s %s\n", cond, args[0]); return; }
     }
-    if (strcmp(op, "syscall") == 0) { emit_a64_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "syscall")) { emit_a64_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for AArch64");
 }
 
 static void emit_arch_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
     (void)size;
     const char *comment = is_legacy_arch_target(target) ? "#" : ";";
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "  %s enter %s\n", comment, args[0]); return; }
-    if (strcmp(op, "leave") == 0 && argc == 0) { buf_appendf(text, "  %s leave\n", comment); return; }
-    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op)); return; }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "  la %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), args[1]); return; }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) { buf_appendf(text, "  %s enter %s\n", comment, args[0]); return; }
+    if (op_is(op, "leave") && argc == 0) { buf_appendf(text, "  %s leave\n", comment); return; }
+    if (op_is(op, "mov") && argc == 2) { buf_appendf(text, "  mov %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op)); return; }
+    if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "  la %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), args[1]); return; }
+    if (op_is(op, "load") && argc == 2) {
         char addr[256]; generic_format_address(args[1], target, addr, sizeof(addr), line_no, op);
         buf_appendf(text, "  load %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), addr); return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256]; generic_format_address(args[0], target, addr, sizeof(addr), line_no, op);
         buf_appendf(text, "  store %s, %s\n", generic_operand(args[1], target, line_no, op), addr); return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
-         strcmp(op, "mod") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 ||
-         strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "mod") || op_is(op, "and") || op_is(op, "or") || op_is(op, "xor") ||
+         op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         buf_appendf(text, "  %s %s, %s, ", op, generic_reg_for_target(args[0], target, line_no, op), generic_reg_for_target(args[0], target, line_no, op));
         buf_append(text, generic_operand(args[1], target, line_no, op));
         buf_append(text, "\n");
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         buf_appendf(text, "  %s %s\n", op, generic_reg_for_target(args[0], target, line_no, op)); return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) { buf_appendf(text, "  cmp %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op)); return; }
-    if ((strcmp(op, "jmp") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
-         strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 || strcmp(op, "ja") == 0 ||
-         strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0) && argc == 1) {
+    if (op_is(op, "cmp") && argc == 2) { buf_appendf(text, "  cmp %s, %s\n", generic_reg_for_target(args[0], target, line_no, op), generic_operand(args[1], target, line_no, op)); return; }
+    if ((op_is(op, "jmp") || op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") ||
+         op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") || op_is(op, "ja") ||
+         op_is(op, "jb") || op_is(op, "jae") || op_is(op, "jbe")) && argc == 1) {
         buf_appendf(text, "  %s %s\n", op, args[0]); return;
     }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
-    if (strcmp(op, "push") == 0 && argc == 1) { buf_appendf(text, "  push %s\n", generic_operand(args[0], target, line_no, op)); return; }
-    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "  pop %s\n", generic_reg_for_target(args[0], target, line_no, op)); return; }
-    if (strcmp(op, "syscall") == 0 && argc >= 1) { buf_appendf(text, "  %s syscall %s runtime placeholder\n", comment, args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "push") && argc == 1) { buf_appendf(text, "  push %s\n", generic_operand(args[0], target, line_no, op)); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "  pop %s\n", generic_reg_for_target(args[0], target, line_no, op)); return; }
+    if (op_is(op, "syscall") && argc >= 1) { buf_appendf(text, "  %s syscall %s runtime placeholder\n", comment, args[0]); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for architecture-style target");
 }
 
 static void emit_vm_ir_instruction(Buffer *text, const char *target, const char *op, const char *size, char **args, int argc, int line_no) {
     (void)size;
     (void)line_no;
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "func %s\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) { buf_append(text, "endfunc\n"); return; }
-    if (strcmp(op, "enter") == 0 && argc == 1) { buf_appendf(text, "  ; enter %s\n", args[0]); return; }
-    if (strcmp(op, "leave") == 0 && argc == 0) { buf_append(text, "  ; leave\n"); return; }
-    if (strcmp(op, "mov") == 0 && argc == 2) { buf_appendf(text, "  %s.mov %s, ", target, args[0]); buf_append(text, args[1]); buf_append(text, "\n"); return; }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "  %s.addr %s, %s\n", target, args[0], args[1]); return; }
-    if ((strcmp(op, "load") == 0 || strcmp(op, "store") == 0) && argc == 2) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "func %s\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) { buf_append(text, "endfunc\n"); return; }
+    if (op_is(op, "enter") && argc == 1) { buf_appendf(text, "  ; enter %s\n", args[0]); return; }
+    if (op_is(op, "leave") && argc == 0) { buf_append(text, "  ; leave\n"); return; }
+    if (op_is(op, "mov") && argc == 2) { buf_appendf(text, "  %s.mov %s, ", target, args[0]); buf_append(text, args[1]); buf_append(text, "\n"); return; }
+    if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "  %s.addr %s, %s\n", target, args[0], args[1]); return; }
+    if ((op_is(op, "load") || op_is(op, "store")) && argc == 2) {
         buf_appendf(text, "  %s.%s %s, ", target, op, args[0]);
         buf_append(text, args[1]);
         buf_append(text, "\n");
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 || strcmp(op, "or") == 0 ||
-         strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0 || strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 ||
-         strcmp(op, "mod") == 0 || strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") || op_is(op, "or") ||
+         op_is(op, "xor") || op_is(op, "cmp") || op_is(op, "mul") || op_is(op, "div") ||
+         op_is(op, "mod") || op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         buf_appendf(text, "  %s.%s %s, ", target, op, args[0]); buf_append(text, args[1]); buf_append(text, "\n"); return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 || strcmp(op, "push") == 0 || strcmp(op, "pop") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") || op_is(op, "push") || op_is(op, "pop")) && argc == 1) {
         buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
     }
-    if ((strcmp(op, "jmp") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
-         strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 || strcmp(op, "call") == 0) && argc == 1) {
+    if ((op_is(op, "jmp") || op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") ||
+         op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") || op_is(op, "call")) && argc == 1) {
         buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
     }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_appendf(text, "  %s.ret\n", target); return; }
-    if (strcmp(op, "syscall") == 0 && argc >= 1) { buf_appendf(text, "  %s.syscall %s\n", target, args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_appendf(text, "  %s.ret\n", target); return; }
+    if (op_is(op, "syscall") && argc >= 1) { buf_appendf(text, "  %s.syscall %s\n", target, args[0]); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for VM/IR target");
 }
 
@@ -2556,27 +2587,27 @@ static void emit_encoded_or_toy_instruction(Buffer *text, const char *target, co
     if (strcmp(target, "befunge") == 0) { buf_appendf(text, ">:%s v\n", op); return; }
     if (strcmp(target, "turing-machine") == 0) { buf_appendf(text, "state_%s: read _ write _ move R goto next\n", op); return; }
     if (strcmp(target, "unlambda") == 0 || strcmp(target, "iota") == 0 || strcmp(target, "jot") == 0) { buf_appendf(text, "`k`k ; %s\n", op); return; }
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
     buf_appendf(text, "  %s.%s", target, op);
     for (int i = 0; i < argc; i++) { buf_append(text, i == 0 ? " " : ", "); buf_append(text, args[i]); }
     buf_append(text, "\n");
 }
 
 static void emit_x86_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (strcmp(op, "func") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) {
         buf_appendf(text, "%s:\n", args[0]); return;
     }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         buf_append(text, "  push rbp\n  mov rbp, rsp\n");
         if (strcmp(args[0], "0") != 0) buf_appendf(text, "  sub rsp, %s\n", args[0]);
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) {
+    if (op_is(op, "leave") && argc == 0) {
         buf_append(text, "  mov rsp, rbp\n  pop rbp\n"); return;
     }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "mov") && argc == 2) {
         if (x86_needs_scratch(args[0], args[1])) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
             buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
@@ -2587,7 +2618,7 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) {
         /* lea cannot write to memory, so a spilled destination goes through
            the scratch register. */
         if (x86_reg_is_spilled(args[0])) {
@@ -2598,7 +2629,7 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if (strcmp(op, "load") == 0 && argc == 2) {
+    if (op_is(op, "load") && argc == 2) {
         char addr[256];
         bool spilled = x86_reg_is_spilled(args[0]);
         x86_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
@@ -2614,7 +2645,7 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         if (spilled) buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
         return;
     }
-    if (strcmp(op, "store") == 0 && argc == 2) {
+    if (op_is(op, "store") && argc == 2) {
         char addr[256];
         x86_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
         if (virtual_reg_index(args[1]) >= 0 && !x86_reg_is_spilled(args[1])) {
@@ -2627,7 +2658,7 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         bool dst_mem = x86_reg_is_spilled(args[0]);
         if (virtual_reg_index(args[1]) < 0) {
             if (dst_mem) buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), x86_operand(args[1], line_no, op));
@@ -2636,18 +2667,24 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         /* A variable shift count must sit in cl, but rcx carries a virtual
            register, so the value is shifted in the scratch while rcx is
-           borrowed. This also stays correct when the count and the
-           destination are the same virtual register. */
-        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
-        buf_append(text, "  push rcx\n");
-        buf_appendf(text, "  mov rcx, %s\n", x86_operand(args[1], line_no, op));
-        buf_appendf(text, "  %s %s, cl\n", op, X86_SCRATCH);
-        buf_append(text, "  pop rcx\n");
-        buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "qword " : "", x86_reg(args[0], line_no, op), X86_SCRATCH);
+           borrowed. A count that already lives in rcx needs no borrowing at
+           all. This stays correct when the count and the destination are the
+           same virtual register. */
+        {
+            bool count_in_cl = strcmp(x86_operand(args[1], line_no, op), "rcx") == 0;
+            buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+            if (!count_in_cl) {
+                buf_append(text, "  push rcx\n");
+                buf_appendf(text, "  mov rcx, %s\n", x86_operand(args[1], line_no, op));
+            }
+            buf_appendf(text, "  %s %s, cl\n", op, X86_SCRATCH);
+            if (!count_in_cl) buf_append(text, "  pop rcx\n");
+            buf_appendf(text, "  mov %s%s, %s\n", dst_mem ? "qword " : "", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        }
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "cmp") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor") || op_is(op, "cmp")) && argc == 2) {
         if (x86_needs_scratch(args[0], args[1])) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
             buf_appendf(text, "  %s qword %s, %s\n", op, x86_reg(args[0], line_no, op), X86_SCRATCH);
@@ -2658,11 +2695,11 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         buf_appendf(text, "  %s %s%s\n", op, x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "mul") == 0 && argc == 2) {
+    if (op_is(op, "mul") && argc == 2) {
         /* imul cannot write to memory. */
         if (x86_reg_is_spilled(args[0])) {
             buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
@@ -2673,7 +2710,7 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
-    if ((strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         /* idiv is hard-wired to rax:rdx. rdx carries a virtual register, so it
            is saved across the division; the divisor is copied out before cqo
            overwrites rdx, which keeps "div r0, r2" correct. */
@@ -2682,28 +2719,28 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_operand(args[1], line_no, op));
         buf_append(text, "  cqo\n");
         buf_appendf(text, "  idiv %s\n", X86_ADDR_SCRATCH);
-        if (strcmp(op, "mod") == 0) {
+        if (op_is(op, "mod")) {
             buf_appendf(text, "  mov %s, rdx\n", X86_SCRATCH);
         }
         buf_append(text, "  pop rdx\n");
         buf_appendf(text, "  mov %s%s, %s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op), X86_SCRATCH);
         return;
     }
-    if (strcmp(op, "push") == 0 && argc == 1) {
+    if (op_is(op, "push") && argc == 1) {
         buf_appendf(text, "  push %s%s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_operand(args[0], line_no, op));
         return;
     }
-    if (strcmp(op, "pop") == 0 && argc == 1) {
+    if (op_is(op, "pop") && argc == 1) {
         buf_appendf(text, "  pop %s%s\n", x86_reg_is_spilled(args[0]) ? "qword " : "", x86_reg(args[0], line_no, op));
         return;
     }
-    if ((strcmp(op, "jmp") == 0 || strcmp(op, "call") == 0 || strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 ||
-         strcmp(op, "jg") == 0 || strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
-         strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 || strcmp(op, "jbe") == 0) && argc == 1) {
+    if ((op_is(op, "jmp") || op_is(op, "call") || op_is(op, "je") || op_is(op, "jne") ||
+         op_is(op, "jg") || op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") ||
+         op_is(op, "ja") || op_is(op, "jb") || op_is(op, "jae") || op_is(op, "jbe")) && argc == 1) {
         buf_appendf(text, "  %s %s\n", op, args[0]); return;
     }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
-    if (strcmp(op, "syscall") == 0) { emit_x86_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "syscall")) { emit_x86_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
 
@@ -2753,13 +2790,13 @@ static void rv_flush_compare(Buffer *text) {
 
 /* Instructions whose first operand is the register they write. */
 static bool rv_writes_first_arg(const char *op) {
-    return strcmp(op, "mov") == 0 || strcmp(op, "load_addr") == 0 || strcmp(op, "load") == 0 ||
-           strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-           strcmp(op, "or") == 0 || strcmp(op, "xor") == 0 || strcmp(op, "shl") == 0 ||
-           strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0 || strcmp(op, "neg") == 0 ||
-           strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0 ||
-           strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 || strcmp(op, "mod") == 0 ||
-           strcmp(op, "pop") == 0;
+    return op_is(op, "mov") || op_is(op, "load_addr") || op_is(op, "load") ||
+           op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+           op_is(op, "or") || op_is(op, "xor") || op_is(op, "shl") ||
+           op_is(op, "shr") || op_is(op, "sar") || op_is(op, "neg") ||
+           op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") ||
+           op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod") ||
+           op_is(op, "pop");
 }
 
 static bool rv_compare_reads(const char *reg) {
@@ -2777,19 +2814,19 @@ static void rv_discard_compare(void) {
 }
 
 static bool rv_is_conditional_branch(const char *op) {
-    return strcmp(op, "je") == 0 || strcmp(op, "jne") == 0 || strcmp(op, "jg") == 0 ||
-           strcmp(op, "jl") == 0 || strcmp(op, "jge") == 0 || strcmp(op, "jle") == 0 ||
-           strcmp(op, "ja") == 0 || strcmp(op, "jb") == 0 || strcmp(op, "jae") == 0 ||
-           strcmp(op, "jbe") == 0;
+    return op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") ||
+           op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") ||
+           op_is(op, "ja") || op_is(op, "jb") || op_is(op, "jae") ||
+           op_is(op, "jbe");
 }
 
 static void rv_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
     const char *mnemonic =
-        strcmp(op, "je") == 0 ? "beq" : strcmp(op, "jne") == 0 ? "bne" :
-        strcmp(op, "jg") == 0 ? "bgt" : strcmp(op, "jl") == 0 ? "blt" :
-        strcmp(op, "jge") == 0 ? "bge" : strcmp(op, "jle") == 0 ? "ble" :
-        strcmp(op, "ja") == 0 ? "bgtu" : strcmp(op, "jb") == 0 ? "bltu" :
-        strcmp(op, "jae") == 0 ? "bgeu" : "bleu";
+        op_is(op, "je") ? "beq" : op_is(op, "jne") ? "bne" :
+        op_is(op, "jg") ? "bgt" : op_is(op, "jl") ? "blt" :
+        op_is(op, "jge") ? "bge" : op_is(op, "jle") ? "ble" :
+        op_is(op, "ja") ? "bgtu" : op_is(op, "jb") ? "bltu" :
+        op_is(op, "jae") ? "bgeu" : "bleu";
     const char *rhs;
     if (rv_cmp_state == RV_CMP_NONE) {
         line_error(line_no, op, "conditional jump with no preceding cmp");
@@ -2812,7 +2849,7 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
        "cmp, branch, carry on" sequence. A call is enough on its own: the
        operands live in caller-saved registers. */
     if (!rv_is_conditional_branch(op) && strcmp(op, "cmp") != 0) {
-        if (strcmp(op, "call") == 0) {
+        if (op_is(op, "call")) {
             rv_flush_compare(text);
         } else if (argc >= 1 && rv_writes_first_arg(op)) {
             int dst = virtual_reg_index(args[0]);
@@ -2821,9 +2858,9 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
             }
         }
     }
-    if (strcmp(op, "func") == 0 && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
-    if (strcmp(op, "endfunc") == 0 && argc == 0) return;
-    if (strcmp(op, "enter") == 0 && argc == 1) {
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
         long frame;
         buf_append(text, "  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
         if (strcmp(args[0], "0") == 0) {
@@ -2838,20 +2875,20 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
         }
         return;
     }
-    if (strcmp(op, "leave") == 0 && argc == 0) {
+    if (op_is(op, "leave") && argc == 0) {
         buf_append(text, "  mv sp, s0\n  ld s0, 0(sp)\n  ld ra, 8(sp)\n  addi sp, sp, 16\n"); return;
     }
-    if (strcmp(op, "mov") == 0 && argc == 2) {
+    if (op_is(op, "mov") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         if (src >= 0) buf_appendf(text, "  mv %s, %s\n", rv_reg(args[0], line_no, op), rv_regs[src]);
         else buf_appendf(text, "  li %s, %s\n", rv_reg(args[0], line_no, op), args[1]);
         return;
     }
-    if (strcmp(op, "load_addr") == 0 && argc == 2) { buf_appendf(text, "  la %s, %s\n", rv_reg(args[0], line_no, op), args[1]); return; }
-    if ((strcmp(op, "load") == 0 || strcmp(op, "store") == 0) && argc == 2) {
+    if (op_is(op, "load_addr") && argc == 2) { buf_appendf(text, "  la %s, %s\n", rv_reg(args[0], line_no, op), args[1]); return; }
+    if ((op_is(op, "load") || op_is(op, "store")) && argc == 2) {
         long off = 0;
         const char *base;
-        if (strcmp(op, "load") == 0) {
+        if (op_is(op, "load")) {
             rv_emit_address_setup(text, args[1], "a6", line_no, op);
             base = rv_address_base(args[1], "a6", line_no, op, &off);
             char offstr[32]; snprintf(offstr, sizeof(offstr), "%ld", off);
@@ -2868,8 +2905,8 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
         }
         return;
     }
-    if ((strcmp(op, "add") == 0 || strcmp(op, "sub") == 0 || strcmp(op, "and") == 0 ||
-         strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) && argc == 2) {
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
         int src = virtual_reg_index(args[1]);
         const char *dst = rv_reg(args[0], line_no, op);
         long value;
@@ -2881,12 +2918,12 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
            lowering spelled that by writing a minus in front of the operand
            text, which turned "sub r0, -5" into "addi t0, t0, --5"; negating
            the parsed value instead keeps both signs working. */
-        if (rv_parse_long(args[1], &value) && !(strcmp(op, "sub") == 0 && value == LONG_MIN)) {
-            long applied = strcmp(op, "sub") == 0 ? -value : value;
+        if (rv_parse_long(args[1], &value) && !(op_is(op, "sub") && value == LONG_MIN)) {
+            long applied = op_is(op, "sub") ? -value : value;
             if (rv_fits_imm12(applied)) {
-                const char *immop = strcmp(op, "and") == 0 ? "andi" :
-                                    strcmp(op, "or") == 0 ? "ori" :
-                                    strcmp(op, "xor") == 0 ? "xori" : "addi";
+                const char *immop = op_is(op, "and") ? "andi" :
+                                    op_is(op, "or") ? "ori" :
+                                    op_is(op, "xor") ? "xori" : "addi";
                 buf_appendf(text, "  %s %s, %s, %ld\n", immop, dst, dst, applied);
                 return;
             }
@@ -2897,29 +2934,29 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
         buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, RV_SCRATCH);
         return;
     }
-    if ((strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) && argc == 2) {
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
         int src = virtual_reg_index(args[1]);
-        const char *native = strcmp(op, "shl") == 0 ? "sll" : (strcmp(op, "shr") == 0 ? "srl" : "sra");
-        const char *nativei = strcmp(op, "shl") == 0 ? "slli" : (strcmp(op, "shr") == 0 ? "srli" : "srai");
+        const char *native = op_is(op, "shl") ? "sll" : (op_is(op, "shr") ? "srl" : "sra");
+        const char *nativei = op_is(op, "shl") ? "slli" : (op_is(op, "shr") ? "srli" : "srai");
         if (src >= 0) buf_appendf(text, "  %s %s, %s, ", native, rv_reg(args[0], line_no, op), rv_reg(args[0], line_no, op));
         else buf_appendf(text, "  %s %s, %s, ", nativei, rv_reg(args[0], line_no, op), rv_reg(args[0], line_no, op));
         buf_append(text, src >= 0 ? rv_regs[src] : args[1]); buf_append(text, "\n"); return;
     }
-    if ((strcmp(op, "neg") == 0 || strcmp(op, "not") == 0 || strcmp(op, "inc") == 0 || strcmp(op, "dec") == 0) && argc == 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         const char *dst = rv_reg(args[0], line_no, op);
-        if (strcmp(op, "neg") == 0) buf_appendf(text, "  neg %s, %s\n", dst, dst);
-        else if (strcmp(op, "not") == 0) buf_appendf(text, "  not %s, %s\n", dst, dst);
-        else buf_appendf(text, strcmp(op, "inc") == 0 ? "  addi %s, %s, 1\n" : "  addi %s, %s, -1\n", dst, dst);
+        if (op_is(op, "neg")) buf_appendf(text, "  neg %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  not %s, %s\n", dst, dst);
+        else buf_appendf(text, op_is(op, "inc") ? "  addi %s, %s, 1\n" : "  addi %s, %s, -1\n", dst, dst);
         return;
     }
-    if ((strcmp(op, "mul") == 0 || strcmp(op, "div") == 0 || strcmp(op, "mod") == 0) && argc == 2) {
+    if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
         int src = virtual_reg_index(args[1]);
-        const char *native = strcmp(op, "mul") == 0 ? "mul" : (strcmp(op, "div") == 0 ? "div" : "rem");
+        const char *native = op_is(op, "mul") ? "mul" : (op_is(op, "div") ? "div" : "rem");
         if (src < 0) buf_appendf(text, "  li a6, %s\n", args[1]);
         buf_appendf(text, "  %s %s, %s, ", native, rv_reg(args[0], line_no, op), rv_reg(args[0], line_no, op));
         buf_append(text, src >= 0 ? rv_regs[src] : "a6"); buf_append(text, "\n"); return;
     }
-    if (strcmp(op, "cmp") == 0 && argc == 2) {
+    if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         snprintf(rv_cmp_lhs, sizeof(rv_cmp_lhs), "%s", rv_reg(args[0], line_no, op));
         if (src >= 0) {
@@ -2936,17 +2973,17 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
         rv_emit_branch(text, op, args[0], line_no);
         return;
     }
-    if (strcmp(op, "push") == 0 && argc == 1) {
+    if (op_is(op, "push") && argc == 1) {
         int src = virtual_reg_index(args[0]);
         if (src < 0) buf_appendf(text, "  li a6, %s\n", args[0]);
         buf_append(text, "  addi sp, sp, -8\n");
         buf_appendf(text, "  sd %s, 0(sp)\n", src >= 0 ? rv_regs[src] : "a6"); return;
     }
-    if (strcmp(op, "pop") == 0 && argc == 1) { buf_appendf(text, "  ld %s, 0(sp)\n  addi sp, sp, 8\n", rv_reg(args[0], line_no, op)); return; }
-    if (strcmp(op, "jmp") == 0 && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
-    if (strcmp(op, "call") == 0 && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
-    if (strcmp(op, "ret") == 0 && argc == 0) { buf_append(text, "  ret\n"); return; }
-    if (strcmp(op, "syscall") == 0) { emit_rv_syscall(text, args, argc, line_no); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "  ld %s, 0(sp)\n  addi sp, sp, 8\n", rv_reg(args[0], line_no, op)); return; }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "syscall")) { emit_rv_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
 
@@ -3028,12 +3065,30 @@ typedef struct {
     bool has_pending;
     char pending[512];
     int pending_line_no;
+    /* A pending line is always a "mov <vreg>, <immediate>", so its parsed form
+       travels with the text. Recovering it by re-parsing on every following
+       instruction was the single largest cost of -O1. */
+    char pending_reg[128];
+    long pending_value;
 } Optimizer;
 
+/* emit_text_line() rewrites the line it is given in place, so it needs a
+   mutable copy. The copy lives in a buffer reused across lines rather than
+   being allocated and freed once per line. */
+static char *line_scratch = NULL;
+static size_t line_scratch_cap = 0;
+
 static void emit_text_line_copy(Buffer *text, const char *line, int line_no, const char *target) {
-    char *copy = xstrdup(line);
-    emit_text_line(text, copy, line_no, target);
-    free(copy);
+    size_t len = strlen(line);
+    if (len + 1 > line_scratch_cap) {
+        size_t cap = line_scratch_cap ? line_scratch_cap : 256;
+        while (cap < len + 1) cap *= 2;
+        free(line_scratch);
+        line_scratch = xmalloc(cap);
+        line_scratch_cap = cap;
+    }
+    memcpy(line_scratch, line, len + 1);
+    emit_text_line(text, line_scratch, line_no, target);
 }
 
 static bool opt_parse_long(const char *text, long *value) {
@@ -3074,8 +3129,9 @@ static bool opt_parse_instruction(const char *line, OptInstruction *out) {
     }
     if (out->argc > 3) return false;
     for (int i = 0; i < out->argc; i++) {
-        if (strlen(args[i]) >= sizeof(out->args[i])) return false;
-        snprintf(out->args[i], sizeof(out->args[i]), "%s", args[i]);
+        size_t arg_len = strlen(args[i]);
+        if (arg_len >= sizeof(out->args[i])) return false;
+        memcpy(out->args[i], args[i], arg_len + 1);
     }
     return true;
 }
@@ -3084,14 +3140,16 @@ static bool opt_is_mov_imm(const OptInstruction *ins, char *reg, long *value) {
     long parsed;
     if (ins->label || ins->directive || strcmp(ins->base_op, "mov") != 0 || ins->argc != 2) return false;
     if (virtual_reg_index(ins->args[0]) < 0 || !opt_parse_long(ins->args[1], &parsed)) return false;
-    if (reg) snprintf(reg, 128, "%s", ins->args[0]);
+    if (reg) memcpy(reg, ins->args[0], strlen(ins->args[0]) + 1);
     if (value) *value = parsed;
     return true;
 }
 
-static bool opt_set_pending(Optimizer *opt, const char *line, int line_no) {
+static bool opt_set_pending(Optimizer *opt, const char *line, int line_no, const char *reg, long value) {
     if (strlen(line) >= sizeof(opt->pending)) return false;
     snprintf(opt->pending, sizeof(opt->pending), "%s", line);
+    snprintf(opt->pending_reg, sizeof(opt->pending_reg), "%s", reg);
+    opt->pending_value = value;
     opt->pending_line_no = line_no;
     opt->has_pending = true;
     return true;
@@ -3135,29 +3193,29 @@ static bool opt_safe_mul(long a, long b, long *out) {
 
 static bool opt_compute_binary(const char *op, long lhs, long rhs, long *result) {
     const long bits = (long)(sizeof(long) * CHAR_BIT);
-    if (strcmp(op, "add") == 0) return opt_safe_add(lhs, rhs, result);
-    if (strcmp(op, "sub") == 0) return opt_safe_sub(lhs, rhs, result);
-    if (strcmp(op, "mul") == 0) return opt_safe_mul(lhs, rhs, result);
-    if (strcmp(op, "div") == 0) {
+    if (op_is(op, "add")) return opt_safe_add(lhs, rhs, result);
+    if (op_is(op, "sub")) return opt_safe_sub(lhs, rhs, result);
+    if (op_is(op, "mul")) return opt_safe_mul(lhs, rhs, result);
+    if (op_is(op, "div")) {
         if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
         *result = lhs / rhs;
         return true;
     }
-    if (strcmp(op, "mod") == 0) {
+    if (op_is(op, "mod")) {
         if (rhs == 0 || (lhs == LONG_MIN && rhs == -1)) return false;
         *result = lhs % rhs;
         return true;
     }
-    if (strcmp(op, "and") == 0 || strcmp(op, "or") == 0 || strcmp(op, "xor") == 0) {
+    if (op_is(op, "and") || op_is(op, "or") || op_is(op, "xor")) {
         if (lhs < 0 || rhs < 0) return false;
-        if (strcmp(op, "and") == 0) *result = lhs & rhs;
-        else if (strcmp(op, "or") == 0) *result = lhs | rhs;
+        if (op_is(op, "and")) *result = lhs & rhs;
+        else if (op_is(op, "or")) *result = lhs | rhs;
         else *result = lhs ^ rhs;
         return true;
     }
-    if (strcmp(op, "shl") == 0 || strcmp(op, "shr") == 0 || strcmp(op, "sar") == 0) {
+    if (op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) {
         if (lhs < 0 || rhs < 0 || rhs >= bits - 1) return false;
-        if (strcmp(op, "shl") == 0) {
+        if (op_is(op, "shl")) {
             if (lhs > (LONG_MAX >> rhs)) return false;
             *result = lhs << rhs;
         } else {
@@ -3176,7 +3234,7 @@ static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_
     if (ins->label || ins->directive || ins->argc < 1) return false;
     dst = virtual_reg_index(ins->args[0]);
     if (dst < 0) return false;
-    if (strcmp(ins->base_op, "mov") == 0 && ins->argc == 2) {
+    if (op_is(ins->base_op, "mov") && ins->argc == 2) {
         src = virtual_reg_index(ins->args[1]);
         if (src == dst) {
             *skip = true;
@@ -3187,36 +3245,36 @@ static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_
     if (ins->argc != 2) return false;
     src = virtual_reg_index(ins->args[1]);
     if (src == dst) {
-        if (strcmp(ins->base_op, "or") == 0 || strcmp(ins->base_op, "and") == 0) {
+        if (op_is(ins->base_op, "or") || op_is(ins->base_op, "and")) {
             *skip = true;
             return true;
         }
-        if (strcmp(ins->base_op, "sub") == 0 || strcmp(ins->base_op, "xor") == 0) {
+        if (op_is(ins->base_op, "sub") || op_is(ins->base_op, "xor")) {
             snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
             return true;
         }
     }
     if (!opt_parse_long(ins->args[1], &value)) return false;
-    if ((strcmp(ins->base_op, "add") == 0 || strcmp(ins->base_op, "sub") == 0 ||
-         strcmp(ins->base_op, "or") == 0 || strcmp(ins->base_op, "xor") == 0 ||
-         strcmp(ins->base_op, "shl") == 0 || strcmp(ins->base_op, "shr") == 0 ||
-         strcmp(ins->base_op, "sar") == 0) && value == 0) {
+    if ((op_is(ins->base_op, "add") || op_is(ins->base_op, "sub") ||
+         op_is(ins->base_op, "or") || op_is(ins->base_op, "xor") ||
+         op_is(ins->base_op, "shl") || op_is(ins->base_op, "shr") ||
+         op_is(ins->base_op, "sar")) && value == 0) {
         *skip = true;
         return true;
     }
-    if ((strcmp(ins->base_op, "mul") == 0 || strcmp(ins->base_op, "div") == 0) && value == 1) {
+    if ((op_is(ins->base_op, "mul") || op_is(ins->base_op, "div")) && value == 1) {
         *skip = true;
         return true;
     }
-    if (strcmp(ins->base_op, "and") == 0 && value == -1) {
+    if (op_is(ins->base_op, "and") && value == -1) {
         *skip = true;
         return true;
     }
-    if ((strcmp(ins->base_op, "and") == 0 || strcmp(ins->base_op, "mul") == 0) && value == 0) {
+    if ((op_is(ins->base_op, "and") || op_is(ins->base_op, "mul")) && value == 0) {
         snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
         return true;
     }
-    if (strcmp(ins->base_op, "mod") == 0 && value == 1) {
+    if (op_is(ins->base_op, "mod") && value == 1) {
         snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
         return true;
     }
@@ -3224,21 +3282,19 @@ static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_
 }
 
 static bool opt_try_absorb_pending(Optimizer *opt, const OptInstruction *current, const char *current_line, int line_no) {
-    OptInstruction pending;
-    char pending_reg[128];
     char current_reg[128];
-    long lhs;
+    long current_value;
     long rhs;
     long result;
-    if (!opt->has_pending || !opt_parse_instruction(opt->pending, &pending)) return false;
-    if (!opt_is_mov_imm(&pending, pending_reg, &lhs)) return false;
-    if (opt_is_mov_imm(current, current_reg, NULL) && strcmp(pending_reg, current_reg) == 0) {
-        return opt_set_pending(opt, current_line, line_no);
+    if (!opt->has_pending) return false;
+    if (opt_is_mov_imm(current, current_reg, &current_value) && strcmp(opt->pending_reg, current_reg) == 0) {
+        return opt_set_pending(opt, current_line, line_no, current_reg, current_value);
     }
     if (current->label || current->directive || current->argc != 2) return false;
-    if (strcmp(current->args[0], pending_reg) != 0 || !opt_parse_long(current->args[1], &rhs)) return false;
-    if (!opt_compute_binary(current->base_op, lhs, rhs, &result)) return false;
-    snprintf(opt->pending, sizeof(opt->pending), "mov %s, %ld", pending_reg, result);
+    if (strcmp(current->args[0], opt->pending_reg) != 0 || !opt_parse_long(current->args[1], &rhs)) return false;
+    if (!opt_compute_binary(current->base_op, opt->pending_value, rhs, &result)) return false;
+    snprintf(opt->pending, sizeof(opt->pending), "mov %s, %ld", opt->pending_reg, result);
+    opt->pending_value = result;
     opt->pending_line_no = line_no;
     return true;
 }
@@ -3247,6 +3303,8 @@ static void emit_text_line_optimized(Buffer *text, const char *line, int line_no
     OptInstruction parsed;
     OptInstruction current;
     char rewritten[512];
+    char current_reg[128];
+    long current_value;
     const char *candidate = line;
     bool skip = false;
     if (!opt->enabled) {
@@ -3277,9 +3335,9 @@ static void emit_text_line_optimized(Buffer *text, const char *line, int line_no
     if (opt_try_absorb_pending(opt, &current, candidate, line_no)) {
         return;
     }
-    if (opt_is_mov_imm(&current, NULL, NULL)) {
+    if (opt_is_mov_imm(&current, current_reg, &current_value)) {
         opt_flush(text, target, opt);
-        if (!opt_set_pending(opt, candidate, line_no)) {
+        if (!opt_set_pending(opt, candidate, line_no, current_reg, current_value)) {
             emit_text_line_copy(text, candidate, line_no, target);
         }
         return;
@@ -3324,6 +3382,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     Optimizer optimizer;
     char *cursor = source;
     const char *section = NULL;
+    enum { SECTION_NONE, SECTION_DATA, SECTION_RODATA, SECTION_BSS, SECTION_TEXT } section_kind = SECTION_NONE;
     int line_no = 0;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
     const bool i386 = is_i386_target(target);
@@ -3339,6 +3398,8 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;
     optimizer.pending[0] = '\0';
+    optimizer.pending_reg[0] = '\0';
+    optimizer.pending_value = 0;
     optimizer.pending_line_no = 0;
     buf_init(&constants); buf_init(&data); buf_init(&rodata); buf_init(&bss); buf_init(&text);
     while (*cursor) {
@@ -3350,12 +3411,22 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         strip_comment(line);
         line = trim(line);
         if (*line == '\0') continue;
-        if (strcmp(line, ".data") == 0 || strcmp(line, ".rodata") == 0 || strcmp(line, ".bss") == 0 || strcmp(line, ".text") == 0) {
-            opt_flush(&text, target, &optimizer);
-            section = line + 1;
-            continue;
+        /* Classifying a line used to cost about ten string comparisons, on
+           every line. Gating each family on its first character skips nearly
+           all of them, and the section is remembered as a code so the text
+           path stops re-deriving it from a name. */
+        if (line[0] == '.') {
+            if (strcmp(line, ".data") == 0 || strcmp(line, ".rodata") == 0 ||
+                strcmp(line, ".bss") == 0 || strcmp(line, ".text") == 0) {
+                opt_flush(&text, target, &optimizer);
+                section = line + 1;
+                section_kind = strcmp(section, "data") == 0 ? SECTION_DATA :
+                               strcmp(section, "rodata") == 0 ? SECTION_RODATA :
+                               strcmp(section, "bss") == 0 ? SECTION_BSS : SECTION_TEXT;
+                continue;
+            }
         }
-        if (strncmp(line, "const ", 6) == 0) {
+        if (line[0] == 'c' && strncmp(line, "const ", 6) == 0) {
             char *name = trim(line + 6);
             char *eq = strchr(name, '=');
             if (!eq) line_error(line_no, "const", "expected const NAME = VALUE");
@@ -3372,15 +3443,16 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             else if (generic) buf_appendf(&constants, "; const %s = %s\n", name, value);
             continue;
         }
-        if (strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0) {
+        if ((line[0] == 'g' && strncmp(line, "global ", 7) == 0) ||
+            (line[0] == 'e' && strncmp(line, "extern ", 7) == 0)) {
             emit_text_line_optimized(&text, line, line_no, target, &optimizer);
             continue;
         }
-        if (!section) line_error(line_no, "section", "expected .data, .rodata, .bss, or .text");
-        if (strcmp(section, "data") == 0) emit_data_line(&data, &constants, line, line_no, target, section);
-        else if (strcmp(section, "rodata") == 0) emit_data_line(&rodata, &constants, line, line_no, target, section);
-        else if (strcmp(section, "bss") == 0) emit_data_line(&bss, &constants, line, line_no, target, section);
-        else emit_text_line_optimized(&text, line, line_no, target, &optimizer);
+        if (section_kind == SECTION_NONE) line_error(line_no, "section", "expected .data, .rodata, .bss, or .text");
+        if (section_kind == SECTION_TEXT) emit_text_line_optimized(&text, line, line_no, target, &optimizer);
+        else if (section_kind == SECTION_DATA) emit_data_line(&data, &constants, line, line_no, target, section);
+        else if (section_kind == SECTION_RODATA) emit_data_line(&rodata, &constants, line, line_no, target, section);
+        else emit_data_line(&bss, &constants, line, line_no, target, section);
     }
     opt_flush(&text, target, &optimizer);
     /* Only reserve backing store for the spilled virtual registers if the
@@ -3497,3 +3569,4 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
