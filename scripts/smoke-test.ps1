@@ -307,6 +307,23 @@ if (Get-Command riscv64-linux-gnu-as -ErrorAction SilentlyContinue) {
     Write-Host "no RISC-V assembler found; skipped assembling the RISC-V output."
 }
 
+if (Get-Command mips-linux-gnu-as -ErrorAction SilentlyContinue) {
+    foreach ($Example in $Examples) {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
+        foreach ($Target in @("mips1-gnu", "mips32-gnu", "micromips-gnu", "mips64-gnu")) {
+            $AsmPath = Join-Path $BuildPath "mips-$Target-$Name-pwsh.s"
+            $ObjPath = Join-Path $BuildPath "mips-$Target-$Name-pwsh.o"
+            Invoke-Native $CompilerExe @($Example.FullName, "--target", $Target, "-o", $AsmPath)
+            # The 64-bit member needs the wider instruction set enabled.
+            $Flags = if ($Target -eq "mips64-gnu") { @("-march=mips64") } else { @() }
+            Invoke-Native "mips-linux-gnu-as" ($Flags + @("-o", $ObjPath, $AsmPath))
+        }
+    }
+    Write-Host "the MIPS assembler accepted every MIPS output."
+} else {
+    Write-Host "no MIPS assembler found; skipped assembling the MIPS output."
+}
+
 if (Get-Command clang -ErrorAction SilentlyContinue) {
     $ClangBackends = @(
         @{ T = "aarch64-gnu"; Triple = "aarch64-unknown-linux-gnu"; P = "a64" },

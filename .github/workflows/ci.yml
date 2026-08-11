@@ -21,7 +21,8 @@ jobs:
       - name: Install assemblers
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm binutils-riscv64-linux-gnu gcc-multilib
+          sudo apt-get install -y nasm binutils-riscv64-linux-gnu \
+            binutils-mips-linux-gnu gcc-multilib
 
       - name: Run POSIX smoke tests
         run: make smoke

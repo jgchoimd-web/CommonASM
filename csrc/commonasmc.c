@@ -143,6 +143,7 @@ typedef enum {
     CLASS_TOY,
     CLASS_MMIX,
     CLASS_DCPU,
+    CLASS_MIPS,
     CLASS_ENCODING
 } TargetClass;
 
@@ -174,7 +175,8 @@ enum {
     TF_HAS_CLZ = 1u << 5,   /* ARMv5 and later */
     TF_HAS_REV = 1u << 6,   /* ARMv6 and later */
     TF_HAS_RBIT = 1u << 7,  /* ARMv6T2 and later */
-    TF_RV_ZBB = 1u << 8     /* RISC-V bit-manipulation extension */
+    TF_RV_ZBB = 1u << 8,    /* RISC-V bit-manipulation extension */
+    TF_64BIT = 1u << 9      /* a 64-bit member of an otherwise 32-bit family */
 };
 
 /* Operations the language offers on every target but that only some machines
@@ -221,10 +223,10 @@ static const TargetDesc target_table[] = {
     {"ia64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_IA64},
     {"loongarch64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_LOONG},
 
-    {"mips1-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"mips32-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"mips64-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"micromips-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"mips1-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
+    {"mips32-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
+    {"mips64-gnu", CLASS_MIPS, GROUP_LEGACY, TF_64BIT},
+    {"micromips-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
     {"power1-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"power2-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"ppc603-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
@@ -704,6 +706,10 @@ static bool is_legacy_arch_target(const char *target) {
     return target_has_class(target, CLASS_LEGACY);
 }
 
+static bool is_mips_target(const char *target) {
+    return target_has_class(target, CLASS_MIPS);
+}
+
 static bool is_vm_ir_target(const char *target) {
     return target_has_class(target, CLASS_VM_IR);
 }
@@ -785,6 +791,7 @@ static int target_word_bits(const char *target) {
     if (!desc) return 64;
     if (desc->cls == CLASS_DCPU) return 16;
     if (desc->cls == CLASS_I386) return 32;
+    if (desc->cls == CLASS_MIPS) return (desc->flags & TF_64BIT) ? 64 : 32;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
     return 64;
 }
@@ -869,6 +876,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_X86_64: return "NASM x86-64 assembly";
         case CLASS_RV64: return "GNU RISC-V 64 assembly";
         case CLASS_I386: return "NASM i386 assembly";
+        case CLASS_MIPS: return "GNU MIPS assembly";
         case CLASS_GENERIC:
         case CLASS_LEGACY: return "assembly-style text output";
         case CLASS_VM_IR: return "VM or compiler IR-style text output";
@@ -1359,7 +1367,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -3023,25 +3031,34 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
 
-/* RISC-V has no condition flags, so a compare has to survive to its branch
-   some other way. The old lowering copied both operands into a6/a7 and
+/* A machine without condition flags has to get a compare to its branch some
+   other way. The old RISC-V lowering copied both operands into a6/a7 and
    branched on those, but a6/a7 are also the scratch and syscall-number
    registers, so any syscall between the compare and the branch silently
    replaced the comparison. The operands are recorded instead and folded into
    the branch itself, which is both correct and two instructions shorter. When
    an unrelated instruction comes between the two, the comparison is first
-   snapshotted into s10/s11 - registers nothing else touches - so it still
-   describes the values as of the compare. */
-typedef enum { RV_CMP_NONE, RV_CMP_PENDING, RV_CMP_SNAPSHOT } RvCompareState;
+   snapshotted into a register pair nothing else touches, so it still
+   describes the values as of the compare.
 
-#define RV_CMP_LHS_REG "s10"
-#define RV_CMP_RHS_REG "s11"
+   RISC-V and MIPS both work this way and spell the comparing branches the
+   same, so they share this and differ only in the registers they snapshot
+   into and how they spell a register-to-register move. */
+typedef enum { CMP_NONE, CMP_PENDING, CMP_SNAPSHOT } CompareState;
+
+typedef struct {
+    CompareState state;
+    char lhs[64];
+    char rhs[64];
+    bool rhs_is_reg;
+    const char *lhs_snapshot;
+    const char *rhs_snapshot;
+    const char *move_op;
+} DeferredCompare;
+
 #define RV_SCRATCH "a6"
 
-static RvCompareState rv_cmp_state = RV_CMP_NONE;
-static char rv_cmp_lhs[64];
-static char rv_cmp_rhs[64];
-static bool rv_cmp_rhs_is_reg = false;
+static DeferredCompare rv_cmp = {CMP_NONE, {0}, {0}, false, "s10", "s11", "mv"};
 
 static bool rv_parse_long(const char *text, long long *value) {
     char *end = NULL;
@@ -3056,50 +3073,60 @@ static bool rv_fits_imm12(long long value) {
     return value >= -2048 && value <= 2047;
 }
 
-static void rv_flush_compare(Buffer *text) {
-    if (rv_cmp_state != RV_CMP_PENDING) return;
-    buf_appendf(text, "  mv %s, %s\n", RV_CMP_LHS_REG, rv_cmp_lhs);
-    if (rv_cmp_rhs_is_reg) buf_appendf(text, "  mv %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
-    else buf_appendf(text, "  li %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
-    snprintf(rv_cmp_lhs, sizeof(rv_cmp_lhs), "%s", RV_CMP_LHS_REG);
-    snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", RV_CMP_RHS_REG);
-    rv_cmp_rhs_is_reg = true;
-    rv_cmp_state = RV_CMP_SNAPSHOT;
+static void compare_flush(Buffer *text, DeferredCompare *cmp) {
+    if (cmp->state != CMP_PENDING) return;
+    buf_appendf(text, "  %s %s, %s\n", cmp->move_op, cmp->lhs_snapshot, cmp->lhs);
+    if (cmp->rhs_is_reg) buf_appendf(text, "  %s %s, %s\n", cmp->move_op, cmp->rhs_snapshot, cmp->rhs);
+    else buf_appendf(text, "  li %s, %s\n", cmp->rhs_snapshot, cmp->rhs);
+    snprintf(cmp->lhs, sizeof(cmp->lhs), "%s", cmp->lhs_snapshot);
+    snprintf(cmp->rhs, sizeof(cmp->rhs), "%s", cmp->rhs_snapshot);
+    cmp->rhs_is_reg = true;
+    cmp->state = CMP_SNAPSHOT;
 }
 
 /* Instructions whose first operand is the register they write. */
-static bool rv_writes_first_arg(const char *op) {
+static bool writes_first_arg(const char *op) {
     return op_is(op, "mov") || op_is(op, "load_addr") || op_is(op, "load") ||
            op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
            op_is(op, "or") || op_is(op, "xor") || op_is(op, "shl") ||
            op_is(op, "shr") || op_is(op, "sar") || op_is(op, "neg") ||
            op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") ||
            op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod") ||
-           op_is(op, "pop");
+           op_is(op, "pop") || op_is(op, "popcnt") || op_is(op, "clz") ||
+           op_is(op, "ctz") || op_is(op, "bswap") || op_is(op, "rol") ||
+           op_is(op, "ror");
 }
 
-static bool rv_compare_reads(const char *reg) {
-    if (rv_cmp_state != RV_CMP_PENDING) return false;
-    if (strcmp(rv_cmp_lhs, reg) == 0) return true;
-    return rv_cmp_rhs_is_reg && strcmp(rv_cmp_rhs, reg) == 0;
+static bool compare_reads(const DeferredCompare *cmp, const char *reg) {
+    if (cmp->state != CMP_PENDING) return false;
+    if (strcmp(cmp->lhs, reg) == 0) return true;
+    return cmp->rhs_is_reg && strcmp(cmp->rhs, reg) == 0;
+}
+
+static void compare_record(DeferredCompare *cmp, const char *lhs, const char *rhs, bool rhs_is_reg) {
+    snprintf(cmp->lhs, sizeof(cmp->lhs), "%s", lhs);
+    snprintf(cmp->rhs, sizeof(cmp->rhs), "%s", rhs);
+    cmp->rhs_is_reg = rhs_is_reg;
+    cmp->state = CMP_PENDING;
 }
 
 /* A label starts a new basic block, so a comparison recorded before it no
    longer describes the state of anything that jumps here. It is dropped
    rather than snapshotted: writing the snapshot out would only leave dead
    copies behind the common case where a branch already consumed it. */
-static void rv_discard_compare(void) {
-    rv_cmp_state = RV_CMP_NONE;
+static void compare_discard(DeferredCompare *cmp) {
+    cmp->state = CMP_NONE;
 }
 
-static bool rv_is_conditional_branch(const char *op) {
+static bool is_conditional_branch(const char *op) {
     return op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") ||
            op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") ||
            op_is(op, "ja") || op_is(op, "jb") || op_is(op, "jae") ||
            op_is(op, "jbe");
 }
 
-static void rv_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
+static void compare_emit_branch(Buffer *text, DeferredCompare *cmp, const char *op,
+                                const char *label, int line_no) {
     const char *mnemonic =
         op_is(op, "je") ? "beq" : op_is(op, "jne") ? "bne" :
         op_is(op, "jg") ? "bgt" : op_is(op, "jl") ? "blt" :
@@ -3107,18 +3134,18 @@ static void rv_emit_branch(Buffer *text, const char *op, const char *label, int 
         op_is(op, "ja") ? "bgtu" : op_is(op, "jb") ? "bltu" :
         op_is(op, "jae") ? "bgeu" : "bleu";
     const char *rhs;
-    if (rv_cmp_state == RV_CMP_NONE) {
+    if (cmp->state == CMP_NONE) {
         line_error(line_no, op, "conditional jump with no preceding cmp");
     }
-    if (rv_cmp_rhs_is_reg) {
-        rhs = rv_cmp_rhs;
+    if (cmp->rhs_is_reg) {
+        rhs = cmp->rhs;
     } else {
         /* Branches compare registers only, so an immediate operand is
            materialised at the branch rather than kept live in a register. */
-        buf_appendf(text, "  li %s, %s\n", RV_CMP_RHS_REG, rv_cmp_rhs);
-        rhs = RV_CMP_RHS_REG;
+        buf_appendf(text, "  li %s, %s\n", cmp->rhs_snapshot, cmp->rhs);
+        rhs = cmp->rhs_snapshot;
     }
-    buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, rv_cmp_lhs, rhs, label);
+    buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, cmp->lhs, rhs, label);
 }
 
 static void emit_rv_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
@@ -3127,13 +3154,13 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
        instruction instead would leave dead copies behind after the common
        "cmp, branch, carry on" sequence. A call is enough on its own: the
        operands live in caller-saved registers. */
-    if (!rv_is_conditional_branch(op) && strcmp(op, "cmp") != 0) {
+    if (!is_conditional_branch(op) && strcmp(op, "cmp") != 0) {
         if (op_is(op, "call")) {
-            rv_flush_compare(text);
-        } else if (argc >= 1 && rv_writes_first_arg(op)) {
+            compare_flush(text, &rv_cmp);
+        } else if (argc >= 1 && writes_first_arg(op)) {
             int dst = virtual_reg_index(args[0]);
-            if (dst >= 0 && rv_compare_reads(rv_regs[dst])) {
-                rv_flush_compare(text);
+            if (dst >= 0 && compare_reads(&rv_cmp, rv_regs[dst])) {
+                compare_flush(text, &rv_cmp);
             }
         }
     }
@@ -3260,19 +3287,12 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     }
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
-        snprintf(rv_cmp_lhs, sizeof(rv_cmp_lhs), "%s", rv_reg(args[0], line_no, op));
-        if (src >= 0) {
-            snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", rv_regs[src]);
-            rv_cmp_rhs_is_reg = true;
-        } else {
-            snprintf(rv_cmp_rhs, sizeof(rv_cmp_rhs), "%s", args[1]);
-            rv_cmp_rhs_is_reg = false;
-        }
-        rv_cmp_state = RV_CMP_PENDING;
+        compare_record(&rv_cmp, rv_reg(args[0], line_no, op),
+                       src >= 0 ? rv_regs[src] : args[1], src >= 0);
         return;
     }
-    if (rv_is_conditional_branch(op) && argc == 1) {
-        rv_emit_branch(text, op, args[0], line_no);
+    if (is_conditional_branch(op) && argc == 1) {
+        compare_emit_branch(text, &rv_cmp, op, args[0], line_no);
         return;
     }
     if (op_is(op, "push") && argc == 1) {
@@ -3477,6 +3497,277 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
     return true;
 }
 
+/* ------------------------------------------------------------------- MIPS */
+
+/* $zero, $at, $k0, $k1, $gp, $sp, $fp and $ra belong to the machine and the
+   assembler, and $v0 and $a0-$a3 carry the syscall convention, so none of
+   them appear here. That leaves the callee-saved set and eight temporaries
+   for the sixteen virtual registers, with $t8 and $t9 held back for a
+   deferred comparison and $v1 as the scratch. $at is left alone because the
+   assembler's own macros - la, a wide li, the comparing branches - use it. */
+static const char *mips_regs[] = {
+    "$s0", "$s1", "$s2", "$s3", "$s4", "$s5", "$s6", "$s7",
+    "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7"
+};
+
+#define MIPS_SCRATCH "$v1"
+
+static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move"};
+
+static bool mips_is_64(const char *target) {
+    return target_word_bits(target) == 64;
+}
+
+static const char *mips_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return mips_regs[reg];
+}
+
+/* addiu and the logical immediates take a 16-bit field. */
+static bool mips_fits_imm16(const char *value, long long *out, bool signed_field) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0) return false;
+    if (signed_field ? (parsed < -32768 || parsed > 32767) : (parsed < 0 || parsed > 65535)) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+/* Returns a register holding the operand, materialising it into the scratch
+   when it is not already one. */
+static const char *mips_operand_reg(Buffer *text, const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return mips_regs[reg];
+    if (is_int(value) || is_known_constant(value)) {
+        buf_appendf(text, "  li %s, %s\n", MIPS_SCRATCH, value);
+    } else if (is_symbol(value)) {
+        buf_appendf(text, "  la %s, %s\n", MIPS_SCRATCH, value);
+    } else {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    return MIPS_SCRATCH;
+}
+
+static void mips_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                              int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        snprintf(out, out_size, "%lld(%s)", addr.offset, mips_reg(addr.base, line_no, op));
+        return;
+    }
+    /* A symbolic address has to be materialised; the assembler's own la macro
+       would otherwise need a base register anyway. */
+    buf_appendf(text, "  la %s, %s\n", MIPS_SCRATCH, addr.symbol);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, MIPS_SCRATCH);
+}
+
+static void emit_mips_syscall(Buffer *text, const char *target, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"$a0", "$a1", "$a2", "$a3"};
+    int number = -1;
+    int count;
+    (void)target;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (op_is(args[0], "exit")) number = 4001;
+    else if (op_is(args[0], "read")) number = 4003;
+    else if (op_is(args[0], "write")) number = 4004;
+    else if (op_is(args[0], "open")) number = 4005;
+    else if (op_is(args[0], "close")) number = 4006;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 4) count = 4;
+    /* No virtual register maps onto $v0 or $a0-$a3, so nothing needs saving. */
+    for (int i = 0; i < count; i++) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0) buf_appendf(text, "  move %s, %s\n", arg_regs[i], mips_regs[reg]);
+        else if (is_int(args[i + 1]) || is_known_constant(args[i + 1])) {
+            buf_appendf(text, "  li %s, %s\n", arg_regs[i], args[i + 1]);
+        } else {
+            buf_appendf(text, "  la %s, %s\n", arg_regs[i], args[i + 1]);
+        }
+    }
+    buf_appendf(text, "  li $v0, %d\n", number);
+    buf_append(text, "  syscall\n");
+}
+
+static void emit_mips_instruction(Buffer *text, const char *target, const char *op, const char *size,
+                                  char **args, int argc, int line_no) {
+    const bool wide = mips_is_64(target);
+    const char *addiu = wide ? "daddiu" : "addiu";
+    const char *addu = wide ? "daddu" : "addu";
+    const char *subu = wide ? "dsubu" : "subu";
+    const char *word_load = wide ? "ld" : "lw";
+    const char *word_store = wide ? "sd" : "sw";
+    const int slot = wide ? 8 : 4;
+
+    /* A pending comparison is pinned down before anything can disturb the
+       registers it names, and a call is enough on its own. */
+    if (!is_conditional_branch(op) && !op_is(op, "cmp")) {
+        if (op_is(op, "call")) {
+            compare_flush(text, &mips_cmp);
+        } else if (argc >= 1 && writes_first_arg(op)) {
+            int dst = virtual_reg_index(args[0]);
+            if (dst >= 0 && compare_reads(&mips_cmp, mips_regs[dst])) {
+                compare_flush(text, &mips_cmp);
+            }
+        }
+    }
+
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_appendf(text, "  %s $sp, $sp, -%d\n", addiu, slot * 2);
+        buf_appendf(text, "  %s $ra, %d($sp)\n", word_store, slot);
+        buf_appendf(text, "  %s $fp, 0($sp)\n", word_store);
+        buf_append(text, "  move $fp, $sp\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (mips_fits_imm16(args[0], &frame, true) && frame != -32768) {
+            buf_appendf(text, "  %s $sp, $sp, %lld\n", addiu, -frame);
+        } else {
+            buf_appendf(text, "  li %s, %s\n", MIPS_SCRATCH, args[0]);
+            buf_appendf(text, "  %s $sp, $sp, %s\n", subu, MIPS_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  move $sp, $fp\n");
+        buf_appendf(text, "  %s $fp, 0($sp)\n", word_load);
+        buf_appendf(text, "  %s $ra, %d($sp)\n", word_load, slot);
+        buf_appendf(text, "  %s $sp, $sp, %d\n", addiu, slot * 2);
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = mips_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) buf_appendf(text, "  move %s, %s\n", dst, mips_regs[src]);
+        else if (is_int(args[1]) || is_known_constant(args[1])) buf_appendf(text, "  li %s, %s\n", dst, args[1]);
+        else buf_appendf(text, "  la %s, %s\n", dst, args[1]);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        buf_appendf(text, "  la %s, %s\n", mips_reg(args[0], line_no, op), args[1]); return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        const char *dst = mips_reg(args[0], line_no, op);
+        const char *mnemonic = size[0] == 'b' ? "lbu" : size[0] == 'w' ? "lhu" :
+                               size[0] == 'd' ? "lw" : word_load;
+        mips_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        const char *mnemonic = size[0] == 'b' ? "sb" : size[0] == 'w' ? "sh" :
+                               size[0] == 'd' ? "sw" : word_store;
+        /* The value is materialised before the address, because both would
+           otherwise want the one scratch register. */
+        int src = virtual_reg_index(args[1]);
+        const char *value;
+        if (src >= 0) {
+            value = mips_regs[src];
+            mips_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        } else {
+            Address parsed;
+            if (!parse_address(args[0], &parsed)) {
+                line_error_token(line_no, args[0], op, "expected address like [r0 + 8] or [symbol + 8]");
+            }
+            if (!parsed.has_base) {
+                line_error_token(line_no, args[0], op,
+                                 "storing a constant to a symbol needs a register base on MIPS");
+            }
+            value = mips_operand_reg(text, args[1], line_no, op);
+            snprintf(addr, sizeof(addr), "%lld(%s)", parsed.offset, mips_reg(parsed.base, line_no, op));
+        }
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
+        const char *dst = mips_reg(args[0], line_no, op);
+        const bool logical = op_is(op, "and") || op_is(op, "or") || op_is(op, "xor");
+        long long value;
+        int src = virtual_reg_index(args[1]);
+        if (src < 0 && mips_fits_imm16(args[1], &value, !logical) &&
+            !(op_is(op, "sub") && value == -32768)) {
+            const char *immop = op_is(op, "and") ? "andi" : op_is(op, "or") ? "ori" :
+                                op_is(op, "xor") ? "xori" : addiu;
+            buf_appendf(text, "  %s %s, %s, %lld\n", immop, dst, dst,
+                        op_is(op, "sub") ? -value : value);
+            return;
+        }
+        {
+            const char *rhs = mips_operand_reg(text, args[1], line_no, op);
+            const char *native = op_is(op, "add") ? addu : op_is(op, "sub") ? subu : op;
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, rhs);
+        }
+        return;
+    }
+    if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        const char *dst = mips_reg(args[0], line_no, op);
+        const char *rhs = mips_operand_reg(text, args[1], line_no, op);
+        const char *native = op_is(op, "mul") ? (wide ? "dmul" : "mul") :
+                             op_is(op, "div") ? (wide ? "ddiv" : "div") : (wide ? "drem" : "rem");
+        buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, rhs);
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *dst = mips_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *immop = op_is(op, "shl") ? (wide ? "dsll" : "sll") :
+                            op_is(op, "shr") ? (wide ? "dsrl" : "srl") : (wide ? "dsra" : "sra");
+        const char *regop = op_is(op, "shl") ? (wide ? "dsllv" : "sllv") :
+                            op_is(op, "shr") ? (wide ? "dsrlv" : "srlv") : (wide ? "dsrav" : "srav");
+        if (src >= 0) buf_appendf(text, "  %s %s, %s, %s\n", regop, dst, dst, mips_regs[src]);
+        else buf_appendf(text, "  %s %s, %s, %s\n", immop, dst, dst, args[1]);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = mips_reg(args[0], line_no, op);
+        if (op_is(op, "neg")) buf_appendf(text, "  %s %s, %s\n", wide ? "dnegu" : "negu", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  nor %s, %s, $zero\n", dst, dst);
+        else buf_appendf(text, "  %s %s, %s, %s\n", addiu, dst, dst, op_is(op, "inc") ? "1" : "-1");
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        int src = virtual_reg_index(args[1]);
+        compare_record(&mips_cmp, mips_reg(args[0], line_no, op),
+                       src >= 0 ? mips_regs[src] : args[1], src >= 0);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        compare_emit_branch(text, &mips_cmp, op, args[0], line_no);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = mips_operand_reg(text, args[0], line_no, op);
+        buf_appendf(text, "  %s $sp, $sp, -%d\n", addiu, slot);
+        buf_appendf(text, "  %s %s, 0($sp)\n", word_store, value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_appendf(text, "  %s %s, 0($sp)\n", word_load, mips_reg(args[0], line_no, op));
+        buf_appendf(text, "  %s $sp, $sp, %d\n", addiu, slot);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  jal %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  jr $ra\n"); return; }
+    if (op_is(op, "syscall")) { emit_mips_syscall(text, target, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for MIPS");
+}
+
 /* ---------------------------------------------------------- inline assembly */
 
 /* The operand text a backend uses for a virtual register, which is what an
@@ -3582,7 +3873,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (is_rv64_target(target) &&
         ((len > 0 && line[len - 1] == ':') ||
          strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0)) {
-        rv_discard_compare();
+        compare_discard(&rv_cmp);
     }
     if (len > 0 && line[len - 1] == ':') {
         line[len - 1] = '\0';
@@ -3594,7 +3885,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -3604,7 +3895,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -3646,6 +3937,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
     else if (is_generic_arch_target(target)) emit_generic_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_legacy_arch_target(target)) emit_arch_instruction(text, target, base_op, size, args, argc, line_no);
@@ -4001,7 +4293,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -4084,7 +4376,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             /* Verbatim text can do anything, so nothing the compiler was
                holding back may outlive it. */
             opt_flush(&text, target, &optimizer);
-            if (is_rv64_target(target)) rv_discard_compare();
+            if (is_rv64_target(target)) compare_discard(&rv_cmp);
             asm_target_buffer = section_kind == SECTION_DATA ? &data :
                                 section_kind == SECTION_RODATA ? &rodata :
                                 section_kind == SECTION_BSS ? &bss : &text;
@@ -4267,6 +4559,9 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
+
 
 
 

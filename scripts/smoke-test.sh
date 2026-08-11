@@ -188,6 +188,22 @@ else
   echo "no RISC-V assembler found; skipped assembling the RISC-V output."
 fi
 
+if command -v mips-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for target in mips1-gnu mips32-gnu micromips-gnu; do
+      "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/mips-${target}-${name}.s"
+      mips-linux-gnu-as -o "$BUILD_DIR/mips-${target}-${name}.o" "$BUILD_DIR/mips-${target}-${name}.s"
+    done
+    # The 64-bit member needs the wider instruction set enabled.
+    "$BUILD_DIR/commonasmc" "$example" --target mips64-gnu -o "$BUILD_DIR/mips-64-${name}.s"
+    mips-linux-gnu-as -march=mips64 -o "$BUILD_DIR/mips-64-${name}.o" "$BUILD_DIR/mips-64-${name}.s"
+  done
+  echo "the MIPS assembler accepted every MIPS output."
+else
+  echo "no MIPS assembler found; skipped assembling the MIPS output."
+fi
+
 if command -v clang > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
