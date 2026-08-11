@@ -195,13 +195,23 @@ if command -v mips-linux-gnu-as > /dev/null 2>&1; then
       "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/mips-${target}-${name}.s"
       mips-linux-gnu-as -o "$BUILD_DIR/mips-${target}-${name}.o" "$BUILD_DIR/mips-${target}-${name}.s"
     done
-    # The 64-bit member needs the wider instruction set enabled.
-    "$BUILD_DIR/commonasmc" "$example" --target mips64-gnu -o "$BUILD_DIR/mips-64-${name}.s"
-    mips-linux-gnu-as -march=mips64 -o "$BUILD_DIR/mips-64-${name}.o" "$BUILD_DIR/mips-64-${name}.s"
   done
-  echo "the MIPS assembler accepted every MIPS output."
+  echo "the MIPS assembler accepted every 32-bit MIPS output."
 else
   echo "no MIPS assembler found; skipped assembling the MIPS output."
+fi
+
+# mips64-gnu needs an assembler whose ABI is actually 64-bit: the 32-bit one
+# rejects a 64-bit immediate even with -march=mips64.
+if command -v mips64-linux-gnuabi64-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target mips64-gnu -o "$BUILD_DIR/mips64-${name}.s"
+    mips64-linux-gnuabi64-as -o "$BUILD_DIR/mips64-${name}.o" "$BUILD_DIR/mips64-${name}.s"
+  done
+  echo "the 64-bit MIPS assembler accepted every mips64-gnu output."
+else
+  echo "no 64-bit MIPS assembler found; skipped assembling the mips64-gnu output."
 fi
 
 if command -v clang > /dev/null 2>&1; then

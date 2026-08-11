@@ -310,18 +310,30 @@ if (Get-Command riscv64-linux-gnu-as -ErrorAction SilentlyContinue) {
 if (Get-Command mips-linux-gnu-as -ErrorAction SilentlyContinue) {
     foreach ($Example in $Examples) {
         $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
-        foreach ($Target in @("mips1-gnu", "mips32-gnu", "micromips-gnu", "mips64-gnu")) {
+        foreach ($Target in @("mips1-gnu", "mips32-gnu", "micromips-gnu")) {
             $AsmPath = Join-Path $BuildPath "mips-$Target-$Name-pwsh.s"
             $ObjPath = Join-Path $BuildPath "mips-$Target-$Name-pwsh.o"
             Invoke-Native $CompilerExe @($Example.FullName, "--target", $Target, "-o", $AsmPath)
-            # The 64-bit member needs the wider instruction set enabled.
-            $Flags = if ($Target -eq "mips64-gnu") { @("-march=mips64") } else { @() }
-            Invoke-Native "mips-linux-gnu-as" ($Flags + @("-o", $ObjPath, $AsmPath))
+            Invoke-Native "mips-linux-gnu-as" @("-o", $ObjPath, $AsmPath)
         }
     }
-    Write-Host "the MIPS assembler accepted every MIPS output."
+    Write-Host "the MIPS assembler accepted every 32-bit MIPS output."
 } else {
     Write-Host "no MIPS assembler found; skipped assembling the MIPS output."
+}
+
+# mips64-gnu needs an assembler whose ABI is actually 64-bit: the 32-bit one
+# rejects a 64-bit immediate even with -march=mips64.
+if (Get-Command mips64-linux-gnuabi64-as -ErrorAction SilentlyContinue) {
+    foreach ($Example in $Examples) {
+        $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
+        $AsmPath = Join-Path $BuildPath "mips64-$Name-pwsh.s"
+        Invoke-Native $CompilerExe @($Example.FullName, "--target", "mips64-gnu", "-o", $AsmPath)
+        Invoke-Native "mips64-linux-gnuabi64-as" @("-o", (Join-Path $BuildPath "mips64-$Name-pwsh.o"), $AsmPath)
+    }
+    Write-Host "the 64-bit MIPS assembler accepted every mips64-gnu output."
+} else {
+    Write-Host "no 64-bit MIPS assembler found; skipped assembling the mips64-gnu output."
 }
 
 if (Get-Command clang -ErrorAction SilentlyContinue) {

@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm binutils-riscv64-linux-gnu \
-            binutils-mips-linux-gnu gcc-multilib
+            binutils-mips-linux-gnu binutils-mips64-linux-gnuabi64 gcc-multilib
 
       - name: Run POSIX smoke tests
         run: make smoke
