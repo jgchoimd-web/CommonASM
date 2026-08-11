@@ -336,6 +336,33 @@ else
   echo "no 64-bit PowerPC assembler found; skipped assembling it."
 fi
 
+# One SPARC assembler covers both, told which width to use.
+if command -v sparc64-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target sparcv8-gnu -o "$BUILD_DIR/sparc8-${name}.s"
+    sparc64-linux-gnu-as -32 -o "$BUILD_DIR/sparc8-${name}.o" "$BUILD_DIR/sparc8-${name}.s"
+    "$BUILD_DIR/commonasmc" "$example" --target sparcv9-gnu -o "$BUILD_DIR/sparc9-${name}.s"
+    sparc64-linux-gnu-as -64 -Av9 -o "$BUILD_DIR/sparc9-${name}.o" "$BUILD_DIR/sparc9-${name}.s"
+  done
+  echo "the SPARC assembler accepted every sparcv8-gnu and sparcv9-gnu output."
+else
+  echo "no SPARC assembler found; skipped assembling the SPARC output."
+fi
+
+if command -v m68k-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    for target in m68k coldfire; do
+      "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/m68k-${target}-${name}.s"
+      m68k-linux-gnu-as -o "$BUILD_DIR/m68k-${target}-${name}.o" "$BUILD_DIR/m68k-${target}-${name}.s"
+    done
+  done
+  echo "the m68k assembler accepted every m68k and coldfire output."
+else
+  echo "no m68k assembler found; skipped assembling the m68k output."
+fi
+
 if command -v clang > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)

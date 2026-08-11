@@ -150,6 +150,8 @@ typedef enum {
     CLASS_DCPU,
     CLASS_MIPS,
     CLASS_PPC,
+    CLASS_SPARC,
+    CLASS_M68K,
     CLASS_ENCODING
 } TargetClass;
 
@@ -240,13 +242,13 @@ static const TargetDesc target_table[] = {
     {"ppcg5-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
     {"power9-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
     {"power10-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
-    {"sparcv8-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"sparcv9-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"sparcv8-gnu", CLASS_SPARC, GROUP_LEGACY, 0},
+    {"sparcv9-gnu", CLASS_SPARC, GROUP_LEGACY, TF_64BIT},
     {"alpha-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"parisc-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"m88k-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"m68k", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"coldfire", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"m68k", CLASS_M68K, GROUP_LEGACY, 0},
+    {"coldfire", CLASS_M68K, GROUP_LEGACY, 0},
     {"avr", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"i8051", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"msp430", CLASS_LEGACY, GROUP_LEGACY, 0},
@@ -723,6 +725,14 @@ static bool is_ppc_target(const char *target) {
     return target_has_class(target, CLASS_PPC);
 }
 
+static bool is_sparc_target(const char *target) {
+    return target_has_class(target, CLASS_SPARC);
+}
+
+static bool is_m68k_target(const char *target) {
+    return target_has_class(target, CLASS_M68K);
+}
+
 static bool is_vm_ir_target(const char *target) {
     return target_has_class(target, CLASS_VM_IR);
 }
@@ -809,7 +819,10 @@ static int target_word_bits(const char *target) {
     if (!desc) return 64;
     if (desc->cls == CLASS_DCPU) return 16;
     if (desc->cls == CLASS_I386) return 32;
-    if (desc->cls == CLASS_MIPS || desc->cls == CLASS_PPC) return (desc->flags & TF_64BIT) ? 64 : 32;
+    if (desc->cls == CLASS_MIPS || desc->cls == CLASS_PPC || desc->cls == CLASS_SPARC) {
+        return (desc->flags & TF_64BIT) ? 64 : 32;
+    }
+    if (desc->cls == CLASS_M68K) return 32;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
     return 64;
 }
@@ -896,6 +909,8 @@ static const char *target_output_kind(const char *target) {
         case CLASS_I386: return "NASM i386 assembly";
         case CLASS_MIPS: return "GNU MIPS assembly";
         case CLASS_PPC: return "GNU PowerPC assembly";
+        case CLASS_SPARC: return "GNU SPARC assembly";
+        case CLASS_M68K: return "GNU m68k assembly";
         case CLASS_GENERIC:
         case CLASS_LEGACY: return "assembly-style text output";
         case CLASS_VM_IR: return "VM or compiler IR-style text output";
@@ -1424,7 +1439,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -4212,6 +4227,538 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
     line_error(line_no, op, "unsupported instruction or wrong argument count for PowerPC");
 }
 
+/* ----------------------------------------------------------------- SPARC */
+
+/* SPARC's register windows exist to make calls cheap, and cost a save and a
+   restore to enter. This emits flat code instead - no window is ever shifted -
+   so %l, %i and the application globals are all just registers here.
+   %g0 reads as zero, %g5-%g7 belong to the system, %o0-%o5 and %g1 carry the
+   syscall convention, %o6/%i6 are the stack and frame pointers and %o7/%i7
+   hold return addresses, so none of those are handed out. */
+static const char *sparc_regs[] = {
+    "%l0", "%l1", "%l2", "%l3", "%l4", "%l5", "%l6", "%l7",
+    "%i0", "%i1", "%i2", "%i3", "%i4", "%i5", "%g2", "%g3"
+};
+
+#define SPARC_SCRATCH "%g1"
+#define SPARC_SCRATCH2 "%g4"
+
+static DeferredCompare sparc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mov", "set"};
+
+static bool sparc_is_64(const char *target) {
+    return target_word_bits(target) == 64;
+}
+
+static const char *sparc_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return sparc_regs[reg];
+}
+
+/* The immediate field is 13 bits signed; wider values go through set, which
+   the assembler expands into however many instructions it needs. */
+static bool sparc_fits_imm13(const char *value, long long *out) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) {
+        if (!constant_value(value, &parsed)) return false;
+        if (parsed < -4096 || parsed > 4095) return false;
+        *out = parsed;
+        return true;
+    }
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0 || parsed < -4096 || parsed > 4095) return false;
+    *out = parsed;
+    return true;
+}
+
+static const char *sparc_operand_reg(Buffer *text, const char *value, const char *scratch,
+                                     int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return sparc_regs[reg];
+    if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    buf_appendf(text, "  set %s, %s\n", value, scratch);
+    return scratch;
+}
+
+/* Every control transfer has a delay slot, and SPARC's assembler does not
+   fill them, so each one is followed by an explicit nop. */
+static void sparc_delay_slot(Buffer *text) {
+    buf_append(text, "  nop\n");
+}
+
+static void sparc_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                               const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        snprintf(out, out_size, "[%s+%lld]", sparc_reg(addr.base, line_no, op), addr.offset);
+        return;
+    }
+    buf_appendf(text, "  set %s, %s\n", addr.symbol, scratch);
+    snprintf(out, out_size, "[%s+%lld]", scratch, addr.offset);
+}
+
+static void emit_sparc_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"%o0", "%o1", "%o2", "%o3", "%o4", "%o5"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (op_is(args[0], "exit")) number = 1;
+    else if (op_is(args[0], "read")) number = 3;
+    else if (op_is(args[0], "write")) number = 4;
+    else if (op_is(args[0], "open")) number = 5;
+    else if (op_is(args[0], "close")) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* No virtual register maps onto %g1 or %o0-%o5, so nothing needs saving. */
+    for (int i = 0; i < count; i++) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0) buf_appendf(text, "  mov %s, %s\n", sparc_regs[reg], arg_regs[i]);
+        else buf_appendf(text, "  set %s, %s\n", args[i + 1], arg_regs[i]);
+    }
+    buf_appendf(text, "  mov %d, %s\n", number, SPARC_SCRATCH);
+    buf_append(text, "  ta 0x10\n");
+    if (result) buf_appendf(text, "  mov %%o0, %s\n", sparc_reg(result, line_no, "syscall"));
+}
+
+static void emit_sparc_instruction(Buffer *text, const char *target, const char *op, const char *size,
+                                   char **args, int argc, int line_no) {
+    const bool wide = sparc_is_64(target);
+    const char *word_load = wide ? "ldx" : "ld";
+    const char *word_store = wide ? "stx" : "st";
+    const int slot = wide ? 8 : 4;
+
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        /* Flat code, so the return address has to be kept by hand rather than
+           by a window. */
+        buf_appendf(text, "  sub %%sp, %d, %%sp\n", slot * 2);
+        buf_appendf(text, "  %s %%o7, [%%sp+%d]\n", word_store, slot);
+        buf_appendf(text, "  %s %%fp, [%%sp+0]\n", word_store);
+        buf_append(text, "  mov %sp, %fp\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (sparc_fits_imm13(args[0], &frame)) buf_appendf(text, "  sub %%sp, %lld, %%sp\n", frame);
+        else {
+            buf_appendf(text, "  set %s, %s\n", args[0], SPARC_SCRATCH);
+            buf_appendf(text, "  sub %%sp, %s, %%sp\n", SPARC_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  mov %fp, %sp\n");
+        buf_appendf(text, "  %s [%%sp+0], %%fp\n", word_load);
+        buf_appendf(text, "  %s [%%sp+%d], %%o7\n", word_load, slot);
+        buf_appendf(text, "  add %%sp, %d, %%sp\n", slot * 2);
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = sparc_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) buf_appendf(text, "  mov %s, %s\n", sparc_regs[src], dst);
+        else buf_appendf(text, "  set %s, %s\n", args[1], dst);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        buf_appendf(text, "  set %s, %s\n", args[1], sparc_reg(args[0], line_no, op));
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        const char *dst = sparc_reg(args[0], line_no, op);
+        const char *mnemonic = size[0] == 'b' ? "ldub" : size[0] == 'w' ? "lduh" :
+                               size[0] == 'd' ? "ld" : word_load;
+        sparc_emit_address(text, args[1], addr, sizeof(addr), SPARC_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, addr, dst);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        const char *mnemonic = size[0] == 'b' ? "stb" : size[0] == 'w' ? "sth" :
+                               size[0] == 'd' ? "st" : word_store;
+        const char *value;
+        sparc_emit_address(text, args[0], addr, sizeof(addr), SPARC_SCRATCH, line_no, op);
+        value = sparc_operand_reg(text, args[1], SPARC_SCRATCH2, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
+        const char *dst = sparc_reg(args[0], line_no, op);
+        const char *native = op_is(op, "xor") ? "xor" : op;
+        long long value;
+        if (sparc_fits_imm13(args[1], &value)) {
+            buf_appendf(text, "  %s %s, %lld, %s\n", native, dst, value, dst);
+        } else {
+            const char *src = sparc_operand_reg(text, args[1], SPARC_SCRATCH, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, src, dst);
+        }
+        return;
+    }
+    if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        const char *dst = sparc_reg(args[0], line_no, op);
+        const char *src = sparc_operand_reg(text, args[1], SPARC_SCRATCH, line_no, op);
+        if (op_is(op, "mul")) {
+            buf_appendf(text, "  %s %s, %s, %s\n", wide ? "mulx" : "smul", dst, src, dst);
+            return;
+        }
+        if (!wide) {
+            /* The 32-bit divide reads the Y register as the high half of the
+               dividend, so it has to be given the sign extension first. */
+            buf_appendf(text, "  sra %s, 31, %s\n", dst, SPARC_SCRATCH2);
+            buf_appendf(text, "  wr %s, %%g0, %%y\n", SPARC_SCRATCH2);
+        }
+        if (op_is(op, "div")) {
+            buf_appendf(text, "  %s %s, %s, %s\n", wide ? "sdivx" : "sdiv", dst, src, dst);
+        } else {
+            /* No remainder instruction: divide, multiply back, subtract. */
+            buf_appendf(text, "  %s %s, %s, %s\n", wide ? "sdivx" : "sdiv", dst, src, SPARC_SCRATCH2);
+            buf_appendf(text, "  %s %s, %s, %s\n", wide ? "mulx" : "smul", SPARC_SCRATCH2, src, SPARC_SCRATCH2);
+            buf_appendf(text, "  sub %s, %s, %s\n", dst, SPARC_SCRATCH2, dst);
+        }
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *dst = sparc_reg(args[0], line_no, op);
+        const char *native = op_is(op, "shl") ? (wide ? "sllx" : "sll") :
+                             op_is(op, "shr") ? (wide ? "srlx" : "srl") : (wide ? "srax" : "sra");
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) buf_appendf(text, "  %s %s, %s, %s\n", native, dst, sparc_regs[src], dst);
+        else buf_appendf(text, "  %s %s, %s, %s\n", native, dst, args[1], dst);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = sparc_reg(args[0], line_no, op);
+        if (op_is(op, "neg")) buf_appendf(text, "  sub %%g0, %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  xnor %s, %%g0, %s\n", dst, dst);
+        else buf_appendf(text, "  add %s, %s, %s\n", dst, op_is(op, "inc") ? "1" : "-1", dst);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        int src = virtual_reg_index(args[1]);
+        compare_record(&sparc_cmp, sparc_reg(args[0], line_no, op),
+                       src >= 0 ? sparc_regs[src] : args[1], src >= 0);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        /* The comparison is emitted here so the branch can say whether it
+           meant a signed or an unsigned one. */
+        const char *branch = op_is(op, "je") ? "be" : op_is(op, "jne") ? "bne" :
+                             op_is(op, "jg") ? "bg" : op_is(op, "jl") ? "bl" :
+                             op_is(op, "jge") ? "bge" : op_is(op, "jle") ? "ble" :
+                             op_is(op, "ja") ? "bgu" : op_is(op, "jb") ? "blu" :
+                             op_is(op, "jae") ? "bgeu" : "bleu";
+        long long value;
+        if (sparc_cmp.state == CMP_NONE) {
+            line_error(line_no, op, "conditional jump with no preceding cmp");
+        }
+        if (sparc_cmp.rhs_is_reg || sparc_fits_imm13(sparc_cmp.rhs, &value)) {
+            buf_appendf(text, "  cmp %s, %s\n", sparc_cmp.lhs, sparc_cmp.rhs);
+        } else {
+            buf_appendf(text, "  set %s, %s\n", sparc_cmp.rhs, SPARC_SCRATCH);
+            buf_appendf(text, "  cmp %s, %s\n", sparc_cmp.lhs, SPARC_SCRATCH);
+        }
+        if (wide) buf_appendf(text, "  %s %%xcc, %s\n", branch, args[0]);
+        else buf_appendf(text, "  %s %s\n", branch, args[0]);
+        sparc_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = sparc_operand_reg(text, args[0], SPARC_SCRATCH, line_no, op);
+        buf_appendf(text, "  sub %%sp, %d, %%sp\n", slot);
+        buf_appendf(text, "  %s %s, [%%sp+0]\n", word_store, value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_appendf(text, "  %s [%%sp+0], %s\n", word_load, sparc_reg(args[0], line_no, op));
+        buf_appendf(text, "  add %%sp, %d, %%sp\n", slot);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) {
+        buf_appendf(text, "  ba %s\n", args[0]);
+        sparc_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "call") && argc == 1) {
+        buf_appendf(text, "  call %s\n", args[0]);
+        sparc_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "ret") && argc == 0) {
+        /* retl returns through %o7 without unwinding a window, which is what
+           flat code wants. */
+        buf_append(text, "  retl\n");
+        sparc_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "syscall")) { emit_sparc_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for SPARC");
+}
+
+/* ------------------------------------------------------------------ m68k */
+
+/* Only the data registers can do arithmetic and logic, and d0 and d1 are the
+   compiler's scratch while a7 and a6 are the stack and frame pointers, which
+   leaves six machine registers. The other ten virtual registers live in spill
+   slots, which m68k reaches directly: nearly every instruction here takes a
+   memory operand on either side. */
+static const char *m68k_regs[] = {
+    "%d2", "%d3", "%d4", "%d5", "%d6", "%d7"
+};
+
+#define M68K_MAPPED_COUNT ((int)(sizeof(m68k_regs) / sizeof(m68k_regs[0])))
+#define M68K_SPILL_COUNT (16 - M68K_MAPPED_COUNT)
+#define M68K_SCRATCH "%d0"
+#define M68K_SCRATCH2 "%d1"
+#define M68K_ADDR_SCRATCH "%a0"
+
+static unsigned m68k_spill_used = 0;
+
+static bool m68k_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= M68K_MAPPED_COUNT;
+}
+
+static const char *m68k_operand_text(int idx) {
+    static char pool[8][48];
+    static unsigned next = 0;
+    char *slot;
+    if (idx < M68K_MAPPED_COUNT) return m68k_regs[idx];
+    slot = pool[next];
+    next = (next + 1) % 8;
+    m68k_spill_used |= 1u << (idx - M68K_MAPPED_COUNT);
+    snprintf(slot, sizeof(pool[0]), "%s+%d", X86_SPILL_SYMBOL, (idx - M68K_MAPPED_COUNT) * 4);
+    return slot;
+}
+
+static const char *m68k_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) {
+        line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    }
+    return m68k_operand_text(reg);
+}
+
+/* An operand as m68k spells it: a register, a spill slot, or an immediate,
+   which needs the # that marks one. */
+static const char *m68k_operand(const char *value, int line_no, const char *op) {
+    static char pool[4][64];
+    static unsigned next = 0;
+    char *slot;
+    int reg = virtual_reg_index(value);
+    if (reg >= 0) return m68k_operand_text(reg);
+    if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    slot = pool[next];
+    next = (next + 1) % 4;
+    snprintf(slot, sizeof(pool[0]), "#%s", value);
+    return slot;
+}
+
+static int m68k_vreg_of(const char *physical) {
+    for (int i = 0; i < M68K_MAPPED_COUNT; i++) {
+        if (strcmp(m68k_regs[i], physical) == 0) return i;
+    }
+    return -1;
+}
+
+static bool m68k_must_preserve(const char *physical) {
+    int vreg = m68k_vreg_of(physical);
+    return vreg >= 0 && (mentioned_vregs & (1u << (unsigned)vreg)) != 0;
+}
+
+static void m68k_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                              int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (!addr.has_base) {
+        if (addr.offset == 0) snprintf(out, out_size, "%s", addr.symbol);
+        else snprintf(out, out_size, "%s%+lld", addr.symbol, addr.offset);
+        return;
+    }
+    /* Only an address register can hold a pointer being dereferenced. */
+    buf_appendf(text, "  move.l %s, %s\n", m68k_reg(addr.base, line_no, op), M68K_ADDR_SCRATCH);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, M68K_ADDR_SCRATCH);
+}
+
+static void emit_m68k_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"%d1", "%d2", "%d3", "%d4", "%d5"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    bool returns = true;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (op_is(args[0], "exit")) { number = 1; returns = false; }
+    else if (op_is(args[0], "read")) number = 3;
+    else if (op_is(args[0], "write")) number = 4;
+    else if (op_is(args[0], "open")) number = 5;
+    else if (op_is(args[0], "close")) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 5) count = 5;
+    /* The argument registers past the first are also virtual registers, so
+       the ones this call writes are saved unless the source never names them. */
+    if (returns) {
+        for (int i = 0; i < count; i++) {
+            if (m68k_must_preserve(arg_regs[i])) buf_appendf(text, "  move.l %s, -(%%sp)\n", arg_regs[i]);
+        }
+    }
+    /* Values are staged on the stack because loading one argument register can
+       destroy the source of a later one. */
+    for (int i = 0; i < count; i++) {
+        buf_appendf(text, "  move.l %s, -(%%sp)\n", m68k_operand(args[i + 1], line_no, "syscall"));
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        buf_appendf(text, "  move.l (%%sp)+, %s\n", arg_regs[i]);
+    }
+    buf_appendf(text, "  move.l #%d, %%d0\n", number);
+    buf_append(text, "  trap #0\n");
+    if (result) {
+        /* d0 carries the result and is not one of the restored registers. */
+        buf_appendf(text, "  move.l %%d0, %s\n", m68k_reg(result, line_no, "syscall"));
+    }
+    if (returns) {
+        for (int i = count - 1; i >= 0; i--) {
+            if (m68k_must_preserve(arg_regs[i])) buf_appendf(text, "  move.l (%%sp)+, %s\n", arg_regs[i]);
+        }
+    }
+}
+
+static void emit_m68k_instruction(Buffer *text, const char *op, const char *size,
+                                  char **args, int argc, int line_no) {
+    /* m68k writes the source first, which is the opposite of the two-address
+       form here, so every operand pair below reads right to left. */
+    const char *suffix = size[0] == 'b' ? ".b" : size[0] == 'w' ? ".w" : ".l";
+
+    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        buf_appendf(text, "  link %%a6, #-%s\n", strcmp(args[0], "0") == 0 ? "0" : args[0]);
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) { buf_append(text, "  unlk %a6\n"); return; }
+    if (op_is(op, "mov") && argc == 2) {
+        if (m68k_reg_is_spilled(args[0]) && m68k_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH);
+            buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        } else {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op),
+                        m68k_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        buf_appendf(text, "  move.l #%s, %s\n", args[1], m68k_reg(args[0], line_no, op));
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        bool spilled = m68k_reg_is_spilled(args[0]);
+        m68k_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (size[0] == 'b' || size[0] == 'w') {
+            /* Sub-word loads leave the rest of the register alone, so it is
+               cleared first. */
+            buf_appendf(text, "  moveq #0, %s\n", M68K_SCRATCH);
+            buf_appendf(text, "  move%s %s, %s\n", suffix, addr, M68K_SCRATCH);
+            buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        } else {
+            buf_appendf(text, "  move.l %s, %s\n", addr,
+                        spilled ? M68K_SCRATCH : m68k_reg(args[0], line_no, op));
+            if (spilled) buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        m68k_emit_address(text, args[0], addr, sizeof(addr), line_no, op);
+        if (m68k_reg_is_spilled(args[1])) {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH);
+            buf_appendf(text, "  move%s %s, %s\n", suffix, M68K_SCRATCH, addr);
+        } else {
+            buf_appendf(text, "  move%s %s, %s\n", suffix, m68k_operand(args[1], line_no, op), addr);
+        }
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
+         op_is(op, "or") || op_is(op, "xor") || op_is(op, "cmp")) && argc == 2) {
+        const char *native = op_is(op, "xor") ? "eor" : op;
+        /* Only one side may be memory, and eor and cmp need their source in a
+           register, so anything else is staged there first. */
+        if ((m68k_reg_is_spilled(args[0]) && m68k_reg_is_spilled(args[1])) ||
+            op_is(op, "xor") || op_is(op, "cmp") || virtual_reg_index(args[1]) < 0) {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH);
+            buf_appendf(text, "  %s.l %s, %s\n", native, M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        } else {
+            buf_appendf(text, "  %s.l %s, %s\n", native, m68k_operand(args[1], line_no, op),
+                        m68k_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if ((op_is(op, "mul") || op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        /* These need their destination in a data register. */
+        buf_appendf(text, "  move.l %s, %s\n", m68k_reg(args[0], line_no, op), M68K_SCRATCH);
+        buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH2);
+        if (op_is(op, "mul")) buf_appendf(text, "  muls.l %s, %s\n", M68K_SCRATCH2, M68K_SCRATCH);
+        else if (op_is(op, "div")) buf_appendf(text, "  divs.l %s, %s\n", M68K_SCRATCH2, M68K_SCRATCH);
+        else {
+            /* divsl leaves the remainder in the first register it names. */
+            buf_appendf(text, "  divsl.l %s, %s:%s\n", M68K_SCRATCH2, M68K_SCRATCH, M68K_SCRATCH);
+        }
+        buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *native = op_is(op, "shl") ? "lsl" : op_is(op, "shr") ? "lsr" : "asr";
+        buf_appendf(text, "  move.l %s, %s\n", m68k_reg(args[0], line_no, op), M68K_SCRATCH);
+        buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH2);
+        buf_appendf(text, "  %s.l %s, %s\n", native, M68K_SCRATCH2, M68K_SCRATCH);
+        buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = m68k_reg(args[0], line_no, op);
+        if (op_is(op, "neg")) buf_appendf(text, "  neg.l %s\n", dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  not.l %s\n", dst);
+        else buf_appendf(text, "  %s.l #1, %s\n", op_is(op, "inc") ? "add" : "sub", dst);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        const char *branch = op_is(op, "je") ? "beq" : op_is(op, "jne") ? "bne" :
+                             op_is(op, "jg") ? "bgt" : op_is(op, "jl") ? "blt" :
+                             op_is(op, "jge") ? "bge" : op_is(op, "jle") ? "ble" :
+                             op_is(op, "ja") ? "bhi" : op_is(op, "jb") ? "bcs" :
+                             op_is(op, "jae") ? "bcc" : "bls";
+        buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        buf_appendf(text, "  move.l %s, -(%%sp)\n", m68k_operand(args[0], line_no, op));
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_appendf(text, "  move.l (%%sp)+, %s\n", m68k_reg(args[0], line_no, op));
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  jmp %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  jsr %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  rts\n"); return; }
+    if (op_is(op, "syscall")) { emit_m68k_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for m68k");
+}
+
 /* ---------------------------------------------------------- inline assembly */
 
 /* The operand text a backend uses for a virtual register, which is what an
@@ -5061,7 +5608,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "global ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -5071,7 +5618,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (strncmp(line, "extern ", 7) == 0) {
         const char *name = trim(line + 7);
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -5113,6 +5660,8 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
     else if (is_i386_target(target)) emit_i386_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_sparc_target(target)) emit_sparc_instruction(text, target, base_op, size, args, argc, line_no);
+    else if (is_m68k_target(target)) emit_m68k_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
@@ -5475,7 +6024,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_rv64_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -5652,6 +6201,9 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         buf_append(&bss, "alignb 4\n");
         buf_appendf(&bss, "%s: resd %d\n", X86_SPILL_SYMBOL, I386_SPILL_COUNT);
     }
+    if (is_m68k_target(target) && m68k_spill_used) {
+        buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, M68K_SPILL_COUNT * 4);
+    }
     buf_init(&out);
     if (x86 || i386) {
         if (x86) buf_append(&out, "default rel\n");
@@ -5698,6 +6250,11 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
                 buf_append(&out, ".syntax unified\n.thumb\n");
             } else if (is_arm32_target(target)) {
                 buf_append(&out, ".syntax unified\n.arm\n");
+            }
+            /* A 64-bit SPARC assembler wants to be told before an application
+               global is used, since the ABI leaves their role to the program. */
+            if (is_sparc_target(target) && sparc_is_64(target)) {
+                buf_append(&out, ".register %g2, #scratch\n.register %g3, #scratch\n");
             }
             if (is_arm32_target(target) && arm_spill_used) {
                 buf_appendf(&out, ".lcomm %s, %d\n", X86_SPILL_SYMBOL, ARM_SPILL_COUNT * 4);
@@ -5787,6 +6344,7 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
 
 
 
