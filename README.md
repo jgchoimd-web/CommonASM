@@ -31,6 +31,11 @@ a claim:
 - `x86_64-nasm`, `i386-nasm` / `ia32-nasm` (nasm)
 - `aarch64-gnu`, `armv7a-gnu` / `armv4-gnu` / `armv5-gnu`, `thumb-gnu` /
   `thumb2-gnu` (clang)
+- `riscv64-gnu` / `rv64i-gnu`, `riscv64-zbb` (binutils)
+- `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu` (binutils)
+
+The rest of the target list is assembly-shaped text rather than assembly, and
+says so under `--target-info`.
 
 Primary:
 
