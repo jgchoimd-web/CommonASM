@@ -3054,11 +3054,12 @@ typedef struct {
     const char *lhs_snapshot;
     const char *rhs_snapshot;
     const char *move_op;
+    const char *load_imm_op;
 } DeferredCompare;
 
 #define RV_SCRATCH "a6"
 
-static DeferredCompare rv_cmp = {CMP_NONE, {0}, {0}, false, "s10", "s11", "mv"};
+static DeferredCompare rv_cmp = {CMP_NONE, {0}, {0}, false, "s10", "s11", "mv", "li"};
 
 static bool rv_parse_long(const char *text, long long *value) {
     char *end = NULL;
@@ -3077,7 +3078,7 @@ static void compare_flush(Buffer *text, DeferredCompare *cmp) {
     if (cmp->state != CMP_PENDING) return;
     buf_appendf(text, "  %s %s, %s\n", cmp->move_op, cmp->lhs_snapshot, cmp->lhs);
     if (cmp->rhs_is_reg) buf_appendf(text, "  %s %s, %s\n", cmp->move_op, cmp->rhs_snapshot, cmp->rhs);
-    else buf_appendf(text, "  li %s, %s\n", cmp->rhs_snapshot, cmp->rhs);
+    else buf_appendf(text, "  %s %s, %s\n", cmp->load_imm_op, cmp->rhs_snapshot, cmp->rhs);
     snprintf(cmp->lhs, sizeof(cmp->lhs), "%s", cmp->lhs_snapshot);
     snprintf(cmp->rhs, sizeof(cmp->rhs), "%s", cmp->rhs_snapshot);
     cmp->rhs_is_reg = true;
@@ -3142,7 +3143,7 @@ static void compare_emit_branch(Buffer *text, DeferredCompare *cmp, const char *
     } else {
         /* Branches compare registers only, so an immediate operand is
            materialised at the branch rather than kept live in a register. */
-        buf_appendf(text, "  li %s, %s\n", cmp->rhs_snapshot, cmp->rhs);
+        buf_appendf(text, "  %s %s, %s\n", cmp->load_imm_op, cmp->rhs_snapshot, cmp->rhs);
         rhs = cmp->rhs_snapshot;
     }
     buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, cmp->lhs, rhs, label);
@@ -3521,7 +3522,11 @@ static const char *mips_regs[] = {
 #define MIPS_SCRATCH "$v1"
 #define MIPS_SCRATCH2 "$a3"
 
-static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move"};
+/* The li macro only reaches 32 bits, so the 64-bit member needs dli. Set once
+   per instruction from the target, because the helpers below are shared. */
+static const char *mips_li_op = "li";
+
+static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move", "li"};
 
 static bool mips_is_64(const char *target) {
     return target_word_bits(target) == 64;
@@ -3557,7 +3562,7 @@ static const char *mips_operand_reg(Buffer *text, const char *value, const char 
     int reg = virtual_reg_index(value);
     if (reg >= 0) return mips_regs[reg];
     if (is_int(value) || is_known_constant(value)) {
-        buf_appendf(text, "  li %s, %s\n", scratch, value);
+        buf_appendf(text, "  %s %s, %s\n", mips_li_op, scratch, value);
     } else if (is_symbol(value)) {
         buf_appendf(text, "  la %s, %s\n", scratch, value);
     } else {
@@ -3601,7 +3606,7 @@ static void emit_mips_syscall(Buffer *text, const char *target, char **args, int
         int reg = virtual_reg_index(args[i + 1]);
         if (reg >= 0) buf_appendf(text, "  move %s, %s\n", arg_regs[i], mips_regs[reg]);
         else if (is_int(args[i + 1]) || is_known_constant(args[i + 1])) {
-            buf_appendf(text, "  li %s, %s\n", arg_regs[i], args[i + 1]);
+            buf_appendf(text, "  %s %s, %s\n", mips_li_op, arg_regs[i], args[i + 1]);
         } else {
             buf_appendf(text, "  la %s, %s\n", arg_regs[i], args[i + 1]);
         }
@@ -3619,6 +3624,8 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     const char *word_load = wide ? "ld" : "lw";
     const char *word_store = wide ? "sd" : "sw";
     const int slot = wide ? 8 : 4;
+    mips_li_op = wide ? "dli" : "li";
+    mips_cmp.load_imm_op = mips_li_op;
 
     /* A pending comparison is pinned down before anything can disturb the
        registers it names, and a call is enough on its own. */
@@ -3645,7 +3652,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         if (mips_fits_imm16(args[0], &frame, true) && frame != -32768) {
             buf_appendf(text, "  %s $sp, $sp, %lld\n", addiu, -frame);
         } else {
-            buf_appendf(text, "  li %s, %s\n", MIPS_SCRATCH, args[0]);
+            buf_appendf(text, "  %s %s, %s\n", mips_li_op, MIPS_SCRATCH, args[0]);
             buf_appendf(text, "  %s $sp, $sp, %s\n", subu, MIPS_SCRATCH);
         }
         return;
@@ -3661,7 +3668,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         const char *dst = mips_reg(args[0], line_no, op);
         int src = virtual_reg_index(args[1]);
         if (src >= 0) buf_appendf(text, "  move %s, %s\n", dst, mips_regs[src]);
-        else if (is_int(args[1]) || is_known_constant(args[1])) buf_appendf(text, "  li %s, %s\n", dst, args[1]);
+        else if (is_int(args[1]) || is_known_constant(args[1])) buf_appendf(text, "  %s %s, %s\n", mips_li_op, dst, args[1]);
         else buf_appendf(text, "  la %s, %s\n", dst, args[1]);
         return;
     }
@@ -4555,6 +4562,9 @@ int main(int argc, char **argv) {
     symbol_set_free(&known_constants);
     return 0;
 }
+
+
+
 
 
 
