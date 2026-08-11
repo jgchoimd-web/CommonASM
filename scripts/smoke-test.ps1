@@ -46,6 +46,23 @@ function Invoke-NativeToFile {
     }
 }
 
+function Invoke-NativeExpectFailure {
+    param(
+        [string]$ErrorPath,
+        [string]$File,
+        [string[]]$Arguments,
+        [string]$Message
+    )
+    & $File @Arguments 2> $ErrorPath
+    if ($LASTEXITCODE -eq 0) {
+        throw $Message
+    }
+    # The non-zero exit code is the expected result, so consume it here.
+    # $LASTEXITCODE is global and would otherwise leak past the end of this
+    # script, where the CI runner turns it into the step's exit code.
+    $global:LASTEXITCODE = 0
+}
+
 function Assert-Contains {
     param(
         [string]$Path,
@@ -94,17 +111,20 @@ Assert-Contains $BrainfuckInfoPath "support: Encoding/pseudo"
 
 $UnknownTargetPath = Join-Path $BuildPath "unknown-target-pwsh.txt"
 $NopePath = Join-Path $BuildPath "nope-pwsh.out"
-& $CompilerExe (Join-Path $RootDir "examples/hello.cas") "--target" "no-such-target" "-o" $NopePath 2> $UnknownTargetPath
-if ($LASTEXITCODE -eq 0) {
-    throw "expected unknown target to fail"
-}
+Invoke-NativeExpectFailure $UnknownTargetPath $CompilerExe @(
+    (Join-Path $RootDir "examples/hello.cas"),
+    "--target",
+    "no-such-target",
+    "-o",
+    $NopePath
+) "expected unknown target to fail"
 Assert-Contains $UnknownTargetPath "unknown target"
 
 $UnknownInfoPath = Join-Path $BuildPath "unknown-info-pwsh.txt"
-& $CompilerExe "--target-info" "no-such-target" 2> $UnknownInfoPath
-if ($LASTEXITCODE -eq 0) {
-    throw "expected unknown target info to fail"
-}
+Invoke-NativeExpectFailure $UnknownInfoPath $CompilerExe @(
+    "--target-info",
+    "no-such-target"
+) "expected unknown target info to fail"
 Assert-Contains $UnknownInfoPath "unknown target"
 
 $StdoutPath = Join-Path $BuildPath "stdout-pwsh.wat"
@@ -208,10 +228,13 @@ _start:
 "@ | Set-Content -Path $BadPath -Encoding ascii
 
 $DiagnosticPath = Join-Path $BuildPath "diagnostic-pwsh.txt"
-& $CompilerExe $BadPath "--target" "x86_64-nasm" "-o" (Join-Path $BuildPath "bad-pwsh.out") 2> $DiagnosticPath
-if ($LASTEXITCODE -eq 0) {
-    throw "expected invalid register to fail"
-}
+Invoke-NativeExpectFailure $DiagnosticPath $CompilerExe @(
+    $BadPath,
+    "--target",
+    "x86_64-nasm",
+    "-o",
+    (Join-Path $BuildPath "bad-pwsh.out")
+) "expected invalid register to fail"
 
 Assert-Contains $DiagnosticPath "expected virtual register r0-r15"
 Assert-Contains $DiagnosticPath "bad-pwsh.cas:5"
@@ -225,3 +248,7 @@ if ($EmptyOutput) {
 }
 
 Write-Host "CommonASM PowerShell smoke tests passed."
+
+# Reaching this line means every check passed. Exit explicitly so no stray
+# $LASTEXITCODE from a native call can decide the exit code for us.
+exit 0
