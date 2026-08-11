@@ -21,6 +21,14 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 
 ## Supported targets
 
+Assembler-verified. CI compiles every example for these and runs the result
+through a real assembler, so "it assembles" is a checked property rather than
+a claim:
+
+- `x86_64-nasm`, `i386-nasm` / `ia32-nasm` (nasm)
+- `aarch64-gnu`, `armv7a-gnu` / `armv4-gnu` / `armv5-gnu`, `thumb-gnu` /
+  `thumb2-gnu` (clang)
+
 Primary:
 
 - `x86_64-nasm`
@@ -208,7 +216,26 @@ Text:
 - `syscall close, fd`
 - `syscall exit, code`
 
-Virtual registers are `r0` through `r15`. Each backend maps them to native registers.
+Virtual registers are `r0` through `r15`. A backend never maps one onto a
+register it needs for itself: the stack and frame pointers, its scratch
+registers, and the registers the syscall convention writes are all held back.
+Where a machine has fewer registers left than the sixteen the language
+promises, the surplus live in spill slots the compiler reserves, so `r15`
+behaves the same everywhere instead of aliasing whatever happened to be
+sixteenth in a table.
+
+| target | in registers | in spill slots |
+| --- | --- | --- |
+| `aarch64-gnu` | `r0`-`r15` | none |
+| `riscv64-gnu` | `r0`-`r15` | none |
+| `x86_64-nasm` | `r0`-`r11` | `r12`-`r15` |
+| `armv7a-gnu` | `r0`-`r9` | `r10`-`r15` |
+| `i386-nasm` | `r0`-`r3` | `r4`-`r15` |
+
+Virtual registers keep their values across everything the compiler emits,
+including `syscall`, which saves and restores whatever the call would
+otherwise overwrite.
+
 `cmp a, b` records the relation between `a` and `b` for the following
 conditional jump. Signed jumps use `jg`/`jl`/`jge`/`jle`; unsigned jumps use
 `ja`/`jb`/`jae`/`jbe`.

@@ -266,18 +266,25 @@ if (Get-Command nasm -ErrorAction SilentlyContinue) {
 }
 
 if (Get-Command clang -ErrorAction SilentlyContinue) {
+    $ClangBackends = @(
+        @{ T = "aarch64-gnu"; Triple = "aarch64-unknown-linux-gnu"; P = "a64" },
+        @{ T = "armv7a-gnu"; Triple = "armv7-unknown-linux-gnueabi"; P = "arm" },
+        @{ T = "thumb2-gnu"; Triple = "thumbv7-unknown-linux-gnueabi"; P = "thumb" }
+    )
     foreach ($Example in $Examples) {
         $Name = [System.IO.Path]::GetFileNameWithoutExtension($Example.Name)
         foreach ($Level in @("-O0", "-O1")) {
-            $AsmPath = Join-Path $BuildPath "a64-$Name$Level-pwsh.s"
-            Invoke-Native $CompilerExe @($Example.FullName, "--target", "aarch64-gnu", $Level, "-o", $AsmPath)
-            Invoke-Native "clang" @("-cc1as", "-triple", "aarch64-unknown-linux-gnu", "-filetype", "obj",
-                "-o", (Join-Path $BuildPath "a64-$Name$Level-pwsh.o"), $AsmPath)
+            foreach ($Backend in $ClangBackends) {
+                $AsmPath = Join-Path $BuildPath "$($Backend.P)-$Name$Level-pwsh.s"
+                Invoke-Native $CompilerExe @($Example.FullName, "--target", $Backend.T, $Level, "-o", $AsmPath)
+                Invoke-Native "clang" @("-cc1as", "-triple", $Backend.Triple, "-filetype", "obj",
+                    "-o", (Join-Path $BuildPath "$($Backend.P)-$Name$Level-pwsh.o"), $AsmPath)
+            }
         }
     }
-    Write-Host "clang accepted every aarch64 output."
+    Write-Host "clang accepted every aarch64, armv7a and thumb2 output."
 } else {
-    Write-Host "clang not found; skipped assembling the aarch64 output."
+    Write-Host "clang not found; skipped assembling the aarch64 and ARM output."
 }
 
 $RepresentativeTargets = @(

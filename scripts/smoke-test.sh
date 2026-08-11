@@ -151,11 +151,17 @@ if command -v clang > /dev/null 2>&1; then
       "$BUILD_DIR/commonasmc" "$example" --target aarch64-gnu "$level" -o "$BUILD_DIR/a64-${name}${level}.s"
       clang -cc1as -triple aarch64-unknown-linux-gnu -filetype obj \
         -o "$BUILD_DIR/a64-${name}${level}.o" "$BUILD_DIR/a64-${name}${level}.s"
+      "$BUILD_DIR/commonasmc" "$example" --target armv7a-gnu "$level" -o "$BUILD_DIR/arm-${name}${level}.s"
+      clang -cc1as -triple armv7-unknown-linux-gnueabi -filetype obj \
+        -o "$BUILD_DIR/arm-${name}${level}.o" "$BUILD_DIR/arm-${name}${level}.s"
+      "$BUILD_DIR/commonasmc" "$example" --target thumb2-gnu "$level" -o "$BUILD_DIR/thumb-${name}${level}.s"
+      clang -cc1as -triple thumbv7-unknown-linux-gnueabi -filetype obj \
+        -o "$BUILD_DIR/thumb-${name}${level}.o" "$BUILD_DIR/thumb-${name}${level}.s"
     done
   done
-  echo "clang accepted every aarch64 output."
+  echo "clang accepted every aarch64, armv7a and thumb2 output."
 else
-  echo "clang not found; skipped assembling the aarch64 output."
+  echo "clang not found; skipped assembling the aarch64 and ARM output."
 fi
 
 targets="
