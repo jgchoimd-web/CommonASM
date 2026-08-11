@@ -1,6 +1,6 @@
 # CommonASM
 
-[![CI](https://github.com/jgchoimd-web/common-assembly-language/actions/workflows/ci.yml/badge.svg)](https://github.com/jgchoimd-web/common-assembly-language/actions/workflows/ci.yml)
+[![CI](https://github.com/jgchoimd-web/CommonASM/actions/workflows/ci.yml/badge.svg)](https://github.com/jgchoimd-web/CommonASM/actions/workflows/ci.yml)
 
 ![CommonASM official logo](docs/assets/commonasm-logo-composite.png)
 
