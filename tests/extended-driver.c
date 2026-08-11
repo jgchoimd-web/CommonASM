@@ -7,7 +7,7 @@
 
 extern void cas_run(void);
 extern uint64_t cas_in, cas_popcnt, cas_clz, cas_ctz, cas_bswap,
-                cas_rol, cas_ror, cas_rol_reg, cas_ror_reg;
+                cas_rol, cas_ror, cas_rol_reg, cas_ror_reg, cas_inline;
 
 static uint64_t ref_popcnt(uint64_t x) {
     uint64_t n = 0;
@@ -78,7 +78,10 @@ int main(void) {
         check("ror", inputs[i], cas_ror, ref_ror(inputs[i], 13));
         check("rol/reg", inputs[i], cas_rol_reg, ref_rol(inputs[i], 13));
         check("ror/reg", inputs[i], cas_ror_reg, ref_ror(inputs[i], 13));
+        /* Whichever inline arm the target picked, it has to have multiplied
+           by three, which is how the block is shown to have gone in and run. */
+        check("inline", inputs[i], cas_inline, inputs[i] * 3u);
     }
-    printf("  %d inputs x 8 checks: %d failures\n", count, failures);
+    printf("  %d inputs x 9 checks: %d failures\n", count, failures);
     return failures != 0;
 }

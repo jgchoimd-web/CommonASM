@@ -198,6 +198,15 @@ h1 {
   object-fit: cover;
 }
 
+/* The mascot sits under the wordmark, so it is sized to stay a companion to
+   it rather than compete with it, and never cropped. */
+.official-logo img.mascot {
+  width: min(45%, 220px);
+  max-height: none;
+  object-fit: contain;
+  justify-self: center;
+}
+
 .official-logo figcaption {
   color: var(--muted);
   font-size: 0.9rem;

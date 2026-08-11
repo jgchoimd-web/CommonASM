@@ -6,10 +6,13 @@
 
 ![CommonASM icon logo](docs/assets/commonasm-logo-icon.png)
 
+![CommonASM mascot](docs/assets/commonasm-logo-mascot.png)
+
 CommonASM is a portable assembly IR that compiles into real assembly dialects.
 
 - Official logo: `docs/assets/commonasm-logo-composite.png`
 - Icon logo: `docs/assets/commonasm-logo-icon.png`
+- Mascot: `docs/assets/commonasm-logo-mascot.png`
 
 Curious about CommonASM? Go to https://ygsmsite.neocities.org/CommonASM
 
@@ -267,6 +270,57 @@ an x86-64 without POPCNT, say.
 Both paths are checked by running them: `tests/extended-kernel.cas` is built
 twice, once each way, linked against `tests/extended-driver.c` and required to
 agree with a reference implementation on every input.
+
+## Inline assembly
+
+For everything the extended operations do not cover, an `asm` block goes into
+the output exactly as written. Nothing in it is parsed or optimised, so a
+program can reach any instruction its machine has.
+
+```asm
+  mov r0, 7
+
+  asm x86_64 {
+    lea {r0}, [{r0} + {r0} * 2]
+  }
+  asm aarch64 {
+    add {r0}, {r0}, {r0}, lsl #1
+  }
+  asm portable {
+    mov r1, 3
+    mul r0, r1
+  }
+```
+
+`{r0}` is replaced by whatever the backend put virtual register `r0` in, so
+the block is wired to the code around it instead of guessing at registers.
+
+Consecutive blocks are alternatives for one spot: the first whose selector
+matches is emitted and the rest are skipped. **A run where nothing matches is
+an error**, so a hand-written fast path cannot silently become a hole on a
+target nobody wrote an arm for.
+
+A selector is one of:
+
+| selector | matches |
+| --- | --- |
+| a target name, e.g. `x86_64-nasm` | that target only |
+| a family: `x86_64`, `i386`, `riscv64`, `aarch64`, `arm32`, `mmix`, `dcpu16` | every target in it |
+| `any` | everything; body is still verbatim assembly |
+| `portable` | everything; body is **CommonASM**, compiled normally |
+
+`portable` is what makes the fast path optional: write the machine's own
+instructions for the targets worth hand-writing, and ordinary CommonASM for
+the rest.
+
+Two limits are worth knowing. A block is opaque to the compiler, so anything
+it was holding back — a buffered constant, a pending RISC-V comparison — is
+settled before the block and not carried across it. And `{rN}` needs a
+register the target can name: where a virtual register lives in a spill slot,
+x86 can still name it as a memory operand, but ARM cannot, and says so.
+
+`examples/inline.cas` shows both forms. The block in
+`tests/extended-kernel.cas` is checked by running it.
 
 `cmp a, b` records the relation between `a` and `b` for the following
 conditional jump. Signed jumps use `jg`/`jl`/`jge`/`jle`; unsigned jumps use

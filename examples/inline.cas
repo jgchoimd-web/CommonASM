@@ -1,0 +1,56 @@
+; Inline assembly. The body of an asm block is not compiled: it goes into the
+; output exactly as written, so a program can reach anything its machine has,
+; including instructions CommonASM has no operation for.
+;
+; Consecutive blocks are alternatives for one spot. The first whose selector
+; matches the target is the one that goes in; the rest are skipped. A run
+; where nothing matches is an error, not a silently missing instruction, so a
+; portable program ends its run with an arm that always matches.
+;
+; A selector is a target name (x86_64-nasm), a family (x86_64, i386, aarch64,
+; arm32, riscv64, mmix, dcpu16), "any" for a verbatim arm that matches
+; everything, or "portable" for an arm written in CommonASM instead of
+; assembly - which is how the fast path stays optional.
+;
+; {r0} is replaced by whatever the backend put virtual register r0 in, so the
+; block is connected to the code around it rather than guessing at registers.
+
+const stdout = 1
+
+.data
+msg: string "inline ok\n"
+
+.text
+global _start
+
+_start:
+  mov r0, 7
+
+  ; Multiply by three, the way each machine does it best.
+  asm x86_64 {
+    lea {r0}, [{r0} + {r0} * 2]
+  }
+  asm aarch64 {
+    add {r0}, {r0}, {r0}, lsl #1
+  }
+  asm arm32 {
+    add {r0}, {r0}, {r0}, lsl #1
+  }
+  asm portable {
+    mov r1, 3
+    mul r0, r1
+  }
+
+  ; An arm can also be for one exact target rather than a family, and it can
+  ; use instructions the language has no operation for at all.
+  asm x86_64-nasm {
+    ; count set bits into r1 without going through the compiler
+    popcnt {r1}, {r0}
+  }
+  asm portable {
+    mov r1, r0
+    popcnt r1
+  }
+
+  syscall write, stdout, msg, msg_len
+  syscall exit, 0

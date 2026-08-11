@@ -483,6 +483,12 @@ static void buf_grow(Buffer *buf, size_t extra) {
     }
 }
 
+static void buf_append_char(Buffer *buf, char ch) {
+    buf_grow(buf, 1);
+    buf->data[buf->len++] = ch;
+    buf->data[buf->len] = '\0';
+}
+
 static void buf_append(Buffer *buf, const char *text) {
     size_t extra = strlen(text);
     buf_grow(buf, extra);
@@ -3471,6 +3477,99 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
     return true;
 }
 
+/* ---------------------------------------------------------- inline assembly */
+
+/* The operand text a backend uses for a virtual register, which is what an
+   inline block interpolates so its assembly can reach the surrounding code.
+   NULL when the register has no name on this target - a spilled ARM register,
+   for instance, lives in memory the block would have to load from itself. */
+static const char *target_register_name(const char *target, int index) {
+    const TargetDesc *desc = target_lookup(target);
+    if (!desc) return NULL;
+    switch (desc->cls) {
+        case CLASS_X86_64: return x86_operand_text(index, "q");
+        case CLASS_I386: return i386_operand_text(index, "d");
+        case CLASS_RV64: return rv_regs[index];
+        case CLASS_MMIX: return mmix_regs[index];
+        case CLASS_DCPU: return index < 8 ? dcpu_regs[index] : NULL;
+        case CLASS_GENERIC:
+            if (desc->flags & TF_AARCH64) return aarch64_regs[index];
+            if (desc->flags & TF_ARM32) return index < ARM_MAPPED_COUNT ? arm_regs[index] : NULL;
+            if (desc->flags & TF_RV_GENERIC) return rv_regs[index];
+            if (desc->flags & TF_IA64) return ia64_regs[index];
+            if (desc->flags & TF_LOONG) return loong_regs[index];
+            return portable_regs[index];
+        default:
+            return portable_regs[index];
+    }
+}
+
+/* Selectors name a target exactly, a family, or every target. "portable" also
+   matches every target, but its body is CommonASM rather than assembly, which
+   is what makes it usable as the last arm: the fast path is written in the
+   machine's own instructions, and everything else falls through to code that
+   compiles anywhere. */
+static bool asm_selector_is_known(const char *selector) {
+    return strcmp(selector, "portable") == 0 ||
+           strcmp(selector, "any") == 0 || strcmp(selector, "x86_64") == 0 ||
+           strcmp(selector, "i386") == 0 || strcmp(selector, "riscv64") == 0 ||
+           strcmp(selector, "aarch64") == 0 || strcmp(selector, "arm32") == 0 ||
+           strcmp(selector, "mmix") == 0 || strcmp(selector, "dcpu16") == 0 ||
+           is_supported_target(selector);
+}
+
+static bool asm_selector_matches(const char *selector, const char *target) {
+    if (strcmp(selector, "any") == 0 || strcmp(selector, "portable") == 0) return true;
+    if (strcmp(selector, target) == 0) return true;
+    if (strcmp(selector, "x86_64") == 0) return target_has_class(target, CLASS_X86_64);
+    if (strcmp(selector, "i386") == 0) return target_has_class(target, CLASS_I386);
+    if (strcmp(selector, "riscv64") == 0) return target_has_class(target, CLASS_RV64);
+    if (strcmp(selector, "mmix") == 0) return target_has_class(target, CLASS_MMIX);
+    if (strcmp(selector, "dcpu16") == 0) return target_has_class(target, CLASS_DCPU);
+    if (strcmp(selector, "aarch64") == 0) return target_has_flag(target, TF_AARCH64);
+    if (strcmp(selector, "arm32") == 0) return target_has_flag(target, TF_ARM32);
+    return false;
+}
+
+/* Copies one line of a block through untouched, except that {rN} becomes
+   whatever the backend put virtual register N in. Nothing else is parsed:
+   that is the point of the construct. */
+static void emit_inline_asm_line(Buffer *out, const char *line, const char *target, int line_no) {
+    for (const char *p = line; *p; ) {
+        const char *close;
+        char name[16];
+        size_t len;
+        int index;
+        const char *replacement;
+        if (*p != '{') {
+            buf_append_char(out, *p++);
+            continue;
+        }
+        close = strchr(p, '}');
+        if (!close) {
+            line_error(line_no, "asm", "unterminated { in an inline assembly operand");
+        }
+        len = (size_t)(close - p) - 1;
+        if (len == 0 || len >= sizeof(name)) {
+            line_error(line_no, "asm", "expected an operand like {r0} in inline assembly");
+        }
+        memcpy(name, p + 1, len);
+        name[len] = '\0';
+        index = virtual_reg_index(name);
+        if (index < 0) {
+            line_error_token(line_no, name, "asm", "expected a virtual register r0-r15 in {}");
+        }
+        replacement = target_register_name(target, index);
+        if (!replacement) {
+            line_error_token(line_no, name, "asm",
+                             "this target keeps that virtual register in memory, so inline assembly cannot name it");
+        }
+        buf_append(out, replacement);
+        p = close + 1;
+    }
+    buf_append(out, "\n");
+}
+
 static void emit_text_line(Buffer *text, char *line, int line_no, const char *target) {
     char *space;
     char *args[16];
@@ -3887,6 +3986,16 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const char *section = NULL;
     enum { SECTION_NONE, SECTION_DATA, SECTION_RODATA, SECTION_BSS, SECTION_TEXT } section_kind = SECTION_NONE;
     int line_no = 0;
+    bool in_asm_block = false;
+    bool asm_emitting = false;
+    bool asm_verbatim = true;
+    Buffer *asm_target_buffer = NULL;
+    /* Consecutive asm blocks are alternatives for one spot: the first whose
+       selector matches is emitted and the rest are skipped. A run where none
+       matches is an error rather than a silently missing instruction. */
+    bool asm_run_open = false;
+    bool asm_run_matched = false;
+    int asm_run_line = 0;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
     const bool i386 = is_i386_target(target);
     const bool rv = is_rv64_target(target);
@@ -3911,9 +4020,83 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         line_no++;
         if (newline) { *newline = '\0'; cursor = newline + 1; }
         else cursor += strlen(cursor);
+
+        /* Inline assembly is collected before comments are stripped, because
+           the body is not CommonASM: a '#' in it is an ARM immediate, not the
+           start of a comment. */
+        if (in_asm_block) {
+            char *body = line;
+            while (*body && isspace((unsigned char)*body)) body++;
+            {
+                char *end = body + strlen(body);
+                while (end > body && isspace((unsigned char)end[-1])) *--end = '\0';
+            }
+            if (strcmp(body, "}") == 0) {
+                in_asm_block = false;
+                continue;
+            }
+            if (asm_emitting) {
+                if (asm_verbatim) {
+                    emit_inline_asm_line(asm_target_buffer, line, target, line_no);
+                } else {
+                    /* The portable arm is ordinary CommonASM, so it goes
+                       through the normal path, comments and all. */
+                    char *portable;
+                    strip_comment(line);
+                    portable = trim(line);
+                    if (*portable) {
+                        emit_text_line_optimized(&text, portable, line_no, target, &optimizer);
+                    }
+                }
+            }
+            continue;
+        }
+
         strip_comment(line);
         line = trim(line);
         if (*line == '\0') continue;
+        if (line[0] == 'a' && strncmp(line, "asm ", 4) == 0) {
+            char *selector = line + 4;
+            char *brace = strchr(selector, '{');
+            if (!brace || *trim(brace + 1) != '\0') {
+                line_error(line_no, "asm", "expected asm SELECTOR { on its own line");
+            }
+            *brace = '\0';
+            selector = trim(selector);
+            if (!asm_selector_is_known(selector)) {
+                line_error_token(line_no, selector, "asm", "unknown target or family in an asm selector");
+            }
+            if (section_kind == SECTION_NONE) {
+                line_error(line_no, "asm", "expected .data, .rodata, .bss, or .text");
+            }
+            if (!asm_run_open) {
+                asm_run_open = true;
+                asm_run_matched = false;
+                asm_run_line = line_no;
+            }
+            asm_verbatim = strcmp(selector, "portable") != 0;
+            if (!asm_verbatim && section_kind != SECTION_TEXT) {
+                line_error(line_no, "asm", "a portable asm arm holds instructions, so it belongs in .text");
+            }
+            in_asm_block = true;
+            asm_emitting = !asm_run_matched && asm_selector_matches(selector, target);
+            if (asm_emitting) asm_run_matched = true;
+            /* Verbatim text can do anything, so nothing the compiler was
+               holding back may outlive it. */
+            opt_flush(&text, target, &optimizer);
+            if (is_rv64_target(target)) rv_discard_compare();
+            asm_target_buffer = section_kind == SECTION_DATA ? &data :
+                                section_kind == SECTION_RODATA ? &rodata :
+                                section_kind == SECTION_BSS ? &bss : &text;
+            continue;
+        }
+        if (asm_run_open) {
+            if (!asm_run_matched) {
+                line_error(asm_run_line, "asm", "no asm block here matches the target being compiled");
+            }
+            asm_run_open = false;
+        }
+
         /* Classifying a line used to cost about ten string comparisons, on
            every line. Gating each family on its first character skips nearly
            all of them, and the section is remembered as a code so the text
@@ -3956,6 +4139,12 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         else if (section_kind == SECTION_DATA) emit_data_line(&data, &constants, line, line_no, target, section);
         else if (section_kind == SECTION_RODATA) emit_data_line(&rodata, &constants, line, line_no, target, section);
         else emit_data_line(&bss, &constants, line, line_no, target, section);
+    }
+    if (in_asm_block) {
+        line_error(asm_run_line, "asm", "unterminated asm block; expected a closing }");
+    }
+    if (asm_run_open && !asm_run_matched) {
+        line_error(asm_run_line, "asm", "no asm block here matches the target being compiled");
     }
     opt_flush(&text, target, &optimizer);
     /* Only reserve backing store for the spilled virtual registers if the
