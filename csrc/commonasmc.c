@@ -7622,6 +7622,13 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         /* A target that advertises the bit-manipulation instructions has to
            tell the assembler it may use them. */
         if (target_has_flag(target, TF_RV_ZBB)) buf_append(&out, ".option arch, +zbb\n");
+        /* Taking a symbol's address is auipc plus addi, and the linker is
+           allowed to fold that pair into one instruction relative to gp when
+           the symbol is near enough. gp is set up by the C runtime's startup
+           code, which freestanding output does not have, so the fold turns a
+           correct address into one about 2048 below zero. Nothing here needs
+           the saving, and the relocation that permits it is not emitted. */
+        buf_append(&out, ".option norelax\n");
         buf_append(&out, constants.data);
         if (rodata.len) { buf_append(&out, ".section .rodata\n"); buf_append(&out, rodata.data); }
         if (data.len) { buf_append(&out, ".section .data\n"); buf_append(&out, data.data); }
