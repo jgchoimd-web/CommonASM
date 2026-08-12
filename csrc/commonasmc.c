@@ -193,6 +193,10 @@ static const char *aarch64_regs[] = {
     "x27", "x28", "x9", "x10", "x11", "x12", "x13", "x14"
 };
 
+/* Set when a program uses an atomic operation, so the one directive it
+   needs is written out and no other program pays for it. */
+static bool a64_lse_used = false;
+
 #define A64_SCRATCH "x16"
 #define A64_SCRATCH2 "x17"
 static const char *ia64_regs[] = {
@@ -899,9 +903,11 @@ static unsigned target_caps(const char *target) {
         case CLASS_GENERIC:
             if (desc->flags & TF_AARCH64) {
                 /* csel decides min, max and sel without a branch, and cneg
-                   is abs once the sign has been tested. */
+                   is abs once the sign has been tested. The atomics are the
+                   ones ARMv8.1 added, which is announced in the output only
+                   by a program that uses one. */
                 return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT |
-                       CAP_MINMAX | CAP_ABS | CAP_SEL;
+                       CAP_MINMAX | CAP_ABS | CAP_SEL | CAP_ATOMIC;
             }
             if (desc->flags & TF_ARM32) {
                 unsigned caps = CAP_ROT; /* the barrel shifter is always there */
@@ -3177,6 +3183,29 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
             buf_appendf(text, "  sdiv %s, %s, %s\n", A64_SCRATCH2, dst, src);
             buf_appendf(text, "  msub %s, %s, %s, %s\n", dst, A64_SCRATCH2, src, dst);
         }
+        return;
+    }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  dmb ish\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* The single-instruction atomics, which arrived with ARMv8.1. The
+           alternative is a load-exclusive and store-exclusive loop, which
+           needs a third scratch register this backend has not got: all
+           sixteen virtual registers live in machine registers here. */
+        char addr[256];
+        const char *dst = a64_reg(args[0], line_no, op);
+        a64_lse_used = true;
+        a64_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (op_is(op, "cas")) {
+            const char *newv = a64_reg(args[2], line_no, op);
+            buf_appendf(text, "  mov %s, %s\n", A64_SCRATCH, dst);
+            buf_appendf(text, "  casal %s, %s, %s\n", A64_SCRATCH, newv, addr);
+        } else if (op_is(op, "atomic_add")) {
+            buf_appendf(text, "  ldaddal %s, %s, %s\n", dst, A64_SCRATCH, addr);
+        } else {
+            buf_appendf(text, "  swpal %s, %s, %s\n", dst, A64_SCRATCH, addr);
+        }
+        buf_appendf(text, "  mov %s, %s\n", dst, A64_SCRATCH);
         return;
     }
     if ((op_is(op, "min") || op_is(op, "max")) && argc == 2) {
@@ -8308,6 +8337,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             } else if (is_arm32_target(target)) {
                 buf_append(&out, ".syntax unified\n.arm\n");
             }
+            /* The atomics this backend emits are ARMv8.1 instructions. The
+               rest of what it emits is ARMv8, which that name includes, so
+               raising the floor costs a program nothing until it uses one. */
+            if (a64_lse_used) buf_append(&out, ".arch armv8.1-a\n");
             /* A 64-bit SPARC assembler wants to be told before an application
                global is used, since the ABI leaves their role to the program. */
             if (is_sparc_target(target) && sparc_is_64(target)) {

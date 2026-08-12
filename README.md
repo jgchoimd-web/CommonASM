@@ -362,8 +362,16 @@ indivisibility.
 | target | `atomic_add` |
 | --- | --- |
 | `x86_64-nasm` | `lock xadd` |
+| `aarch64-gnu` | `ldaddal` |
 | `riscv64-gnu` | `amoadd.d` |
 | everything else | a load, an add and a store |
+
+The AArch64 instructions are the ones ARMv8.1 added, so a program that uses
+one raises the floor of its own output to that — announced by an `.arch`
+directive the output only carries when an atomic is in it. The alternative
+would be a load-exclusive and store-exclusive loop, which needs a scratch
+register that backend has not got: all sixteen virtual registers live in
+machine registers there.
 
 That last row is a real difference, not a slower way of doing the same thing.
 It is correct for a program with one thread and wrong for one with two, so
