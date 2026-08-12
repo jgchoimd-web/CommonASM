@@ -69,6 +69,43 @@ if grep -q "add rbx, 0" "$BUILD_DIR/optimize-O1.asm" ||
   exit 1
 fi
 
+# A function that calls has to keep its return address, on the machines where
+# the call instruction writes a register rather than the stack. A leaf
+# function has nothing to keep and should not pay for it.
+cat > "$BUILD_DIR/nested.cas" <<'CAS'
+.text
+global _start
+_start:
+  call outer
+  syscall exit, 0
+func outer
+  call leaf
+  ret
+endfunc
+func leaf
+  mov r0, 1
+  ret
+endfunc
+CAS
+# The marker is the saving instruction, not the register name: a return
+# instruction names the register too.
+for pair in "aarch64-gnu@str x30" "armv7a-gnu@push {lr}" "riscv64-gnu@sd ra, 0(sp)"             "mips32-gnu@sw \$ra, 0(\$sp)" "ppcg4-gnu@mflr" "sparcv8-gnu@st %o7, [%sp+0]"             "zarch@stg %r14"; do
+  nested_target=${pair%%@*}
+  nested_reg=${pair#*@}
+  "$BUILD_DIR/commonasmc" "$BUILD_DIR/nested.cas" --target "$nested_target" -O1     -o "$BUILD_DIR/nested-$nested_target.s"
+  outer_body=$(sed -n '/^outer:/,/^leaf:/p' "$BUILD_DIR/nested-$nested_target.s")
+  leaf_body=$(sed -n '/^leaf:/,$p' "$BUILD_DIR/nested-$nested_target.s")
+  if ! printf '%s' "$outer_body" | grep -qF -- "$nested_reg"; then
+    echo "$nested_target: a function that calls did not keep its return address"
+    exit 1
+  fi
+  if printf '%s' "$leaf_body" | grep -qF -- "$nested_reg"; then
+    echo "$nested_target: a leaf function saved a return address it did not need to"
+    exit 1
+  fi
+done
+echo "a nested call keeps its return address, and a leaf does not pay for it."
+
 # Multiplying a value the compiler cannot see by a power of two is a shift.
 cat > "$BUILD_DIR/strength.cas" <<'CAS'
 .bss

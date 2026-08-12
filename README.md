@@ -14,7 +14,8 @@ CommonASM is a portable assembly IR that compiles into real assembly dialects.
 - Icon logo: `docs/assets/commonasm-logo-icon.png`
 - Mascot: `docs/assets/commonasm-logo-mascot.png`
 
-Curious about CommonASM? Go to https://ygsmsite.neocities.org/CommonASM
+The project site is at https://jgchoimd-web.github.io/CommonASM/, built from
+`docs/` by `.github/workflows/pages.yml` on every push that touches it.
 
 It is meant as a middle layer for a future programming language compiler:
 
@@ -24,28 +25,13 @@ your language -> CommonASM -> x86_64 / riscv64 / more backends later
 
 ## Supported targets
 
-Assembler-verified. CI compiles every example for these and runs the result
-through a real assembler, so "it assembles" is a checked property rather than
-a claim:
+A target is in one of three lists below, and which one is decided by what CI
+does with it rather than by how finished it feels.
 
-- `x86_64-nasm`, `i386-nasm` / `ia32-nasm` (nasm)
-- `aarch64-gnu`, `armv7a-gnu` / `armv4-gnu` / `armv5-gnu`, `thumb-gnu` /
-  `thumb2-gnu` (clang)
-- `riscv64-gnu` / `rv64i-gnu`, `riscv64-zbb` (binutils)
-- `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu` (binutils)
-- `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`,
-  `power9-gnu`, `power10-gnu` (binutils)
-- `sparcv8-gnu`, `sparcv9-gnu` (binutils)
-- `m68k`, `coldfire` (binutils)
-- `zarch` (binutils)
-
-Every family in the list below that claims to emit assembly is in that set.
-The rest is assembly-shaped text rather than assembly, and says so under
-`--target-info`.
-
-`demos/` has two programs written in the language rather than about it: a
-freestanding multiboot kernel and a guessing game on raw syscalls. What
-writing them changed is recorded in `demos/README.md`.
+`demos/` has three programs written in the language rather than about it: a
+freestanding multiboot kernel, a guessing game on raw syscalls, and a sorting
+program that the emulated machines all have to agree on. What writing them
+changed is recorded in `demos/README.md`.
 
 Executed on every commit — built, linked, and run under emulation, all
 required to print the same thing:
@@ -146,8 +132,12 @@ make examples
 
 ## GitHub Pages site
 
-This repository includes a static project site in `docs/`. In GitHub Pages,
-choose "Deploy from a branch", select `main`, and set the folder to `/docs`.
+The site is `docs/`, published at
+<https://jgchoimd-web.github.io/CommonASM/>. `.github/workflows/pages.yml`
+deploys it on every push that touches `docs/`, so what is on the site is what
+is in the repository, and the deployment is visible in Actions rather than
+hidden in a settings page. The workflow checks that every asset the page names
+is actually present before publishing.
 
 ## Community files
 

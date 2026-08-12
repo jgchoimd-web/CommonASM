@@ -1402,6 +1402,58 @@ static unsigned scan_mentioned_vregs(const char *source) {
     return mask;
 }
 
+/* The functions whose bodies contain a call. On a machine where the call
+   instruction writes a register rather than the stack, such a function has to
+   put that register somewhere before making its own call, or the call
+   overwrites the address it was going to return to. A leaf function has
+   nothing to save, and most functions are leaves, so it is worth knowing
+   which is which rather than saving in all of them. */
+static SymbolSet functions_that_call;
+
+/* True while emitting a function that saved the link register, so that ret
+   knows to put it back. */
+static bool func_saved_link = false;
+
+static void scan_functions_that_call(const char *source) {
+    const char *p = source;
+    char current[128];
+    bool inside = false;
+    current[0] = '\0';
+    while (*p) {
+        const char *line = p;
+        const char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        while (len > 0 && isspace((unsigned char)*line)) { line++; len--; }
+        while (len > 0 && isspace((unsigned char)line[len - 1])) len--;
+        if (len > 5 && strncmp(line, "func ", 5) == 0) {
+            const char *name = line + 5;
+            size_t name_len = len - 5;
+            while (name_len > 0 && isspace((unsigned char)*name)) { name++; name_len--; }
+            if (name_len < sizeof(current)) {
+                memcpy(current, name, name_len);
+                current[name_len] = '\0';
+                inside = true;
+            }
+        } else if (len == 7 && strncmp(line, "endfunc", 7) == 0) {
+            inside = false;
+        } else if (inside && len > 5 && strncmp(line, "call ", 5) == 0) {
+            if (!symbol_set_contains(&functions_that_call, current)) {
+                symbol_set_add(&functions_that_call, current, NULL);
+            }
+            inside = false;   /* one call is enough to need the save */
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
+/* Whether this function has to preserve the link register, answered at the
+   point the function starts so that ret can mirror it. */
+static bool func_needs_link_save(const char *name) {
+    func_saved_link = symbol_set_contains(&functions_that_call, name);
+    return func_saved_link;
+}
+
 /* Index of the virtual register a machine register carries, or -1. */
 static int x86_vreg_of(const char *physical) {
     for (int i = 0; i < X86_MAPPED_COUNT; i++) {
@@ -2554,7 +2606,17 @@ static void emit_arm_syscall(Buffer *text, char **args, int argc, int line_no) {
 }
 
 static void emit_arm_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  push {lr}\n");
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -2721,7 +2783,13 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
     }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  bx lr\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  pop {lr}\n");
+        }
+        buf_append(text, "  bx lr\n");
+        return;
+    }
     if (argc == 1) {
         const char *cond =
             op_is(op, "je") ? "eq" : op_is(op, "jne") ? "ne" :
@@ -2872,7 +2940,17 @@ static void emit_a64_syscall(Buffer *text, char **args, int argc, int line_no) {
 }
 
 static void emit_a64_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  str x30, [sp, #-16]!\n");
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -3067,7 +3145,13 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
     }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  ldr x30, [sp], #16\n");
+        }
+        buf_append(text, "  ret\n");
+        return;
+    }
     if (argc == 1) {
         const char *cond =
             op_is(op, "je") ? "eq" : op_is(op, "jne") ? "ne" :
@@ -3547,7 +3631,18 @@ static void emit_rv_instruction(Buffer *text, const char *target, const char *op
             }
         }
     }
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_appendf(text, "  addi sp, sp, -%d\n", slot);
+            buf_appendf(text, "  %s ra, 0(sp)\n", word_store);
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -3705,7 +3800,14 @@ static void emit_rv_instruction(Buffer *text, const char *target, const char *op
     if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "  %s %s, 0(sp)\n  addi sp, sp, %d\n", word_load, rv_reg(args[0], line_no, op), slot); return; }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_appendf(text, "  %s ra, 0(sp)\n", word_load);
+            buf_appendf(text, "  addi sp, sp, %d\n", slot);
+        }
+        buf_append(text, "  ret\n");
+        return;
+    }
     if (op_is(op, "syscall")) { emit_rv_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count");
 }
@@ -4103,7 +4205,18 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         }
     }
 
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_appendf(text, "  %s $sp, $sp, -%d\n", addiu, slot);
+            buf_appendf(text, "  %s $ra, 0($sp)\n", word_store);
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -4229,7 +4342,14 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  jal %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  jr $ra\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_appendf(text, "  %s $ra, 0($sp)\n", word_load);
+            buf_appendf(text, "  %s $sp, $sp, %d\n", addiu, slot);
+        }
+        buf_append(text, "  jr $ra\n");
+        return;
+    }
     if (op_is(op, "syscall")) { emit_mips_syscall(text, target, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for MIPS");
 }
@@ -4371,7 +4491,19 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
         }
     }
 
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  mflr 0\n");
+            buf_appendf(text, "  addi 1, 1, -%d\n", slot);
+            buf_appendf(text, "  %s 0, 0(1)\n", word_store);
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -4541,7 +4673,15 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
     }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  b %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bl %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  blr\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_appendf(text, "  %s 0, 0(1)\n", word_load);
+            buf_appendf(text, "  addi 1, 1, %d\n", slot);
+            buf_append(text, "  mtlr 0\n");
+        }
+        buf_append(text, "  blr\n");
+        return;
+    }
     if (op_is(op, "syscall")) { emit_ppc_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for PowerPC");
 }
@@ -4657,7 +4797,18 @@ static void emit_sparc_instruction(Buffer *text, const char *target, const char 
     const char *word_store = wide ? "stx" : "st";
     const int slot = wide ? 8 : 4;
 
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_appendf(text, "  sub %%sp, %d, %%sp\n", slot);
+            buf_appendf(text, "  %s %%o7, [%%sp+0]\n", word_store);
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
@@ -4815,6 +4966,10 @@ static void emit_sparc_instruction(Buffer *text, const char *target, const char 
         return;
     }
     if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_appendf(text, "  %s [%%sp+0], %%o7\n", word_load);
+            buf_appendf(text, "  add %%sp, %d, %%sp\n", slot);
+        }
         /* retl returns through %o7 without unwinding a window, which is what
            flat code wants. */
         buf_append(text, "  retl\n");
@@ -5281,7 +5436,18 @@ static void emit_s390_syscall(Buffer *text, char **args, int argc, int line_no) 
 
 static void emit_s390_instruction(Buffer *text, const char *op, const char *size,
                                   char **args, int argc, int line_no) {
-    if (op_is(op, "func") && argc == 1) { buf_appendf(text, "%s:\n", args[0]); return; }
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* The call instruction leaves the return address in a register, so
+           a function that itself calls has to put its own away first: the
+           inner call would otherwise overwrite the address it was going to
+           return to. Leaf functions save nothing. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  aghi %r15, -8\n");
+            buf_append(text, "  stg %r14, 0(%r15)\n");
+        }
+        return;
+    }
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         buf_append(text, "  aghi %r15, -16\n");
@@ -5442,7 +5608,14 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
     }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  brasl %%r14, %s\n", args[0]); return; }
-    if (op_is(op, "ret") && argc == 0) { buf_append(text, "  br %r14\n"); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  lg %r14, 0(%r15)\n");
+            buf_append(text, "  aghi %r15, 8\n");
+        }
+        buf_append(text, "  br %r14\n");
+        return;
+    }
     if (op_is(op, "syscall")) { emit_s390_syscall(text, args, argc, line_no); return; }
     line_error(line_no, op, "unsupported instruction or wrong argument count for s390x");
 }
@@ -7233,6 +7406,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     }
     /* Scanned before the loop starts chopping the source into lines. */
     mentioned_vregs = scan_mentioned_vregs(source);
+    scan_functions_that_call(source);
     if (is_wasm_target(target)) wasm_begin();
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;

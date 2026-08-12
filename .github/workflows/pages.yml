@@ -1,0 +1,55 @@
+name: Pages
+
+# The site is the docs/ directory, published as-is. It is static, so there is
+# nothing to build - the job exists so that a push to main is what updates the
+# site, rather than a setting somewhere that nobody can see from the repo.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and a newer push wins rather than queueing behind
+# an older one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Publish docs/ to GitHub Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check the site is intact
+        run: |
+          test -f docs/index.html
+          test -f docs/styles.css
+          for asset in $(grep -o 'assets/[A-Za-z0-9_.-]*' docs/index.html | sort -u); do
+            test -f "docs/$asset" || { echo "docs/index.html points at a missing $asset"; exit 1; }
+          done
+          echo "every asset the page names is present."
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs/
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
