@@ -279,8 +279,14 @@ if command -v riscv64-linux-gnu-as > /dev/null 2>&1; then
       "$BUILD_DIR/commonasmc" "$example" --target "$target" -o "$BUILD_DIR/rv-${target}-${name}.s"
       riscv64-linux-gnu-as -o "$BUILD_DIR/rv-${target}-${name}.o" "$BUILD_DIR/rv-${target}-${name}.s"
     done
+    # The same assembler builds rv32 when told which machine it is. The
+    # multiply and divide are the M extension, which the target has always
+    # emitted and which the bare name rv32i does not promise.
+    "$BUILD_DIR/commonasmc" "$example" --target rv32i-gnu -o "$BUILD_DIR/rv-rv32i-${name}.s"
+    riscv64-linux-gnu-as -march=rv32im -mabi=ilp32 \
+      -o "$BUILD_DIR/rv-rv32i-${name}.o" "$BUILD_DIR/rv-rv32i-${name}.s"
   done
-  echo "the RISC-V assembler accepted every riscv64-gnu and riscv64-zbb output."
+  echo "the RISC-V assembler accepted every riscv64-gnu, riscv64-zbb and rv32i-gnu output."
 else
   echo "no RISC-V assembler found; skipped assembling the RISC-V output."
 fi
@@ -440,6 +446,8 @@ run_exec_case i386-nasm   nasm "-f elf32"  ld "-m elf_i386"   ""
 run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
 run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
 run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
+run_exec_case rv32i-gnu   riscv64-linux-gnu-as "-march=rv32im -mabi=ilp32" \
+                          riscv64-linux-gnu-ld "-m elf32lriscv" qemu-riscv32-static
 # A MIPS linker looks for __start rather than _start, so it is told the name.
 run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "-e _start" qemu-mips-static
 run_exec_case ppcg4-gnu   powerpc-linux-gnu-as "" powerpc-linux-gnu-ld "" qemu-ppc-static

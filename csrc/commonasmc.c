@@ -200,7 +200,7 @@ static const char *portable_regs[] = {
 typedef enum {
     CLASS_X86_64,
     CLASS_I386,
-    CLASS_RV64,
+    CLASS_RISCV,
     CLASS_GENERIC,
     CLASS_LEGACY,
     CLASS_VM_IR,
@@ -245,7 +245,8 @@ enum {
     TF_HAS_REV = 1u << 6,   /* ARMv6 and later */
     TF_HAS_RBIT = 1u << 7,  /* ARMv6T2 and later */
     TF_RV_ZBB = 1u << 8,    /* RISC-V bit-manipulation extension */
-    TF_64BIT = 1u << 9      /* a 64-bit member of an otherwise 32-bit family */
+    TF_64BIT = 1u << 9,     /* a 64-bit member of an otherwise 32-bit family */
+    TF_RV32 = 1u << 10      /* the 32-bit member of the RISC-V family */
 };
 
 /* Operations the language offers on every target but that only some machines
@@ -272,11 +273,11 @@ typedef struct {
    grouped in the order --list-targets prints them. */
 static const TargetDesc target_table[] = {
     {"x86_64-nasm", CLASS_X86_64, GROUP_PRIMARY, 0},
-    {"riscv64-gnu", CLASS_RV64, GROUP_PRIMARY, 0},
-    {"rv64i-gnu", CLASS_RV64, GROUP_PRIMARY, 0},
+    {"riscv64-gnu", CLASS_RISCV, GROUP_PRIMARY, 0},
+    {"rv64i-gnu", CLASS_RISCV, GROUP_PRIMARY, 0},
     /* Same lowering as riscv64-gnu, but allowed to use the bit-manipulation
        instructions. Adding it costs one row, which is what the table is for. */
-    {"riscv64-zbb", CLASS_RV64, GROUP_PRIMARY, TF_RV_ZBB},
+    {"riscv64-zbb", CLASS_RISCV, GROUP_PRIMARY, TF_RV_ZBB},
 
     {"i386-nasm", CLASS_I386, GROUP_I386, 0},
     {"ia32-nasm", CLASS_I386, GROUP_I386, 0},
@@ -287,7 +288,7 @@ static const TargetDesc target_table[] = {
     {"aarch64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_AARCH64},
     {"thumb-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ},
     {"thumb2-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_ARM32 | TF_HAS_CLZ | TF_HAS_REV | TF_HAS_RBIT},
-    {"rv32i-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_RV_GENERIC},
+    {"rv32i-gnu", CLASS_RISCV, GROUP_GENERIC, TF_RV32},
     {"rv128i-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_RV_GENERIC},
     {"ia64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_IA64},
     {"loongarch64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_LOONG},
@@ -766,8 +767,8 @@ static bool is_i386_target(const char *target) {
     return target_has_class(target, CLASS_I386);
 }
 
-static bool is_rv64_target(const char *target) {
-    return target_has_class(target, CLASS_RV64);
+static bool is_riscv_target(const char *target) {
+    return target_has_class(target, CLASS_RISCV);
 }
 
 static bool is_generic_arch_target(const char *target) {
@@ -861,7 +862,7 @@ static unsigned target_caps(const char *target) {
                for clz and ctz but they leave the result undefined for a zero
                input, so those are expanded instead. */
             return CAP_BSWAP | CAP_ROT;
-        case CLASS_RV64:
+        case CLASS_RISCV:
             return (desc->flags & TF_RV_ZBB) ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT) : 0;
         case CLASS_WASM:
             /* wasm counts bits and rotates natively, but has nothing that
@@ -897,6 +898,7 @@ static int target_word_bits(const char *target) {
     }
     if (desc->cls == CLASS_M68K) return 32;
     if (desc->cls == CLASS_S390) return 64;
+    if (desc->cls == CLASS_RISCV) return (desc->flags & TF_RV32) ? 32 : 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
     return 64;
 }
@@ -980,7 +982,7 @@ static const char *target_support_level(const char *target) {
    the class alone is not the answer. */
 static bool target_emits_assembly(const TargetDesc *desc) {
     switch (desc->cls) {
-        case CLASS_X86_64: case CLASS_I386: case CLASS_RV64: case CLASS_MIPS:
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS:
         case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
         case CLASS_WASM:
             return true;
@@ -998,7 +1000,7 @@ static const char *target_output_kind(const char *target) {
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return "GNU ARM assembly";
     switch (desc->cls) {
         case CLASS_X86_64: return "NASM x86-64 assembly";
-        case CLASS_RV64: return "GNU RISC-V 64 assembly";
+        case CLASS_RISCV: return (desc->flags & TF_RV32) ? "GNU RISC-V 32 assembly" : "GNU RISC-V 64 assembly";
         case CLASS_I386: return "NASM i386 assembly";
         case CLASS_MIPS: return "GNU MIPS assembly";
         case CLASS_PPC: return "GNU PowerPC assembly";
@@ -1342,18 +1344,20 @@ static const char *x86_size_word(const char *size) {
     return "qword";
 }
 
-static const char *rv_load_op(const char *size) {
+/* On rv32 there is no eight-byte load, so an unsuffixed access is the
+   four-byte one, which is that machine's word. */
+static const char *rv_load_op(const char *size, bool wide) {
     if (strcmp(size, "b") == 0) return "lb";
     if (strcmp(size, "w") == 0) return "lh";
     if (strcmp(size, "d") == 0) return "lw";
-    return "ld";
+    return wide ? "ld" : "lw";
 }
 
-static const char *rv_store_op(const char *size) {
+static const char *rv_store_op(const char *size, bool wide) {
     if (strcmp(size, "b") == 0) return "sb";
     if (strcmp(size, "w") == 0) return "sh";
     if (strcmp(size, "d") == 0) return "sw";
-    return "sd";
+    return wide ? "sd" : "sw";
 }
 
 /* Over-approximates which virtual registers the program mentions by scanning
@@ -1547,7 +1551,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     char *name;
     char *kind;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
-    const bool rv = is_rv64_target(target);
+    const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
     const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target) || is_toy_target(target);
@@ -3434,7 +3438,14 @@ static void compare_emit_branch(Buffer *text, DeferredCompare *cmp, const char *
     buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, cmp->lhs, rhs, label);
 }
 
-static void emit_rv_instruction(Buffer *text, const char *op, const char *size, char **args, int argc, int line_no) {
+static void emit_rv_instruction(Buffer *text, const char *target, const char *op, const char *size,
+                                char **args, int argc, int line_no) {
+    /* rv32 and rv64 differ only in how wide a word is: same registers, same
+       mnemonics for everything narrower, and the same syscall numbers. */
+    const bool wide = !target_has_flag(target, TF_RV32);
+    const char *word_load = wide ? "ld" : "lw";
+    const char *word_store = wide ? "sd" : "sw";
+    const int slot = wide ? 8 : 4;
     /* A pending comparison only has to be pinned down when something is about
        to disturb the registers it names. Snapshotting on every intervening
        instruction instead would leave dead copies behind after the common
@@ -3454,7 +3465,8 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
-        buf_append(text, "  addi sp, sp, -16\n  sd ra, 8(sp)\n  sd s0, 0(sp)\n  mv s0, sp\n");
+        buf_appendf(text, "  addi sp, sp, -%d\n  %s ra, %d(sp)\n  %s s0, 0(sp)\n  mv s0, sp\n",
+                    slot * 2, word_store, slot, word_store);
         if (strcmp(args[0], "0") == 0) {
             return;
         }
@@ -3468,7 +3480,8 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
         return;
     }
     if (op_is(op, "leave") && argc == 0) {
-        buf_append(text, "  mv sp, s0\n  ld s0, 0(sp)\n  ld ra, 8(sp)\n  addi sp, sp, 16\n"); return;
+        buf_appendf(text, "  mv sp, s0\n  %s s0, 0(sp)\n  %s ra, %d(sp)\n  addi sp, sp, %d\n",
+                    word_load, word_load, slot, slot * 2); return;
     }
     if (op_is(op, "mov") && argc == 2) {
         int src = virtual_reg_index(args[1]);
@@ -3484,7 +3497,7 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
             rv_emit_address_setup(text, args[1], "a6", line_no, op);
             base = rv_address_base(args[1], "a6", line_no, op, &off);
             char offstr[32]; snprintf(offstr, sizeof(offstr), "%lld", off);
-            buf_appendf(text, "  %s %s, ", rv_load_op(size), rv_reg(args[0], line_no, op));
+            buf_appendf(text, "  %s %s, ", rv_load_op(size, wide), rv_reg(args[0], line_no, op));
             buf_append(text, offstr); buf_appendf(text, "(%s)\n", base);
         } else {
             int src = virtual_reg_index(args[1]);
@@ -3492,7 +3505,7 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
             rv_emit_address_setup(text, args[0], "a6", line_no, op);
             base = rv_address_base(args[0], "a6", line_no, op, &off);
             char offstr[32]; snprintf(offstr, sizeof(offstr), "%lld", off);
-            buf_appendf(text, "  %s %s, ", rv_store_op(size), src >= 0 ? rv_regs[src] : "a7");
+            buf_appendf(text, "  %s %s, ", rv_store_op(size, wide), src >= 0 ? rv_regs[src] : "a7");
             buf_append(text, offstr); buf_appendf(text, "(%s)\n", base);
         }
         return;
@@ -3584,10 +3597,10 @@ static void emit_rv_instruction(Buffer *text, const char *op, const char *size, 
     if (op_is(op, "push") && argc == 1) {
         int src = virtual_reg_index(args[0]);
         if (src < 0) buf_appendf(text, "  li a6, %s\n", args[0]);
-        buf_append(text, "  addi sp, sp, -8\n");
-        buf_appendf(text, "  sd %s, 0(sp)\n", src >= 0 ? rv_regs[src] : "a6"); return;
+        buf_appendf(text, "  addi sp, sp, -%d\n", slot);
+        buf_appendf(text, "  %s %s, 0(sp)\n", word_store, src >= 0 ? rv_regs[src] : "a6"); return;
     }
-    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "  ld %s, 0(sp)\n  addi sp, sp, 8\n", rv_reg(args[0], line_no, op)); return; }
+    if (op_is(op, "pop") && argc == 1) { buf_appendf(text, "  %s %s, 0(sp)\n  addi sp, sp, %d\n", word_load, rv_reg(args[0], line_no, op), slot); return; }
     if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  j %s\n", args[0]); return; }
     if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
     if (op_is(op, "ret") && argc == 0) { buf_append(text, "  ret\n"); return; }
@@ -5759,7 +5772,7 @@ static const char *target_register_name(const char *target, int index) {
     switch (desc->cls) {
         case CLASS_X86_64: return x86_operand_text(index, "q");
         case CLASS_I386: return i386_operand_text(index, "d");
-        case CLASS_RV64: return rv_regs[index];
+        case CLASS_RISCV: return rv_regs[index];
         case CLASS_MMIX: return mmix_regs[index];
         case CLASS_DCPU: return index < 8 ? dcpu_regs[index] : NULL;
         case CLASS_GENERIC:
@@ -5793,7 +5806,7 @@ static bool asm_selector_matches(const char *selector, const char *target) {
     if (strcmp(selector, target) == 0) return true;
     if (strcmp(selector, "x86_64") == 0) return target_has_class(target, CLASS_X86_64);
     if (strcmp(selector, "i386") == 0) return target_has_class(target, CLASS_I386);
-    if (strcmp(selector, "riscv64") == 0) return target_has_class(target, CLASS_RV64);
+    if (strcmp(selector, "riscv64") == 0) return target_has_class(target, CLASS_RISCV);
     if (strcmp(selector, "mmix") == 0) return target_has_class(target, CLASS_MMIX);
     if (strcmp(selector, "dcpu16") == 0) return target_has_class(target, CLASS_DCPU);
     if (strcmp(selector, "aarch64") == 0) return target_has_flag(target, TF_AARCH64);
@@ -5937,7 +5950,7 @@ static const LiftRule *lift_rules_for(const char *selector, char *comment_out, s
         snprintf(comment_out, comment_size, "@");
         return lift_a64; /* ARM and AArch64 share this instruction shape */
     }
-    if (strcmp(selector, "riscv64") == 0 || target_has_class(selector, CLASS_RV64)) {
+    if (strcmp(selector, "riscv64") == 0 || target_has_class(selector, CLASS_RISCV)) {
         snprintf(comment_out, comment_size, "#");
         return lift_rv;
     }
@@ -5965,7 +5978,7 @@ static const char *const *lift_register_table(const char *family, int *count) {
     if (strcmp(family, "arm32") == 0 || target_has_flag(family, TF_ARM32)) {
         *count = ARM_MAPPED_COUNT; return arm_regs;
     }
-    if (strcmp(family, "riscv64") == 0 || target_has_class(family, CLASS_RV64)) {
+    if (strcmp(family, "riscv64") == 0 || target_has_class(family, CLASS_RISCV)) {
         *count = 16; return rv_regs;
     }
     if (strcmp(family, "mips") == 0 || target_has_class(family, CLASS_MIPS)) {
@@ -6581,7 +6594,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     size_t len = strlen(line);
     /* A label or a symbol directive ends the straight-line run a pending
        RISC-V comparison was counting on. */
-    if (is_rv64_target(target) &&
+    if (is_riscv_target(target) &&
         ((len > 0 && line[len - 1] == ':') ||
          strncmp(line, "global ", 7) == 0 || strncmp(line, "extern ", 7) == 0)) {
         compare_discard(&rv_cmp);
@@ -6598,7 +6611,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -6609,7 +6622,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_rv64_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -6646,7 +6659,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
        into ordinary CommonASM here, before any backend sees it. */
     if (emit_extended_fallback(text, target, base_op, args, argc, line_no)) return;
     if (strcmp(target, "x86_64-nasm") == 0) emit_x86_instruction(text, base_op, size, args, argc, line_no);
-    else if (is_rv64_target(target)) emit_rv_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_riscv_target(target)) emit_rv_instruction(text, target, base_op, size, args, argc, line_no);
     else if (strcmp(target, "mmixal") == 0) emit_mmix_instruction(text, base_op, size, args, argc, line_no);
     else if (strcmp(target, "dcpu16") == 0) emit_dcpu_instruction(text, base_op, size, args, argc, line_no);
     else if (is_aarch64_target(target)) emit_a64_instruction(text, base_op, size, args, argc, line_no);
@@ -7014,7 +7027,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     bool asm_capturing = false;
     const bool x86 = strcmp(target, "x86_64-nasm") == 0;
     const bool i386 = is_i386_target(target);
-    const bool rv = is_rv64_target(target);
+    const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
     const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_vm_ir_target(target) || is_toy_target(target);
@@ -7112,7 +7125,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             /* Verbatim text can do anything, so nothing the compiler was
                holding back may outlive it. */
             opt_flush(&text, target, &optimizer);
-            if (is_rv64_target(target)) compare_discard(&rv_cmp);
+            if (is_riscv_target(target)) compare_discard(&rv_cmp);
             asm_target_buffer = section_kind == SECTION_DATA ? &data :
                                 section_kind == SECTION_RODATA ? &rodata :
                                 section_kind == SECTION_BSS ? &bss : &text;
