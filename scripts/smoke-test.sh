@@ -521,10 +521,6 @@ if command -v sh4-linux-gnu-as > /dev/null 2>&1; then
     sh4-linux-gnu-as -o "$BUILD_DIR/sh-${name}.o" "$BUILD_DIR/sh-${name}.s"
   done
   echo "the SuperH assembler accepted every superh output."
-  # Temporary: show what the assembler made of the divide routine.
-  "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/exec-kernel.cas" --target superh -O1     -o "$BUILD_DIR/sh-probe.s"
-  sh4-linux-gnu-as -o "$BUILD_DIR/sh-probe.o" "$BUILD_DIR/sh-probe.s"
-  sh4-linux-gnu-objdump -d "$BUILD_DIR/sh-probe.o"     | sed -n '/<__commonasm_divmod>:/,+46p'
 else
   echo "no SuperH assembler found; skipped assembling the SuperH output."
 fi
