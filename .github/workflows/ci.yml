@@ -28,10 +28,18 @@ jobs:
             binutils-s390x-linux-gnu binutils-aarch64-linux-gnu \
             binutils-arm-linux-gnueabi wabt qemu-user-static gcc-multilib
 
-      - name: Install the Nios II assembler, if this image has one
+      - name: Report which other machines this image could check
         run: |
-          sudo apt-get install -y binutils-nios2-linux-gnu \
-            || echo "no Nios II assembler in this image; that step will skip"
+          echo "cross assemblers available:"
+          for arch in alpha arc hppa ia64 sh4 xtensa microblaze nios2 or1k m68k; do
+            apt-cache show "binutils-$arch-linux-gnu" > /dev/null 2>&1 \
+              && echo "  binutils-$arch-linux-gnu"
+          done
+          for pkg in binutils-avr binutils-msp430 binutils-bpf; do
+            apt-cache show "$pkg" > /dev/null 2>&1 && echo "  $pkg"
+          done
+          echo "emulators available:"
+          ls /usr/bin/qemu-*-static 2>/dev/null | sed 's|/usr/bin/qemu-|  |;s|-static||'
 
       - name: Install the LoongArch assembler, if this image has one
         run: |
