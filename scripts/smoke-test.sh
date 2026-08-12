@@ -375,6 +375,83 @@ else
   echo "no z/Architecture assembler found; skipped assembling the zarch output."
 fi
 
+# The strongest check there is: build tests/exec-kernel.cas for every machine
+# that has an assembler, a linker and an emulator here, run it, and require
+# all of them to print the same thing. Assembling says the text was
+# well-formed; this says the arithmetic, the control flow, the memory and the
+# syscalls all do what they were supposed to.
+EXEC_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 "
+exec_failures=0
+exec_ran=0
+
+run_exec_case() {
+  case_target=$1
+  case_as=$2
+  case_asflags=$3
+  case_ld=$4
+  case_ldflags=$5
+  case_qemu=$6
+  if [ -n "$case_as" ] && ! command -v "$case_as" > /dev/null 2>&1; then
+    echo "  $case_target: skipped, no $case_as here"; return 0
+  fi
+  if ! command -v "$case_ld" > /dev/null 2>&1; then
+    echo "  $case_target: skipped, no $case_ld here"; return 0
+  fi
+  if [ -n "$case_qemu" ] && ! command -v "$case_qemu" > /dev/null 2>&1; then
+    echo "  $case_target: skipped, no $case_qemu here"; return 0
+  fi
+  "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/exec-kernel.cas" --target "$case_target" -O1 \
+    -o "$BUILD_DIR/exec-$case_target.s" || { echo "  $case_target: did not compile"; exec_failures=$((exec_failures+1)); return 0; }
+  if [ "$case_as" = "nasm" ]; then
+    nasm $case_asflags "$BUILD_DIR/exec-$case_target.s" -o "$BUILD_DIR/exec-$case_target.o" \
+      || { echo "  $case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
+  else
+    $case_as $case_asflags -o "$BUILD_DIR/exec-$case_target.o" "$BUILD_DIR/exec-$case_target.s" \
+      || { echo "  $case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
+  fi
+  $case_ld $case_ldflags "$BUILD_DIR/exec-$case_target.o" -o "$BUILD_DIR/exec-$case_target" \
+    || { echo "  $case_target: did not link"; exec_failures=$((exec_failures+1)); return 0; }
+  if [ -n "$case_qemu" ]; then
+    "$case_qemu" "$BUILD_DIR/exec-$case_target" > "$BUILD_DIR/exec-$case_target.txt" 2>&1 || true
+  else
+    "$BUILD_DIR/exec-$case_target" > "$BUILD_DIR/exec-$case_target.txt" 2>&1 || true
+  fi
+  exec_ran=$((exec_ran+1))
+  if [ "$(cat "$BUILD_DIR/exec-$case_target.txt")" = "$EXEC_EXPECTED" ]; then
+    echo "  $case_target: ran and printed the expected line"
+  else
+    echo "  $case_target: printed [$(cat "$BUILD_DIR/exec-$case_target.txt")]"
+    echo "                expected [$EXEC_EXPECTED]"
+    exec_failures=$((exec_failures+1))
+  fi
+}
+
+if [ "$(uname -s)" != "Linux" ]; then
+  echo "not Linux; skipped running the program on the emulated machines."
+  exec_skipped=1
+else
+  exec_skipped=0
+fi
+
+if [ "$exec_skipped" = "0" ]; then
+echo "running the same program on every machine that can be emulated here:"
+run_exec_case x86_64-nasm nasm "-f elf64"  ld ""              ""
+run_exec_case i386-nasm   nasm "-f elf32"  ld "-m elf_i386"   ""
+run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
+run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
+run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
+run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "" qemu-mips-static
+run_exec_case ppcg4-gnu   powerpc-linux-gnu-as "" powerpc-linux-gnu-ld "" qemu-ppc-static
+run_exec_case sparcv8-gnu sparc64-linux-gnu-as "-32" sparc64-linux-gnu-ld "-m elf32_sparc" qemu-sparc-static
+run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
+run_exec_case zarch       s390x-linux-gnu-as "" s390x-linux-gnu-ld "" qemu-s390x-static
+if [ "$exec_failures" -ne 0 ]; then
+  echo "$exec_failures machines disagreed with the rest"
+  exit 1
+fi
+echo "$exec_ran machines ran the same program and printed the same line."
+fi
+
 # wasm is text that has to be assembled and validated, not linked.
 if command -v wat2wasm > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do

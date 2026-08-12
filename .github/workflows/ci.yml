@@ -25,7 +25,8 @@ jobs:
             binutils-mips-linux-gnu binutils-mips64-linux-gnuabi64 \
             binutils-powerpc-linux-gnu binutils-powerpc64-linux-gnu \
             binutils-sparc64-linux-gnu binutils-m68k-linux-gnu \
-            binutils-s390x-linux-gnu wabt gcc-multilib
+            binutils-s390x-linux-gnu binutils-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi wabt qemu-user-static gcc-multilib
 
       - name: Run POSIX smoke tests
         run: make smoke

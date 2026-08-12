@@ -1,0 +1,131 @@
+; Run on every machine CommonASM emits assembly for, under emulation, and
+; required to print the same thing on all of them. Assembling is a weak
+; property: this one is arithmetic, control flow, memory and syscalls all
+; actually executing.
+;
+; Everything stays inside 32 bits so that the 32-bit and 64-bit members of a
+; family agree, and the output is decimal text so byte order cannot matter.
+
+const stdout = 1
+
+.rodata
+sep: string " "
+nl: string "\n"
+
+.bss
+digits: zero 32
+
+.text
+global _start
+
+_start:
+  ; arithmetic: (7 * 6 + 100 - 8) / 2 = 67
+  mov r0, 7
+  mul r0, 6
+  add r0, 100
+  sub r0, 8
+  div r0, 2
+  call print
+
+  ; remainder and the logical operations
+  mov r0, 1000
+  mod r0, 7                 ; 6
+  call print
+  mov r0, 0xff
+  and r0, 0x3c              ; 60
+  call print
+  mov r0, 0x30
+  or r0, 0x0d               ; 61
+  call print
+  mov r0, 0xff
+  xor r0, 0xf0              ; 15
+  call print
+
+  ; shifts, including the arithmetic one
+  mov r0, 3
+  shl r0, 5                 ; 96
+  call print
+  mov r0, 1024
+  shr r0, 4                 ; 64
+  call print
+  mov r0, 100
+  neg r0
+  sar r0, 2
+  neg r0                    ; 25
+  call print
+
+  ; the extended operations, native on some machines and expanded on others
+  mov r0, 0xff
+  popcnt r0                 ; 8
+  call print
+  mov r0, 256
+  ctz r0                    ; 8
+  call print
+  mov r0, 1
+  rol r0, 6                 ; 64
+  call print
+
+  ; memory, and a loop with a comparison
+  load_addr r1, digits
+  mov r2, 0
+  mov r3, 0
+sum_loop:
+  cmp r2, 10
+  jge sum_done
+  store.b [r1], r2
+  inc r1
+  add r3, r2
+  inc r2
+  jmp sum_loop
+sum_done:
+  mov r0, r3                ; 0+1+..+9 = 45
+  call print
+
+  ; read one of those bytes back
+  load_addr r1, digits
+  add r1, 7
+  load.b r0, [r1]           ; 7
+  call print
+
+  syscall write, stdout, nl, nl_len
+  syscall exit, 0
+
+; Prints r0 as decimal followed by a space. Digits come out backwards, so
+; they are pushed and popped.
+func print
+  mov r4, 0                 ; how many digits
+  cmp r0, 0
+  jne print_loop
+  mov r0, 48
+  push r0
+  inc r4
+  jmp print_out
+print_loop:
+  cmp r0, 0
+  je print_out
+  mov r5, r0
+  mod r5, 10
+  add r5, 48
+  push r5
+  inc r4
+  div r0, 10
+  jmp print_loop
+print_out:
+  load_addr r6, digits
+  add r6, 16
+  mov r7, r6
+print_pop:
+  cmp r4, 0
+  je print_write
+  pop r5
+  store.b [r7], r5
+  inc r7
+  dec r4
+  jmp print_pop
+print_write:
+  mov r0, r7
+  sub r0, r6                ; how many bytes were laid down
+  syscall write, stdout, r6, r0
+  syscall write, stdout, sep, sep_len
+  ret
+endfunc
