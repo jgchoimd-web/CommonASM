@@ -112,6 +112,65 @@ static const char *arm_regs[] = {
 #define ARM_SCRATCH2 "r12"
 
 static unsigned arm_spill_used = 0;
+/* Set when something divided, so the divide routine is written out. */
+static bool arm_divmod_used = false;
+
+/* Signed division for a machine that has none: r0 divided by r1 leaves the
+   quotient in r0 and the remainder in r1, and nothing else changes. It is a
+   restoring division, one quotient bit per turn of the loop, and it takes the
+   sign off both operands first so that the doubled remainder always stays
+   inside the word. The quotient takes the two signs multiplied together and
+   the remainder takes the dividend's, which is the rule the rest of the
+   language follows. Dividing by zero answers zero rather than trapping,
+   because there is no trap to take on a machine with no divide.
+
+   The mnemonics are the ones ARM and Thumb-2 spell the same way, and the
+   conditional part is written as branches, since Thumb would need an if-then
+   block to run an instruction conditionally. */
+static const char arm_divmod_routine[] =
+    "\n__commonasm_divmod:\n"
+    "  push {r4}\n"
+    "  mov r4, #0\n"
+    "  cmp r1, #0\n"
+    "  beq 9f\n"
+    "  bpl 1f\n"
+    "  rsbs r1, r1, #0\n"
+    "  mov r4, #1\n"
+    "1:\n"
+    "  cmp r0, #0\n"
+    "  bpl 2f\n"
+    "  rsbs r0, r0, #0\n"
+    "  eor r4, r4, #1\n"
+    "  orr r4, r4, #2\n"
+    "2:\n"
+    "  mov r2, #0\n"
+    "  mov r3, #32\n"
+    "3:\n"
+    "  lsls r0, r0, #1\n"
+    "  adcs r2, r2, r2\n"
+    "  cmp r2, r1\n"
+    "  bcc 4f\n"
+    "  sub r2, r2, r1\n"
+    "  orr r0, r0, #1\n"
+    "4:\n"
+    "  subs r3, r3, #1\n"
+    "  bne 3b\n"
+    "  mov r1, r2\n"
+    "  tst r4, #1\n"
+    "  beq 5f\n"
+    "  rsbs r0, r0, #0\n"
+    "5:\n"
+    "  tst r4, #2\n"
+    "  beq 6f\n"
+    "  rsbs r1, r1, #0\n"
+    "6:\n"
+    "  pop {r4}\n"
+    "  bx lr\n"
+    "9:\n"
+    "  mov r0, #0\n"
+    "  mov r1, #0\n"
+    "  pop {r4}\n"
+    "  bx lr\n";
 /* x29, x30 and sp are the frame, link and stack registers, x0-x8 carry the
    Linux syscall ABI, and x18 is the platform register, so none of them appear
    here. AArch64 has enough registers left that all sixteen virtual ones get a
@@ -2521,22 +2580,34 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
         return;
     }
     if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
-        /* ARM has no division instruction in the portable subset, so this is
-           the EABI helper call. It takes r0 and r1 and clobbers r0-r3, so the
-           virtual registers living there are saved around it. */
+        /* ARM has no division instruction in the portable subset. Calling the
+           EABI helper for it would make every program that divides need
+           libgcc to link, which freestanding output cannot have, so the
+           routine is written into the output instead. It takes r0 and r1 and
+           clobbers r0-r3, so the virtual registers living there are saved
+           around it, and so is the link register the call overwrites. */
         static const char *const clobbered[] = {"r0", "r1", "r2"};
         const char *lhs = arm_value_reg(text, args[0], ARM_SCRATCH2, line_no, op);
         const char *rhs;
+        int saved = 0;
+        arm_divmod_used = true;
         buf_appendf(text, "  push {%s}\n", lhs);
         rhs = arm_value_reg(text, args[1], ARM_SCRATCH2, line_no, op);
         buf_appendf(text, "  push {%s}\n", rhs);
         for (int i = 0; i < 3; i++) {
-            if (arm_must_preserve(clobbered[i])) buf_appendf(text, "  push {%s}\n", clobbered[i]);
+            if (arm_must_preserve(clobbered[i])) {
+                buf_appendf(text, "  push {%s}\n", clobbered[i]);
+                saved++;
+            }
         }
-        buf_append(text, "  ldr r1, [sp, #0]\n");
-        buf_append(text, "  ldr r0, [sp, #4]\n");
-        buf_appendf(text, "  bl %s\n", op_is(op, "div") ? "__aeabi_idiv" : "__aeabi_idivmod");
+        buf_append(text, "  push {lr}\n");
+        saved++;
+        /* The operands are under everything that was just saved. */
+        buf_appendf(text, "  ldr r1, [sp, #%d]\n", saved * 4);
+        buf_appendf(text, "  ldr r0, [sp, #%d]\n", saved * 4 + 4);
+        buf_append(text, "  bl __commonasm_divmod\n");
         buf_appendf(text, "  mov %s, %s\n", ARM_SCRATCH2, op_is(op, "div") ? "r0" : "r1");
+        buf_append(text, "  pop {lr}\n");
         for (int i = 2; i >= 0; i--) {
             if (arm_must_preserve(clobbered[i])) buf_appendf(text, "  pop {%s}\n", clobbered[i]);
         }
@@ -4773,8 +4844,13 @@ static void emit_m68k_instruction(Buffer *text, const char *op, const char *size
         if (op_is(op, "mul")) buf_appendf(text, "  muls.l %s, %s\n", M68K_SCRATCH2, M68K_SCRATCH);
         else if (op_is(op, "div")) buf_appendf(text, "  divs.l %s, %s\n", M68K_SCRATCH2, M68K_SCRATCH);
         else {
-            /* divsl leaves the remainder in the first register it names. */
-            buf_appendf(text, "  divsl.l %s, %s:%s\n", M68K_SCRATCH2, M68K_SCRATCH, M68K_SCRATCH);
+            /* divsl leaves the remainder in the first register it names and
+               the quotient in the second, but naming one register twice is
+               the encoding for "quotient only" and that is what it stores.
+               The divisor's own register takes the remainder instead: the
+               divisor is read before either result is written. */
+            buf_appendf(text, "  divsl.l %s, %s:%s\n", M68K_SCRATCH2, M68K_SCRATCH2, M68K_SCRATCH);
+            buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH2, M68K_SCRATCH);
         }
         buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
         return;
@@ -4868,6 +4944,14 @@ static void s390_load_imm(Buffer *text, const char *reg, const char *value) {
     buf_appendf(text, "  iihf %s, %llu\n", reg, ((unsigned long long)number >> 32) & 0xffffffffu);
 }
 
+/* Naming r0 where an instruction wants a base register does not mean register
+   zero: it means there is no base register, and the displacement is used as an
+   absolute address. So a spill slot is addressed through r1, even when the
+   value being loaded is going to r0. */
+static const char *s390_base_reg(const char *scratch) {
+    return strcmp(scratch, "%r0") == 0 ? S390_SCRATCH : scratch;
+}
+
 /* Brings a virtual register into a real one, loading it from its slot when it
    has no register of its own. */
 static const char *s390_value_reg(Buffer *text, const char *value, const char *scratch,
@@ -4876,8 +4960,9 @@ static const char *s390_value_reg(Buffer *text, const char *value, const char *s
     if (reg >= 0 && reg < S390_MAPPED_COUNT) return s390_regs[reg];
     if (reg >= 0) {
         int offset = s390_spill_offset(value);
-        buf_appendf(text, "  larl %s, %s\n", scratch, X86_SPILL_SYMBOL);
-        buf_appendf(text, "  lg %s, %d(%s)\n", scratch, offset, scratch);
+        const char *base = s390_base_reg(scratch);
+        buf_appendf(text, "  larl %s, %s\n", base, X86_SPILL_SYMBOL);
+        buf_appendf(text, "  lg %s, %d(%s)\n", scratch, offset, base);
         return scratch;
     }
     if (!is_int(value) && !is_symbol(value) && !is_known_constant(value)) {
@@ -4896,24 +4981,29 @@ static const char *s390_dst_reg(const char *value, int line_no, const char *op) 
 }
 
 static void s390_store_back(Buffer *text, const char *value, const char *from, const char *via) {
+    const char *base;
     if (!s390_reg_is_spilled(value)) return;
-    buf_appendf(text, "  larl %s, %s\n", via, X86_SPILL_SYMBOL);
-    buf_appendf(text, "  stg %s, %d(%s)\n", from, s390_spill_offset(value), via);
+    base = s390_base_reg(via);
+    buf_appendf(text, "  larl %s, %s\n", base, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  stg %s, %d(%s)\n", from, s390_spill_offset(value), base);
 }
 
 static void s390_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
                               const char *scratch, int line_no, const char *op) {
     Address addr;
+    /* Whatever comes back from here is used as a base register, so r0 is not
+       an option for it either. */
+    const char *held = s390_base_reg(scratch);
     if (!parse_address(addr_text, &addr)) {
         line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
     }
     if (addr.has_base) {
-        const char *base = s390_value_reg(text, addr.base, scratch, line_no, op);
+        const char *base = s390_value_reg(text, addr.base, held, line_no, op);
         snprintf(out, out_size, "%lld(%s)", addr.offset, base);
         return;
     }
-    buf_appendf(text, "  larl %s, %s\n", scratch, addr.symbol);
-    snprintf(out, out_size, "%lld(%s)", addr.offset, scratch);
+    buf_appendf(text, "  larl %s, %s\n", held, addr.symbol);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, held);
 }
 
 static int s390_vreg_of(const char *physical) {
@@ -7158,6 +7248,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         die("unknown target");
     }
     buf_append(&out, text.data);
+    if (is_arm32_target(target) && arm_divmod_used) buf_append(&out, arm_divmod_routine);
     return out;
 }
 

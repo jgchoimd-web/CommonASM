@@ -440,7 +440,8 @@ run_exec_case i386-nasm   nasm "-f elf32"  ld "-m elf_i386"   ""
 run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
 run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
 run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
-run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "" qemu-mips-static
+# A MIPS linker looks for __start rather than _start, so it is told the name.
+run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "-e _start" qemu-mips-static
 run_exec_case ppcg4-gnu   powerpc-linux-gnu-as "" powerpc-linux-gnu-ld "" qemu-ppc-static
 run_exec_case sparcv8-gnu sparc64-linux-gnu-as "-32" sparc64-linux-gnu-ld "-m elf32_sparc" qemu-sparc-static
 run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
