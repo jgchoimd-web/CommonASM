@@ -227,6 +227,7 @@ typedef enum {
     CLASS_SPARC,
     CLASS_M68K,
     CLASS_LOONG,
+    CLASS_NIOS2,
     CLASS_S390,
     CLASS_WASM,
     CLASS_ENCODING
@@ -340,7 +341,7 @@ static const TargetDesc target_table[] = {
     {"xtensa", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"superh", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"rx", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"nios2", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"nios2", CLASS_NIOS2, GROUP_LEGACY, 0},
     {"microblaze", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"arc", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"ptx", CLASS_LEGACY, GROUP_LEGACY, 0},
@@ -850,6 +851,10 @@ static bool is_ia64_target(const char *target) {
     return target_has_flag(target, TF_IA64);
 }
 
+static bool is_nios2_target(const char *target) {
+    return target_has_class(target, CLASS_NIOS2);
+}
+
 static bool is_loong_target(const char *target) {
     return target_has_class(target, CLASS_LOONG);
 }
@@ -951,6 +956,7 @@ static int target_word_bits(const char *target) {
     }
     if (desc->cls == CLASS_M68K) return 32;
     if (desc->cls == CLASS_LOONG) return 64;
+    if (desc->cls == CLASS_NIOS2) return 32;
     if (desc->cls == CLASS_S390) return 64;
     if (desc->cls == CLASS_RISCV) return (desc->flags & TF_RV32) ? 32 : 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
@@ -1057,7 +1063,7 @@ static const char *target_support_level(const char *target) {
    the class alone is not the answer. */
 static bool target_emits_assembly(const TargetDesc *desc) {
     switch (desc->cls) {
-        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG:
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2:
         case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
         case CLASS_WASM:
             return true;
@@ -1082,6 +1088,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_SPARC: return "GNU SPARC assembly";
         case CLASS_M68K: return "GNU m68k assembly";
         case CLASS_LOONG: return "GNU LoongArch assembly";
+        case CLASS_NIOS2: return "GNU Nios II assembly";
         case CLASS_S390: return "GNU z/Architecture assembly";
         case CLASS_WASM: return "WebAssembly text";
         case CLASS_GENERIC:
@@ -1792,7 +1799,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -5817,6 +5824,328 @@ static void emit_loong_instruction(Buffer *text, const char *op, const char *siz
     line_error(line_no, op, "unsupported instruction or wrong argument count for LoongArch");
 }
 
+/* ----------------------------------------------------------------- Nios II */
+
+/* r0 is zero, r1 is the assembler's own temporary, r2 and r3 carry a system
+   call's number and its answer, r4 to r7 carry its arguments, and r24 upwards
+   belong to the machine and the ABI. That leaves r8 to r23. Fourteen of them
+   hold virtual registers; the other two are the compiler's scratch pair, and
+   the pair a pending comparison is copied into is r23 with r1 borrowed from
+   the assembler, so virtual r14 and r15 get spill slots.
+
+   Its branches compare two registers and jump in one instruction, so it
+   shares the machinery RISC-V, MIPS and LoongArch use for holding a
+   comparison until the branch that spells it out. */
+static const char *nios2_machine_regs[] = {
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "r16", "r17", "r18", "r19", "r20", "r21"
+};
+
+#define NIOS2_MAPPED_COUNT ((int)(sizeof(nios2_machine_regs) / sizeof(nios2_machine_regs[0])))
+#define NIOS2_SPILL_COUNT (16 - NIOS2_MAPPED_COUNT)
+#define NIOS2_SCRATCH "r22"
+#define NIOS2_SCRATCH2 "r23"
+
+static unsigned nios2_spill_used = 0;
+
+/* at is the assembler's temporary. Nothing this backend emits leans on the
+   macros that use it, and the output says .set noat once when a comparison
+   has to be copied aside. */
+static bool nios2_noat_used = false;
+
+static DeferredCompare nios2_cmp = {CMP_NONE, {0}, {0}, false, "at", "r23", "mov", "movia", false};
+
+static bool nios2_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= NIOS2_MAPPED_COUNT;
+}
+
+static int nios2_spill_offset(const char *value) {
+    return (virtual_reg_index(value) - NIOS2_MAPPED_COUNT) * 4;
+}
+
+/* addi and the comparisons take a signed 16-bit field; the logical
+   immediates take an unsigned one. */
+static bool nios2_fits_imm16(const char *value, long long *out, bool is_signed) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0 || !end || *end != '\0') return false;
+    if (is_signed ? (parsed < -32768 || parsed > 32767) : (parsed < 0 || parsed > 65535)) return false;
+    *out = parsed;
+    return true;
+}
+
+static const char *nios2_value_reg(Buffer *text, const char *value, const char *scratch,
+                                   int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0 && reg < NIOS2_MAPPED_COUNT) return nios2_machine_regs[reg];
+    if (reg >= 0) {
+        nios2_spill_used |= 1u << (unsigned)(reg - NIOS2_MAPPED_COUNT);
+        buf_appendf(text, "  movia %s, %s\n", scratch, X86_SPILL_SYMBOL);
+        buf_appendf(text, "  ldw %s, %d(%s)\n", scratch, nios2_spill_offset(value), scratch);
+        return scratch;
+    }
+    if (is_int(value) || is_known_constant(value)) {
+        long long small;
+        /* movia is a pair of instructions whatever it is given, so a value
+           that fits the one-instruction form gets it. */
+        if (nios2_fits_imm16(value, &small, true)) {
+            buf_appendf(text, "  movi %s, %lld\n", scratch, small);
+        } else {
+            buf_appendf(text, "  movia %s, %s\n", scratch, value);
+        }
+    } else if (is_symbol(value)) {
+        buf_appendf(text, "  movia %s, %s\n", scratch, value);
+    } else {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    return scratch;
+}
+
+static const char *nios2_dst_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    return reg < NIOS2_MAPPED_COUNT ? nios2_machine_regs[reg] : NIOS2_SCRATCH;
+}
+
+static void nios2_store_back(Buffer *text, const char *value, const char *from) {
+    /* The slot's address needs a register that is not the one holding the
+       value, or taking it would overwrite what is about to be stored. */
+    const char *base = strcmp(from, NIOS2_SCRATCH) == 0 ? NIOS2_SCRATCH2 : NIOS2_SCRATCH;
+    if (!nios2_reg_is_spilled(value)) return;
+    nios2_spill_used |= 1u << (unsigned)(virtual_reg_index(value) - NIOS2_MAPPED_COUNT);
+    buf_appendf(text, "  movia %s, %s\n", base, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  stw %s, %d(%s)\n", from, nios2_spill_offset(value), base);
+}
+
+static void nios2_emit_address(Buffer *text, const char *addr_text, char *base_out, size_t base_size,
+                               long long *offset_out, const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    *offset_out = addr.offset;
+    if (addr.has_base) {
+        snprintf(base_out, base_size, "%s", nios2_value_reg(text, addr.base, scratch, line_no, op));
+        return;
+    }
+    buf_appendf(text, "  movia %s, %s\n", scratch, addr.symbol);
+    snprintf(base_out, base_size, "%s", scratch);
+}
+
+static void emit_nios2_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"r4", "r5", "r6", "r7", "r8", "r9"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    /* The generic system call numbers, the same set RISC-V uses. */
+    if (strcmp(args[0], "read") == 0) number = 63;
+    else if (strcmp(args[0], "write") == 0) number = 64;
+    else if (strcmp(args[0], "open") == 0) number = 1024;
+    else if (strcmp(args[0], "close") == 0) number = 57;
+    else if (strcmp(args[0], "exit") == 0) number = 93;
+    else line_error(line_no, "syscall", "unknown syscall");
+    /* r8 and r9 carry virtual registers as well as the fifth and sixth
+       arguments, so those two are saved when a call reaches that far. */
+    count = argc - 1;
+    if (count > 6) count = 6;
+    for (int i = count; i >= 5; i--) buf_appendf(text, "  addi sp, sp, -4\n  stw %s, 0(sp)\n", arg_regs[i - 1]);
+    for (int i = 0; i < count; i++) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0 && reg < NIOS2_MAPPED_COUNT) {
+            buf_appendf(text, "  mov %s, %s\n", arg_regs[i], nios2_machine_regs[reg]);
+        } else if (reg >= 0) {
+            buf_appendf(text, "  movia %s, %s\n", arg_regs[i], X86_SPILL_SYMBOL);
+            buf_appendf(text, "  ldw %s, %d(%s)\n", arg_regs[i], nios2_spill_offset(args[i + 1]), arg_regs[i]);
+        } else {
+            buf_appendf(text, "  movia %s, %s\n", arg_regs[i], args[i + 1]);
+        }
+    }
+    buf_appendf(text, "  movi r2, %d\n", number);
+    buf_append(text, "  trap\n");
+    if (result) {
+        const char *dst = nios2_dst_reg(result, line_no, "syscall");
+        buf_appendf(text, "  mov %s, r2\n", dst);
+        nios2_store_back(text, result, dst);
+    }
+    for (int i = 5; i <= count; i++) buf_appendf(text, "  ldw %s, 0(sp)\n  addi sp, sp, 4\n", arg_regs[i - 1]);
+}
+
+static void emit_nios2_instruction(Buffer *text, const char *op, const char *size,
+                                   char **args, int argc, int line_no) {
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* call overwrites ra, so a function that calls keeps its own. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  addi sp, sp, -4\n  stw ra, 0(sp)\n");
+        }
+        return;
+    }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_append(text, "  addi sp, sp, -8\n  stw ra, 4(sp)\n  stw fp, 0(sp)\n  mov fp, sp\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (nios2_fits_imm16(args[0], &frame, true)) {
+            buf_appendf(text, "  addi sp, sp, %lld\n", -frame);
+        } else {
+            buf_appendf(text, "  movia %s, %s\n", NIOS2_SCRATCH, args[0]);
+            buf_appendf(text, "  sub sp, sp, %s\n", NIOS2_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  mov sp, fp\n  ldw fp, 0(sp)\n  ldw ra, 4(sp)\n  addi sp, sp, 8\n");
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0 && src < NIOS2_MAPPED_COUNT) {
+            buf_appendf(text, "  mov %s, %s\n", dst, nios2_machine_regs[src]);
+        } else {
+            const char *value = nios2_value_reg(text, args[1], dst, line_no, op);
+            if (strcmp(value, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, value);
+        }
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  movia %s, %s\n", dst, args[1]);
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char base[32];
+        long long off = 0;
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        /* The signed forms, so a narrow load means here what it means
+           everywhere else. This machine's word is four bytes, so the widest
+           access it has is the one an unsuffixed load asks for. */
+        const char *mnemonic = size[0] == 'b' ? "ldb" : size[0] == 'w' ? "ldh" : "ldw";
+        nios2_emit_address(text, args[1], base, sizeof(base), &off, NIOS2_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %lld(%s)\n", mnemonic, dst, off, base);
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char base[32];
+        long long off = 0;
+        const char *mnemonic = size[0] == 'b' ? "stb" : size[0] == 'w' ? "sth" : "stw";
+        const char *value = nios2_value_reg(text, args[1], NIOS2_SCRATCH2, line_no, op);
+        nios2_emit_address(text, args[0], base, sizeof(base), &off, NIOS2_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %lld(%s)\n", mnemonic, value, off, base);
+        return;
+    }
+    if (op_is(op, "mod") && argc == 2) {
+        /* There is no remainder instruction, so it is the division taken back
+           out of what went in. */
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        const char *lhs = nios2_value_reg(text, args[0], dst, line_no, op);
+        const char *rhs;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, lhs);
+        rhs = nios2_value_reg(text, args[1], NIOS2_SCRATCH2, line_no, op);
+        buf_appendf(text, "  div %s, %s, %s\n", "at", dst, rhs);
+        buf_appendf(text, "  mul %s, %s, %s\n", "at", "at", rhs);
+        buf_appendf(text, "  sub %s, %s, %s\n", dst, dst, "at");
+        nios2_noat_used = true;
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") || op_is(op, "or") ||
+         op_is(op, "xor") || op_is(op, "mul") || op_is(op, "div")) && argc == 2) {
+        const char *native = op_is(op, "add") ? "add" : op_is(op, "sub") ? "sub" :
+                             op_is(op, "and") ? "and" : op_is(op, "or") ? "or" :
+                             op_is(op, "xor") ? "xor" : op_is(op, "mul") ? "mul" : "div";
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        const char *lhs = nios2_value_reg(text, args[0], dst, line_no, op);
+        long long imm;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, lhs);
+        if (op_is(op, "add") && nios2_fits_imm16(args[1], &imm, true)) {
+            buf_appendf(text, "  addi %s, %s, %lld\n", dst, dst, imm);
+        } else if (op_is(op, "sub") && nios2_fits_imm16(args[1], &imm, true) && imm != -32768) {
+            buf_appendf(text, "  addi %s, %s, %lld\n", dst, dst, -imm);
+        } else if ((op_is(op, "and") || op_is(op, "or") || op_is(op, "xor")) &&
+                   nios2_fits_imm16(args[1], &imm, false)) {
+            buf_appendf(text, "  %si %s, %s, %lld\n", native, dst, dst, imm);
+        } else {
+            const char *rhs = nios2_value_reg(text, args[1], NIOS2_SCRATCH2, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, rhs);
+        }
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        const char *native = op_is(op, "shl") ? "sll" : op_is(op, "shr") ? "srl" : "sra";
+        const char *lhs = nios2_value_reg(text, args[0], dst, line_no, op);
+        long long imm;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, lhs);
+        if (is_int(args[1]) && nios2_fits_imm16(args[1], &imm, false) && imm < 32) {
+            buf_appendf(text, "  %si %s, %s, %lld\n", native, dst, dst, imm);
+        } else {
+            const char *amount = nios2_value_reg(text, args[1], NIOS2_SCRATCH2, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, dst, amount);
+        }
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        const char *value = nios2_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  mov %s, %s\n", dst, value);
+        if (op_is(op, "neg")) buf_appendf(text, "  sub %s, r0, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  nor %s, %s, r0\n", dst, dst);
+        else buf_appendf(text, "  addi %s, %s, %s\n", dst, dst, op_is(op, "inc") ? "1" : "-1");
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        /* A spilled operand is brought into the register the comparison would
+           be copied into anyway, so it lasts until the branch. */
+        const char *lhs = nios2_value_reg(text, args[0], nios2_cmp.lhs_snapshot, line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *rhs = src >= 0 ? nios2_value_reg(text, args[1], nios2_cmp.rhs_snapshot, line_no, op)
+                                   : args[1];
+        if (strcmp(lhs, "at") == 0) nios2_noat_used = true;
+        compare_record(&nios2_cmp, lhs, rhs, src >= 0, line_no);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        if (nios2_cmp.state == CMP_SNAPSHOT) nios2_noat_used = true;
+        compare_emit_branch(text, &nios2_cmp, op, args[0], line_no);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = nios2_value_reg(text, args[0], NIOS2_SCRATCH2, line_no, op);
+        buf_append(text, "  addi sp, sp, -4\n");
+        buf_appendf(text, "  stw %s, 0(sp)\n", value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        const char *dst = nios2_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  ldw %s, 0(sp)\n", dst);
+        buf_append(text, "  addi sp, sp, 4\n");
+        nios2_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  br %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  call %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  ldw ra, 0(sp)\n  addi sp, sp, 4\n");
+        }
+        buf_append(text, "  ret\n");
+        return;
+    }
+    if (op_is(op, "syscall")) { emit_nios2_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for Nios II");
+}
+
 /* ------------------------------------------------------------------ m68k */
 
 /* Only the data registers can do arithmetic and logic, and d0 and d1 are the
@@ -7869,7 +8198,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -7880,7 +8209,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -7927,6 +8256,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (is_sparc_target(target)) emit_sparc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_m68k_target(target)) emit_m68k_instruction(text, base_op, size, args, argc, line_no);
     else if (is_loong_target(target)) emit_loong_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_nios2_target(target)) emit_nios2_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
@@ -8311,7 +8641,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -8512,6 +8842,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         buf_append(&bss, ".balign 8\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, S390_SPILL_COUNT * 8);
     }
+    if (is_nios2_target(target) && nios2_spill_used) {
+        buf_append(&bss, ".balign 4\n");
+        buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, NIOS2_SPILL_COUNT * 4);
+    }
     if (is_loong_target(target) && loong_spill_used) {
         buf_append(&bss, ".balign 8\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, LOONG_SPILL_COUNT * 8);
@@ -8579,6 +8913,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             if (is_sparc_target(target) && sparc_is_64(target)) {
                 buf_append(&out, ".register %g2, #scratch\n.register %g3, #scratch\n");
             }
+            if (is_nios2_target(target) && nios2_noat_used) buf_append(&out, ".set noat\n");
             if (is_mips_target(target) && mips_llsc_used) {
                 buf_append(&out, target_word_bits(target) == 64 ? ".set mips3\n"
                                                                : ".set mips2\n");
