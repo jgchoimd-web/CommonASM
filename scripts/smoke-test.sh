@@ -386,6 +386,8 @@ fi
 # all of them to print the same thing. Assembling says the text was
 # well-formed; this says the arithmetic, the control flow, the memory and the
 # syscalls all do what they were supposed to.
+EXEC_PROGRAM=tests/exec-kernel.cas
+EXEC_NAME=kernel
 EXEC_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 "
 exec_failures=0
 exec_ran=0
@@ -398,36 +400,36 @@ run_exec_case() {
   case_ldflags=$5
   case_qemu=$6
   if [ -n "$case_as" ] && ! command -v "$case_as" > /dev/null 2>&1; then
-    echo "  $case_target: skipped, no $case_as here"; return 0
+    echo "  $EXEC_NAME/$case_target: skipped, no $case_as here"; return 0
   fi
   if ! command -v "$case_ld" > /dev/null 2>&1; then
-    echo "  $case_target: skipped, no $case_ld here"; return 0
+    echo "  $EXEC_NAME/$case_target: skipped, no $case_ld here"; return 0
   fi
   if [ -n "$case_qemu" ] && ! command -v "$case_qemu" > /dev/null 2>&1; then
-    echo "  $case_target: skipped, no $case_qemu here"; return 0
+    echo "  $EXEC_NAME/$case_target: skipped, no $case_qemu here"; return 0
   fi
-  "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/exec-kernel.cas" --target "$case_target" -O1 \
-    -o "$BUILD_DIR/exec-$case_target.s" || { echo "  $case_target: did not compile"; exec_failures=$((exec_failures+1)); return 0; }
+  "$BUILD_DIR/commonasmc" "$ROOT_DIR/$EXEC_PROGRAM" --target "$case_target" -O1 \
+    -o "$BUILD_DIR/exec-$EXEC_NAME-$case_target.s" || { echo "  $EXEC_NAME/$case_target: did not compile"; exec_failures=$((exec_failures+1)); return 0; }
   if [ "$case_as" = "nasm" ]; then
-    nasm $case_asflags "$BUILD_DIR/exec-$case_target.s" -o "$BUILD_DIR/exec-$case_target.o" \
-      || { echo "  $case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
+    nasm $case_asflags "$BUILD_DIR/exec-$EXEC_NAME-$case_target.s" -o "$BUILD_DIR/exec-$EXEC_NAME-$case_target.o" \
+      || { echo "  $EXEC_NAME/$case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
   else
-    $case_as $case_asflags -o "$BUILD_DIR/exec-$case_target.o" "$BUILD_DIR/exec-$case_target.s" \
-      || { echo "  $case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
+    $case_as $case_asflags -o "$BUILD_DIR/exec-$EXEC_NAME-$case_target.o" "$BUILD_DIR/exec-$EXEC_NAME-$case_target.s" \
+      || { echo "  $EXEC_NAME/$case_target: did not assemble"; exec_failures=$((exec_failures+1)); return 0; }
   fi
-  $case_ld $case_ldflags "$BUILD_DIR/exec-$case_target.o" -o "$BUILD_DIR/exec-$case_target" \
-    || { echo "  $case_target: did not link"; exec_failures=$((exec_failures+1)); return 0; }
+  $case_ld $case_ldflags "$BUILD_DIR/exec-$EXEC_NAME-$case_target.o" -o "$BUILD_DIR/exec-$EXEC_NAME-$case_target" \
+    || { echo "  $EXEC_NAME/$case_target: did not link"; exec_failures=$((exec_failures+1)); return 0; }
   if [ -n "$case_qemu" ]; then
-    "$case_qemu" "$BUILD_DIR/exec-$case_target" > "$BUILD_DIR/exec-$case_target.txt" 2>&1 || true
+    "$case_qemu" "$BUILD_DIR/exec-$EXEC_NAME-$case_target" > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
   else
-    "$BUILD_DIR/exec-$case_target" > "$BUILD_DIR/exec-$case_target.txt" 2>&1 || true
+    "$BUILD_DIR/exec-$EXEC_NAME-$case_target" > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
   fi
   exec_ran=$((exec_ran+1))
-  if [ "$(cat "$BUILD_DIR/exec-$case_target.txt")" = "$EXEC_EXPECTED" ]; then
-    echo "  $case_target: ran and printed the expected line"
+  if [ "$(cat "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt")" = "$EXEC_EXPECTED" ]; then
+    echo "  $EXEC_NAME/$case_target: ran and printed the expected line"
   else
-    echo "  $case_target: printed [$(cat "$BUILD_DIR/exec-$case_target.txt")]"
-    echo "                expected [$EXEC_EXPECTED]"
+    echo "  $EXEC_NAME/$case_target: printed [$(cat "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt")]"
+    echo "                 expected [$EXEC_EXPECTED]"
     exec_failures=$((exec_failures+1))
   fi
 }
@@ -439,26 +441,40 @@ else
   exec_skipped=0
 fi
 
+run_exec_everywhere() {
+  run_exec_case x86_64-nasm nasm "-f elf64"  ld ""              ""
+  run_exec_case i386-nasm   nasm "-f elf32"  ld "-m elf_i386"   ""
+  run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
+  run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
+  run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
+  run_exec_case rv32i-gnu   riscv64-linux-gnu-as "-march=rv32im -mabi=ilp32" \
+                            riscv64-linux-gnu-ld "-m elf32lriscv" qemu-riscv32-static
+  # A MIPS linker looks for __start rather than _start, so it is told the name.
+  run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "-e _start" qemu-mips-static
+  run_exec_case ppcg4-gnu   powerpc-linux-gnu-as "" powerpc-linux-gnu-ld "" qemu-ppc-static
+  run_exec_case sparcv8-gnu sparc64-linux-gnu-as "-32" sparc64-linux-gnu-ld "-m elf32_sparc" qemu-sparc-static
+  run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
+  run_exec_case zarch       s390x-linux-gnu-as "" s390x-linux-gnu-ld "" qemu-s390x-static
+}
+
 if [ "$exec_skipped" = "0" ]; then
-echo "running the same program on every machine that can be emulated here:"
-run_exec_case x86_64-nasm nasm "-f elf64"  ld ""              ""
-run_exec_case i386-nasm   nasm "-f elf32"  ld "-m elf_i386"   ""
-run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
-run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
-run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
-run_exec_case rv32i-gnu   riscv64-linux-gnu-as "-march=rv32im -mabi=ilp32" \
-                          riscv64-linux-gnu-ld "-m elf32lriscv" qemu-riscv32-static
-# A MIPS linker looks for __start rather than _start, so it is told the name.
-run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "-e _start" qemu-mips-static
-run_exec_case ppcg4-gnu   powerpc-linux-gnu-as "" powerpc-linux-gnu-ld "" qemu-ppc-static
-run_exec_case sparcv8-gnu sparc64-linux-gnu-as "-32" sparc64-linux-gnu-ld "-m elf32_sparc" qemu-sparc-static
-run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
-run_exec_case zarch       s390x-linux-gnu-as "" s390x-linux-gnu-ld "" qemu-s390x-static
+echo "running the same programs on every machine that can be emulated here:"
+run_exec_everywhere
+
+# The sorting demo is a second opinion: longer, nested loops, a signed
+# comparison in the inner one, negative numbers to print, and the comparing
+# extended operations. One program agreeing everywhere can still be a program
+# that never reaches the awkward paths.
+EXEC_PROGRAM=demos/sort/sort.cas
+EXEC_NAME=sort
+EXEC_EXPECTED="-8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4 "
+run_exec_everywhere
+
 if [ "$exec_failures" -ne 0 ]; then
-  echo "$exec_failures machines disagreed with the rest"
+  echo "$exec_failures runs disagreed with the rest"
   exit 1
 fi
-echo "$exec_ran machines ran the same program and printed the same line."
+echo "$exec_ran runs of two programs printed the same line as each other."
 fi
 
 # wasm is text that has to be assembled and validated, not linked.

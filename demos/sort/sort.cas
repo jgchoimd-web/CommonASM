@@ -1,0 +1,209 @@
+; A small program that does something ordinary, to find out what is awkward
+; about writing CommonASM rather than what is broken about one backend.
+;
+; It sorts twelve numbers in place, then reports the smallest, the largest,
+; the total, the spread, and how many are over fifty. Everything is four bytes
+; wide and printed as decimal, so the answer is the same on a 32-bit machine
+; and a 64-bit one, and byte order cannot change it.
+;
+;   commonasmc demos/sort/sort.cas --target x86_64-nasm -O1 -o sort.asm
+;   nasm -f elf64 sort.asm -o sort.o && ld sort.o -o sort && ./sort
+;   -8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4
+
+const stdout = 1
+const count = 12
+
+.data
+; deliberately unsorted, with negatives, a duplicate-free spread, and values
+; on both sides of the fifty the last figure counts against
+values: dword 23, -8, 91, 4, 62, 15, 88, 3, 41, 7, 55, 12
+
+.rodata
+sep: string " "
+bar: string "| "
+nl: string "\n"
+lmin: string "min "
+lmax: string "max "
+lsum: string "sum "
+lspread: string "spread "
+lover: string "over50 "
+
+.bss
+scratch: zero 32
+
+.text
+global _start
+
+_start:
+  call sort
+  call show
+
+  syscall write, stdout, nl, nl_len
+  syscall exit, 0
+
+; Insertion sort over the array in place. r1 walks the unsorted part, r2 walks
+; backwards through the sorted part looking for where r3 belongs.
+func sort
+  mov r1, 1
+sort_outer:
+  cmp r1, count
+  jge sort_done
+
+  ; r3 = values[r1], the value being placed
+  load_addr r4, values
+  mov r5, r1
+  shl r5, 2
+  add r4, r5
+  load.d r3, [r4]
+
+  mov r2, r1
+sort_inner:
+  cmp r2, 0
+  jle sort_place
+
+  ; r6 = values[r2 - 1]
+  load_addr r4, values
+  mov r5, r2
+  dec r5
+  shl r5, 2
+  add r4, r5
+  load.d r6, [r4]
+
+  cmp r6, r3
+  jle sort_place
+
+  ; shift it up one slot and keep looking
+  store.d [r4 + 4], r6
+  dec r2
+  jmp sort_inner
+
+sort_place:
+  load_addr r4, values
+  mov r5, r2
+  shl r5, 2
+  add r4, r5
+  store.d [r4], r3
+
+  inc r1
+  jmp sort_outer
+
+sort_done:
+  ret
+endfunc
+
+; Walks the sorted array once, printing each value and collecting the figures
+; on the way past. r8 is the running smallest, r9 the largest, r10 the total
+; and r11 the count over fifty.
+func show
+  mov r1, 0
+  mov r8, 2000000
+  mov r9, -2000000
+  mov r10, 0
+  mov r11, 0
+
+show_loop:
+  cmp r1, count
+  jge show_done
+
+  load_addr r4, values
+  mov r5, r1
+  shl r5, 2
+  add r4, r5
+  load.d r0, [r4]
+
+  min r8, r0
+  max r9, r0
+  add r10, r0
+
+  ; one more if this one is over fifty, counted without a branch
+  mov r7, 50
+  sub r7, r0          ; negative exactly when r0 is over fifty
+  sar r7, 31          ; all ones then, zero otherwise
+  sel r7, 1, 0
+  add r11, r7
+
+  call print
+  inc r1
+  jmp show_loop
+
+show_done:
+  syscall write, stdout, bar, bar_len
+
+  syscall write, stdout, lmin, lmin_len
+  mov r0, r8
+  call print
+
+  syscall write, stdout, lmax, lmax_len
+  mov r0, r9
+  call print
+
+  syscall write, stdout, lsum, lsum_len
+  mov r0, r10
+  call print
+
+  ; the spread is the distance between the ends, which abs makes a distance
+  ; rather than a difference
+  syscall write, stdout, lspread, lspread_len
+  mov r0, r8
+  sub r0, r9
+  abs r0
+  call print
+
+  syscall write, stdout, lover, lover_len
+  mov r0, r11
+  call print
+  ret
+endfunc
+
+; Prints r0 as a signed decimal followed by a space. The digits come out
+; backwards, so they are pushed and popped.
+func print
+  mov r12, 0
+  cmp r0, 0
+  jge print_positive
+  mov r12, 1
+  neg r0
+print_positive:
+  mov r2, 0
+  cmp r0, 0
+  jne print_digits
+  mov r0, 48
+  push r0
+  inc r2
+  jmp print_sign
+print_digits:
+  cmp r0, 0
+  je print_sign
+  mov r3, r0
+  mod r3, 10
+  add r3, 48
+  push r3
+  inc r2
+  div r0, 10
+  jmp print_digits
+
+print_sign:
+  load_addr r5, scratch
+  mov r6, r5
+  cmp r12, 0
+  je print_pop
+  mov r3, 45
+  store.b [r6], r3
+  inc r6
+
+print_pop:
+  cmp r2, 0
+  je print_write
+  pop r3
+  store.b [r6], r3
+  inc r6
+  dec r2
+  jmp print_pop
+
+print_write:
+  mov r0, r6
+  sub r0, r5
+  syscall write, stdout, r5, r0
+  syscall write, stdout, sep, sep_len
+  ret
+endfunc
