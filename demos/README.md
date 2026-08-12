@@ -44,8 +44,8 @@ nasm -f elf64 sort.asm -o sort.o && ld sort.o -o sort && ./sort
 -8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4
 ```
 
-It is built for all twelve machines the smoke test can run, and all twelve
-have to print that line.
+It is built for every machine the smoke test can run — sixteen of them — and
+all sixteen have to print that line.
 
 ## What writing them changed
 

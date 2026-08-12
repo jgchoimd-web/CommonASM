@@ -580,6 +580,84 @@ else
   echo "no z/Architecture assembler found; skipped assembling the zarch output."
 fi
 
+# TEMPORARY. A SPARC signed divide answers correctly when the divisor is
+# positive and returns zero when it is negative, which is what a divide would
+# do if it read the divisor as unsigned. The sequence emitted is the textbook
+# one, so this asks which part of it is not behaving: each variant sets its
+# bit if it answers -3, and a machine that works answers 31.
+if command -v sparc64-linux-gnu-as > /dev/null 2>&1 && command -v qemu-sparc-static > /dev/null 2>&1; then
+  cat > "$BUILD_DIR/sparcdiv.s" <<'SPARCPROBE'
+  .text
+  .global _start
+_start:
+  mov %g0, %l7
+  ! A: divisor in a register, the sequence the compiler emits
+  mov 7, %l0
+  mov -2, %l1
+  sra %l0, 31, %g4
+  wr %g4, %g0, %y
+  sdiv %l0, %l1, %l2
+  cmp %l2, -3
+  bne 1f
+   nop
+  or %l7, 1, %l7
+1:
+  ! B: the same with three instructions between the write and the divide
+  mov 7, %l0
+  mov -2, %l1
+  sra %l0, 31, %g4
+  wr %g4, %g0, %y
+  nop
+  nop
+  nop
+  sdiv %l0, %l1, %l2
+  cmp %l2, -3
+  bne 2f
+   nop
+  or %l7, 2, %l7
+2:
+  ! C: divisor as a signed immediate rather than out of a register
+  mov 7, %l0
+  sra %l0, 31, %g4
+  wr %g4, %g0, %y
+  sdiv %l0, -2, %l2
+  cmp %l2, -3
+  bne 3f
+   nop
+  or %l7, 4, %l7
+3:
+  ! D: control. -7 / 2 is the case that already answers correctly.
+  mov -7, %l0
+  mov 2, %l1
+  sra %l0, 31, %g4
+  wr %g4, %g0, %y
+  sdiv %l0, %l1, %l2
+  cmp %l2, -3
+  bne 4f
+   nop
+  or %l7, 8, %l7
+4:
+  ! E: the other spelling of the write to %y
+  mov 7, %l0
+  mov -2, %l1
+  sra %l0, 31, %g4
+  wr %g0, %g4, %y
+  sdiv %l0, %l1, %l2
+  cmp %l2, -3
+  bne 5f
+   nop
+  or %l7, 16, %l7
+5:
+  mov %l7, %o0
+  mov 1, %g1
+  ta 0x10
+SPARCPROBE
+  sparc64-linux-gnu-as -32 -o "$BUILD_DIR/sparcdiv.o" "$BUILD_DIR/sparcdiv.s"
+  sparc64-linux-gnu-ld -m elf32_sparc "$BUILD_DIR/sparcdiv.o" -o "$BUILD_DIR/sparcdiv"
+  qemu-sparc-static "$BUILD_DIR/sparcdiv" || sparc_probe=$?
+  echo "sparc divide probe: ${sparc_probe:-0} of 31 (1=register 2=nops 4=immediate 8=control 16=other wr)"
+fi
+
 # The strongest check there is: build tests/exec-kernel.cas for every machine
 # that has an assembler, a linker and an emulator here, run it, and require
 # all of them to print the same thing. Assembling says the text was

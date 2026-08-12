@@ -6611,6 +6611,12 @@ static const char *hppa_machine_regs[] = {
 #define HPPA_MAPPED_COUNT ((int)(sizeof(hppa_machine_regs) / sizeof(hppa_machine_regs[0])))
 #define HPPA_SCRATCH "%r20"
 #define HPPA_SCRATCH2 "%r21"
+/* The frame pointer cannot be %r3, which is the register the ABI would
+   name: %r3 is virtual r0 here, so enter overwrote the argument the
+   function had just been called with, and leave loaded the stack pointer
+   out of whatever the function had computed by then. %r27 is the data
+   pointer, which a static program with no shared libraries never uses. */
+#define HPPA_FRAME "%r27"
 
 /* Set when something divided, so the divide routine is written out. */
 static bool hppa_divmod_used = false;
@@ -6818,7 +6824,8 @@ static void emit_hppa_instruction(Buffer *text, const char *op, const char *size
     if (op_is(op, "endfunc") && argc == 0) return;
     if (op_is(op, "enter") && argc == 1) {
         long long frame;
-        buf_append(text, "  stw %r2, -20(%r30)\n  copy %r30, %r3\n  ldo 64(%r30), %r30\n");
+        buf_append(text, "  stw %r2, -20(%r30)\n  stw %r27, -24(%r30)\n");
+        buf_append(text, "  copy %r30, %r27\n  ldo 64(%r30), %r30\n");
         if (strcmp(args[0], "0") == 0) return;
         if (hppa_fits_imm11(args[0], &frame)) buf_appendf(text, "  ldo %lld(%%r30), %%r30\n", frame);
         else {
@@ -6829,7 +6836,8 @@ static void emit_hppa_instruction(Buffer *text, const char *op, const char *size
         return;
     }
     if (op_is(op, "leave") && argc == 0) {
-        buf_append(text, "  copy %r3, %r30\n  ldw -20(%r30), %r2\n");
+        buf_append(text, "  copy %r27, %r30\n  ldw -20(%r30), %r2\n");
+        buf_append(text, "  ldw -24(%r30), %r27\n");
         return;
     }
     if (op_is(op, "mov") && argc == 2) {
