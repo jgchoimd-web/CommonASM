@@ -1,0 +1,277 @@
+; Signed arithmetic and the edges of it, run on every machine and required to
+; agree with C. tests/exec-arith-reference.c computes the line this has to
+; print, so the expectation comes from a C compiler rather than from someone
+; working it out by hand.
+;
+; Four of these machines have no divide instruction and use a division routine
+; written by hand in this compiler, each with its own sign correction. Until
+; this program, no negative number had ever reached one of them: every division
+; anywhere else in the test suite is a positive value by a positive constant.
+;
+; The operands come out of .data rather than being written as literals,
+; because the optimizer folds arithmetic on constants and a folded division
+; never reaches the machine's divide at all. The last few values are the
+; literal form on purpose, so the folding is checked against the same C.
+;
+; Left out deliberately: division by zero, and the most negative value divided
+; by -1. Both are undefined in CommonASM, and the machines genuinely disagree
+; about them -- x86 raises a fault while a software routine returns a number.
+;
+; Everything stays inside 32 bits, so the 32-bit and 64-bit members of a
+; family have to agree.
+
+const stdout = 1
+
+.rodata
+sep: string " "
+nl: string "\n"
+
+.data
+neg_seven:  dword -7
+pos_seven:  dword 7
+pos_two:    dword 2
+neg_two:    dword -2
+pos_four:   dword 4
+pos_six:    dword 6
+pos_eight:  dword 8
+pos_mil:    dword 1000000
+neg_mil:    dword -1000000
+neg_hun:    dword -100
+neg_three:  dword -3
+neg_25:     dword -25
+pos_12345:  dword 12345
+neg_2mil:   dword -2000000
+neg_42:     dword -42
+neg_five:   dword -5
+neg_one:    dword -1
+pos_one:    dword 1
+
+.bss
+cell: zero 8
+scratch: zero 32
+
+.text
+global _start
+
+_start:
+  ; the four sign combinations of a division, and the four remainders that go
+  ; with them. C truncates toward zero and takes the sign of the dividend for
+  ; the remainder; every machine here has to do the same.
+  load.d r0, [neg_seven]
+  load.d r1, [pos_two]
+  div r0, r1                ; -3
+  call print
+  load.d r0, [pos_seven]
+  load.d r1, [neg_two]
+  div r0, r1                ; -3
+  call print
+  load.d r0, [neg_seven]
+  load.d r1, [neg_two]
+  div r0, r1                ; 3
+  call print
+  load.d r0, [neg_seven]
+  load.d r1, [pos_two]
+  mod r0, r1                ; -1
+  call print
+  load.d r0, [pos_seven]
+  load.d r1, [neg_two]
+  mod r0, r1                ; 1
+  call print
+  load.d r0, [neg_seven]
+  load.d r1, [neg_two]
+  mod r0, r1                ; -1
+  call print
+
+  ; the same thing with values too big to be a special case
+  load.d r0, [pos_mil]
+  load.d r1, [neg_seven]
+  div r0, r1                ; -142857
+  call print
+  load.d r0, [pos_mil]
+  load.d r1, [neg_seven]
+  mod r0, r1                ; 1
+  call print
+  load.d r0, [neg_mil]
+  load.d r1, [pos_seven]
+  div r0, r1                ; -142857
+  call print
+  load.d r0, [neg_mil]
+  load.d r1, [pos_seven]
+  mod r0, r1                ; -1
+  call print
+
+  ; An arithmetic shift is not a division. It rounds down where a division
+  ; rounds toward zero, and these two lines are what stops anyone turning one
+  ; into the other. The remainder below is the same trap: masking the low bits
+  ; would answer 1 rather than -3.
+  load.d r0, [neg_hun]
+  sar r0, 3                 ; -13
+  call print
+  load.d r0, [neg_hun]
+  load.d r1, [pos_eight]
+  div r0, r1                ; -12
+  call print
+  load.d r0, [neg_seven]
+  load.d r1, [pos_four]
+  mod r0, r1                ; -3
+  call print
+
+  ; a negative shifted left, and both shifts asked for nothing at all
+  load.d r0, [neg_three]
+  shl r0, 4                 ; -48
+  call print
+  load.d r0, [pos_12345]
+  shl r0, 0                 ; 12345
+  call print
+  load.d r0, [neg_25]
+  sar r0, 0                 ; -25
+  call print
+
+  ; multiply and negate, with the sign on the other side
+  load.d r0, [neg_seven]
+  load.d r1, [pos_six]
+  mul r0, r1                ; -42
+  call print
+  load.d r0, [neg_2mil]
+  neg r0                    ; 2000000
+  call print
+
+  ; the extended operations that have a sign to get wrong
+  load.d r0, [neg_42]
+  abs r0                    ; 42
+  call print
+  load.d r0, [neg_five]
+  min r0, 3                 ; -5
+  call print
+  load.d r0, [neg_five]
+  max r0, 3                 ; 3
+  call print
+
+  ; A signed comparison and an unsigned one over the same two values have to
+  ; disagree: -1 is below 1 as a number and above it as a bit pattern.
+  mov r0, 0
+  load.d r1, [neg_one]
+  cmp r1, 1
+  jge arith_cmp1
+  mov r0, 1
+arith_cmp1:
+  call print                ; 1
+  mov r0, 0
+  load.d r1, [neg_one]
+  cmp r1, 1
+  jae arith_cmp2
+  mov r0, 1
+arith_cmp2:
+  call print                ; 0
+  mov r0, 0
+  load.d r1, [neg_five]
+  cmp r1, -5
+  jg arith_cmp3
+  mov r0, 1
+arith_cmp3:
+  call print                ; 1
+  mov r0, 0
+  load.d r1, [neg_one]
+  cmp r1, 1
+  jle arith_cmp4
+  mov r0, 1
+arith_cmp4:
+  call print                ; 0
+
+  ; a narrow load sign-extends, which is the only rule under which a 32-bit
+  ; machine and a 64-bit one agree, and masking is how to undo it
+  mov r0, 200
+  store.b [cell], r0
+  load.b r0, [cell]         ; -56
+  call print
+  load.b r0, [cell]
+  and r0, 0xff              ; 200
+  call print
+  mov r0, 0x8001
+  store.w [cell], r0
+  load.w r0, [cell]         ; -32767
+  call print
+
+  ; The same arithmetic written as literals, which the optimizer folds in the
+  ; compiler instead of leaving to the machine. Folding that disagrees with
+  ; the machine is a bug either way, so both forms answer to the same C.
+  mov r0, -7
+  div r0, 2                 ; -3
+  call print
+  mov r0, 7
+  div r0, -2                ; -3
+  call print
+  mov r0, -7
+  mod r0, 2                 ; -1
+  call print
+  mov r0, 7
+  mod r0, -2                ; 1
+  call print
+  mov r0, -100
+  div r0, 8                 ; -12
+  call print
+  mov r0, -7
+  mod r0, 4                 ; -3
+  call print
+  mov r0, -3
+  mul r0, 16                ; -48, and a multiply by a power of two becomes a
+  call print                ;      shift, so this is a negative shifted left
+  mov r0, -7
+  mul r0, 6                 ; -42
+  call print
+
+  syscall write, stdout, nl, nl_len
+  syscall exit, 0
+
+; Prints r0 as a signed decimal followed by a space. The digits come out
+; backwards, so they are pushed and popped.
+func print
+  mov r12, 0
+  cmp r0, 0
+  jge print_positive
+  mov r12, 1
+  neg r0
+print_positive:
+  mov r2, 0
+  cmp r0, 0
+  jne print_digits
+  mov r0, 48
+  push r0
+  inc r2
+  jmp print_sign
+print_digits:
+  cmp r0, 0
+  je print_sign
+  mov r3, r0
+  mod r3, 10
+  add r3, 48
+  push r3
+  inc r2
+  div r0, 10
+  jmp print_digits
+
+print_sign:
+  load_addr r5, scratch
+  mov r6, r5
+  cmp r12, 0
+  je print_pop
+  mov r3, 45
+  store.b [r6], r3
+  inc r6
+
+print_pop:
+  cmp r2, 0
+  je print_write
+  pop r3
+  store.b [r6], r3
+  inc r6
+  dec r2
+  jmp print_pop
+
+print_write:
+  mov r0, r6
+  sub r0, r5
+  syscall write, stdout, r5, r0
+  syscall write, stdout, sep, sep_len
+  ret
+endfunc

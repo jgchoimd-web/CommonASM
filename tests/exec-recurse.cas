@@ -1,0 +1,232 @@
+; Every function here calls something, and most of them call themselves.
+; Nothing else that runs in CI does. A function that calls a function is the
+; one shape where a machine has to keep its own return address alive across a
+; call that overwrites it, keep the stack balanced across a push, and reach a
+; spill slot that the call it is about to make will write to as well. All of
+; that is per-machine code, and until this program none of it had ever run.
+;
+; Registers are not preserved across a call: a called function may write any
+; of them, and a caller that needs a value keeps it on the stack. That rule is
+; what every function below is written to, and what it is here to check.
+;
+; Everything stays inside 32 bits and comes out as decimal, so the 32-bit and
+; 64-bit members of a family have to agree.
+
+const stdout = 1
+
+.rodata
+sep: string " "
+nl: string "\n"
+
+.bss
+digits: zero 32
+
+.text
+global _start
+
+_start:
+  ; self-recursion, ten deep, with the running value kept in a register that
+  ; is a spill slot rather than a machine one on most of these machines
+  mov r0, 10
+  call fact                 ; 3628800
+  call print
+
+  ; two recursive calls in one body: the return address has to survive the
+  ; first one for the second one to be reached at all
+  mov r0, 15
+  call fib                  ; 610
+  call print
+
+  ; mutual recursion, twenty-one calls deep before it turns around
+  mov r0, 21
+  call is_even              ; 0
+  call print
+  mov r0, 20
+  call is_even              ; 1
+  call print
+
+  ; the same shape inside a function that asks for a stack frame, so the
+  ; frame and the pushes have to agree about where the stack pointer is
+  mov r0, 50
+  call sumto                ; 1275
+  call print
+
+  ; a leaf call made from inside a recursion, with the recursion's own value
+  ; sitting on the stack while the leaf runs and writes registers
+  mov r0, 20
+  call trisum               ; 630
+  call print
+
+  ; a hundred deep, holding the highest virtual register there is
+  mov r0, 100
+  call chain                ; 5050
+  call print
+
+  syscall write, stdout, nl, nl_len
+  syscall exit, 0
+
+; n! computed by calling itself, with n kept across the call
+func fact
+  cmp r0, 1
+  jg fact_rec
+  mov r0, 1
+  ret
+fact_rec:
+  mov r12, r0
+  push r12
+  dec r0
+  call fact
+  pop r12
+  mul r0, r12
+  ret
+endfunc
+
+; Two calls in one body. Whatever holds the return address is written by the
+; first call, so it has to be reloaded before the second one returns anywhere.
+func fib
+  cmp r0, 2
+  jge fib_rec
+  ret
+fib_rec:
+  push r0
+  dec r0
+  call fib                  ; fib(n-1)
+  pop r8                    ; n
+  push r0                   ; keep fib(n-1)
+  mov r0, r8
+  sub r0, 2
+  call fib                  ; fib(n-2)
+  pop r9
+  add r0, r9
+  ret
+endfunc
+
+; These two only ever call each other, so no single function's own save and
+; restore can be what makes them work.
+func is_even
+  cmp r0, 0
+  je is_even_yes
+  dec r0
+  call is_odd
+  ret
+is_even_yes:
+  mov r0, 1
+  ret
+endfunc
+
+func is_odd
+  cmp r0, 0
+  je is_odd_no
+  dec r0
+  call is_even
+  ret
+is_odd_no:
+  mov r0, 0
+  ret
+endfunc
+
+; Recursion inside a stack frame. The frame moves the stack pointer, the push
+; moves it again, and the return has to find the return address regardless.
+func sumto
+  enter 16
+  cmp r0, 0
+  jg sumto_rec
+  mov r0, 0
+  leave
+  ret
+sumto_rec:
+  push r0
+  dec r0
+  call sumto
+  pop r10
+  add r0, r10
+  leave
+  ret
+endfunc
+
+; A leaf: it calls nothing, so it has nothing to save, and it writes a
+; register its caller is in the middle of using.
+func triple
+  mov r11, r0
+  add r0, r11
+  add r0, r11
+  ret
+endfunc
+
+; Sums triple(1) through triple(n) by recursion, calling the leaf while its
+; own partial answer is on the stack.
+func trisum
+  cmp r0, 0
+  jg trisum_rec
+  mov r0, 0
+  ret
+trisum_rec:
+  push r0
+  dec r0
+  call trisum
+  pop r13                   ; n
+  push r0                   ; the sum so far
+  mov r0, r13
+  call triple
+  pop r13
+  add r0, r13
+  ret
+endfunc
+
+; A hundred frames deep, each one holding r15, which is a spill slot on every
+; machine that spills at all.
+func chain
+  cmp r0, 0
+  jg chain_rec
+  mov r0, 0
+  ret
+chain_rec:
+  mov r15, r0
+  push r15
+  dec r0
+  call chain
+  pop r15
+  add r0, r15
+  ret
+endfunc
+
+; Prints r0 as decimal followed by a space. Everything this program computes
+; is positive, so there is no sign to handle. Digits come out backwards, so
+; they are pushed and popped.
+func print
+  mov r4, 0
+  cmp r0, 0
+  jne print_loop
+  mov r0, 48
+  push r0
+  inc r4
+  jmp print_out
+print_loop:
+  cmp r0, 0
+  je print_out
+  mov r5, r0
+  mod r5, 10
+  add r5, 48
+  push r5
+  inc r4
+  div r0, 10
+  jmp print_loop
+print_out:
+  load_addr r6, digits
+  add r6, 16
+  mov r7, r6
+print_pop:
+  cmp r4, 0
+  je print_write
+  pop r5
+  store.b [r7], r5
+  inc r7
+  dec r4
+  jmp print_pop
+print_write:
+  mov r0, r7
+  sub r0, r6
+  syscall write, stdout, r6, r0
+  syscall write, stdout, sep, sep_len
+  ret
+endfunc

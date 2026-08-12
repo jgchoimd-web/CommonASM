@@ -587,6 +587,16 @@ fi
 # syscalls all do what they were supposed to.
 KERNEL_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 100 105 105 7 9 9 9 "
 SORT_EXPECTED="-8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4 "
+RECURSE_EXPECTED="3628800 610 0 1 1275 630 5050 "
+# The arithmetic program's expected line is not written down here. A C
+# compiler works it out, so that what sixteen machines have to agree with is
+# C's answer to signed division rather than someone's arithmetic in a shell
+# variable.
+"$CC" -std=c99 -Wall -Wextra -pedantic "$ROOT_DIR/tests/exec-arith-reference.c" \
+  -o "$BUILD_DIR/exec-arith-reference"
+ARITH_EXPECTED="$("$BUILD_DIR/exec-arith-reference")"
+echo "C computed the line the arithmetic program has to print:"
+echo "  $ARITH_EXPECTED"
 EXEC_PROGRAM=tests/exec-kernel.cas
 EXEC_NAME=kernel
 EXEC_EXPECTED="$KERNEL_EXPECTED"
@@ -686,11 +696,29 @@ EXEC_NAME=sort
 EXEC_EXPECTED="$SORT_EXPECTED"
 run_exec_everywhere
 
+# A function that calls a function is where a machine has to keep its own
+# return address alive across a call that overwrites it, and reach a spill
+# slot the callee will write to as well. Nothing else here recurses at all,
+# so none of that code had ever run.
+EXEC_PROGRAM=tests/exec-recurse.cas
+EXEC_NAME=recurse
+EXEC_EXPECTED="$RECURSE_EXPECTED"
+run_exec_everywhere
+
+# Signed arithmetic at its edges, against what C answers. Four of these
+# machines divide with a routine written by hand in this compiler, each with
+# its own sign correction, and every other division in the suite is a
+# positive value by a positive constant.
+EXEC_PROGRAM=tests/exec-arith.cas
+EXEC_NAME=arith
+EXEC_EXPECTED="$ARITH_EXPECTED"
+run_exec_everywhere
+
 if [ "$exec_failures" -ne 0 ]; then
   echo "$exec_failures runs disagreed with the rest"
   exit 1
 fi
-echo "$exec_ran runs of two programs printed the same line as each other."
+echo "$exec_ran runs of four programs printed the same line as each other."
 fi
 
 # wasm is text that has to be assembled and validated, not linked.
@@ -725,6 +753,8 @@ if command -v wat2wasm > /dev/null 2>&1; then
     }
     run_exec_wasm kernel tests/exec-kernel.cas "$KERNEL_EXPECTED"
     run_exec_wasm sort demos/sort/sort.cas "$SORT_EXPECTED"
+    run_exec_wasm recurse tests/exec-recurse.cas "$RECURSE_EXPECTED"
+    run_exec_wasm arith tests/exec-arith.cas "$ARITH_EXPECTED"
   else
     echo "no node found; skipped running the wasm output."
   fi

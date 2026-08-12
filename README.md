@@ -119,22 +119,33 @@ they can prove:
    takes RISC-V, MIPS, PowerPC, SPARC, m68k, z/Architecture, LoongArch, Alpha,
    PA-RISC and SuperH; and wat2wasm
    validates the wasm module.
-3. **It runs and gets the right answer.** Two programs are built for every
+3. **It runs and gets the right answer.** Four programs are built for every
    machine there is an emulator for, linked, run under `qemu-user`, and all of
-   them have to print the same line — twenty-four runs, plus both programs
-   under node as wasm. `tests/exec-kernel.cas` uses arithmetic, all three
-   shifts, the extended operations, the atomic ones, a loop with a comparison,
-   byte memory access, a call with a stack, and syscalls;
-   `demos/sort/sort.cas` is a sorting program, with a loop inside a loop, a
-   signed comparison in the inner one, and negative numbers to print. That is
-   thirty runs.
+   them have to print the same line — sixty runs, plus all four under node as
+   wasm. `tests/exec-kernel.cas` uses arithmetic, all three shifts, the
+   extended operations, the atomic ones, a loop with a comparison, byte memory
+   access, a call with a stack, and syscalls. `demos/sort/sort.cas` is a
+   sorting program, with a loop inside a loop, a signed comparison in the
+   inner one, and negative numbers to print. `tests/exec-recurse.cas` is all
+   calls and mostly recursion, which is the one shape where a machine has to
+   keep its own return address alive across a call that overwrites it.
+   `tests/exec-arith.cas` is signed arithmetic at its edges, and it is the
+   only program here that ever hands a negative number to a divide — four of
+   these machines divide with a routine written by hand in this compiler.
    Assembling only says the text was well-formed; this is what catches a
    backend that assembles perfectly and computes the wrong number. Every
    backend bug found since it was added had passed step 2 — including one that
    meant a function could not call a function on seven machines.
-4. **It reads back.** Each family's assembly is lifted into CommonASM and
-   required to match the source it came from, and the extended operations are
-   run against a C reference both natively and expanded.
+
+   The arithmetic program's expected line is not written down anywhere. CI
+   compiles `tests/exec-arith-reference.c` and runs it, so what the machines
+   have to agree with is a C compiler's answer to signed division rather than
+   someone's arithmetic in a shell variable.
+4. **It reads back.** The six families that can be read — x86-64, i386,
+   AArch64, ARM32, RISC-V and MIPS — have their assembly lifted into
+   CommonASM, compiled again, and required to land on the assembly it started
+   from. The extended operations are run against a C reference both natively
+   and expanded.
 
 Tests that are supposed to fail are checked to actually fail, so a test that
 has stopped testing anything is caught too.
@@ -308,11 +319,24 @@ sixteenth in a table.
 | `riscv64-gnu` | `r0`-`r15` | none |
 | `x86_64-nasm` | `r0`-`r11` | `r12`-`r15` |
 | `armv7a-gnu` | `r0`-`r9` | `r10`-`r15` |
-| `i386-nasm` | `r0`-`r3` | `r4`-`r15` |
+| `superh` | `r0`-`r9` | `r10`-`r15` |
+| `i386-nasm` | `r0`-`r4` | `r5`-`r15` |
+
+32-bit x86 is the tightest of them, and it gets one more register out of a
+program that never says `enter`: `ebp` is the frame pointer only for a
+program that asks for a frame, and nothing else in the lowering needs it. A
+program that does use a frame gets `r0`-`r3` in registers instead.
 
 Virtual registers keep their values across everything the compiler emits,
 including `syscall`, which saves and restores whatever the call would
 otherwise overwrite.
+
+They do not survive a `call`. A called function is your code, and it may
+write any register it likes, so a caller that still needs a value puts it on
+the stack — including a value that lives in a spill slot, since `push` and
+`pop` reach a slot as readily as a register. This is what makes recursion
+work, and `tests/exec-recurse.cas` is what checks that it does on every
+machine.
 
 A load narrower than the register sign-extends: `load.b`, `load.w` and
 `load.d` all read a signed value. This is the only rule under which a 32-bit
