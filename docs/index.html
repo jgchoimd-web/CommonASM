@@ -55,8 +55,8 @@
 
       <section class="summary-band" aria-label="Project summary">
         <div>
-          <strong>Ten machines run the same program</strong>
-          <span>Built, linked and executed under emulation on every commit.</span>
+          <strong>Thirteen machines, two programs</strong>
+          <span>Built, linked and executed under emulation on every commit, all required to print the same line.</span>
         </div>
         <div>
           <strong>Eleven assemblers check the output</strong>
@@ -90,8 +90,9 @@
             <ul>
               <li><code>x86_64-nasm</code>, <code>i386-nasm</code></li>
               <li><code>aarch64-gnu</code>, <code>armv7a-gnu</code></li>
-              <li><code>riscv64-gnu</code>, <code>mips32-gnu</code>, <code>ppcg4-gnu</code></li>
-              <li><code>sparcv8-gnu</code>, <code>m68k</code>, <code>zarch</code></li>
+              <li><code>riscv64-gnu</code>, <code>rv32i-gnu</code>, <code>mips32-gnu</code></li>
+              <li><code>ppcg4-gnu</code>, <code>sparcv8-gnu</code>, <code>m68k</code></li>
+              <li><code>zarch</code>, <code>loongarch64-gnu</code>, <code>wasm</code></li>
             </ul>
           </article>
           <article class="target-card">
@@ -168,8 +169,10 @@ _start:
             <p>
               <code>popcnt</code>, <code>clz</code>, <code>ctz</code>,
               <code>bswap</code>, <code>rol</code>, <code>ror</code>,
-              <code>min</code>, <code>max</code>, <code>abs</code> and
-              <code>sel</code> are one instruction where the machine has one.
+              <code>min</code>, <code>max</code>, <code>abs</code>,
+              <code>sel</code>, and the atomic <code>fence</code>,
+              <code>atomic_add</code>, <code>atomic_xchg</code> and
+              <code>cas</code> are one instruction where the machine has one.
               Where it does not, each expands into ordinary CommonASM that goes
               through the same lowering as hand-written code, so the program
               still builds and still gives the same answer.

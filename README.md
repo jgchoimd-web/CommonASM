@@ -40,6 +40,7 @@ required to print the same thing:
 - `aarch64-gnu`, `armv7a-gnu`
 - `riscv64-gnu`, `rv32i-gnu`
 - `mips32-gnu`, `ppcg4-gnu`, `sparcv8-gnu`, `m68k`, `zarch`
+- `loongarch64-gnu`
 - `wasm`, through node
 
 Assembled on every commit — real assembly a real assembler accepts, sharing
@@ -54,7 +55,7 @@ the emitters above, but with nothing here to run them on:
 Pseudo assembly — readable text in that machine's shape, for reading and for
 porting from, not for assembling:
 
-- `rv128i-gnu`, `ia64-gnu`, `loongarch64-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
+- `rv128i-gnu`, `ia64-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
 - `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
 - `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`
 - `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
@@ -102,17 +103,21 @@ they can prove:
 2. **A real assembler accepts it.** NASM takes the x86-64 and i386 output with
    `-w+error=number-overflow`, so a truncated immediate is an error rather
    than a warning; clang takes AArch64, ARMv7 and Thumb-2; the GNU assembler
-   takes RISC-V, MIPS, PowerPC, SPARC, m68k and z/Architecture; and wat2wasm
+   takes RISC-V, MIPS, PowerPC, SPARC, m68k, z/Architecture and LoongArch;
+   and wat2wasm
    validates the wasm module.
-3. **It runs and gets the right answer.** `tests/exec-kernel.cas` uses
-   arithmetic, all three shifts, the extended operations, a loop with a
-   comparison, byte memory access, a call with a stack, and syscalls, then
-   prints thirteen numbers. It is built for x86-64, i386, AArch64, ARMv7,
-   RISC-V, MIPS, PowerPC, SPARC, m68k and z/Architecture, linked, run under
-   `qemu-user`, and all ten have to print the same line. Assembling only says
-   the text was well-formed; this is what catches a backend that assembles
-   perfectly and computes the wrong number. Every backend bug found since it
-   was added had passed step 2.
+3. **It runs and gets the right answer.** Two programs are built for every
+   machine there is an emulator for, linked, run under `qemu-user`, and all of
+   them have to print the same line — twenty-four runs, plus both programs
+   under node as wasm. `tests/exec-kernel.cas` uses arithmetic, all three
+   shifts, the extended operations, the atomic ones, a loop with a comparison,
+   byte memory access, a call with a stack, and syscalls;
+   `demos/sort/sort.cas` is a sorting program, with a loop inside a loop, a
+   signed comparison in the inner one, and negative numbers to print.
+   Assembling only says the text was well-formed; this is what catches a
+   backend that assembles perfectly and computes the wrong number. Every
+   backend bug found since it was added had passed step 2 — including one that
+   meant a function could not call a function on seven machines.
 4. **It reads back.** Each family's assembly is lifted into CommonASM and
    required to match the source it came from, and the extended operations are
    run against a C reference both natively and expanded.
