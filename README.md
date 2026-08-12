@@ -52,11 +52,17 @@ the emitters above, but with nothing here to run them on:
 - `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg5-gnu`, `power9-gnu`, `power10-gnu`
 - `sparcv9-gnu`, `coldfire`
 
+Real assembly with nothing here to check it — the backend emits what the
+machine's assembler takes, but Ubuntu has no cross-assembler for it, so CI
+gets no further than building:
+
+- `nios2`
+
 Pseudo assembly — readable text in that machine's shape, for reading and for
 porting from, not for assembling:
 
 - `rv128i-gnu`, `ia64-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
-- `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
+- `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `microblaze`, `arc`
 - `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`
 - `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
 - `mmixal`, `dcpu16`
