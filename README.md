@@ -304,6 +304,11 @@ there is not. Nothing has to use them, and using them never costs portability.
 - `ctz rD`: trailing zeros, the word width for zero
 - `bswap rD`: reverse byte order
 - `rol rD, n` / `ror rD, n`: rotate, by a constant or a register
+- `min rD, x` / `max rD, x`: signed, against a register or an immediate
+- `abs rD`: signed magnitude; the most negative value is left alone, since
+  negating it would not fit
+- `sel rD, a, b`: `rD` is the condition on the way in and the result on the
+  way out — `a` if it was non-zero, `b` if it was zero
 
 What that means in practice, for `popcnt`:
 
@@ -313,6 +318,20 @@ What that means in practice, for `popcnt`:
 | `aarch64-gnu` | `fmov`, `cnt`, `addv`, `fmov` |
 | `x86_64-nasm` | `popcnt rbx, rbx` |
 | `riscv64-gnu` | 22 instructions, no bit-manipulation extension needed |
+
+and for `min`:
+
+| target | emitted |
+| --- | --- |
+| `riscv64-zbb` | `min s2, s2, s3` |
+| `aarch64-gnu` | `cmp`, `csel ..., le` |
+| `x86_64-nasm` | `cmp`, `cmovg` |
+| everything else | a compare and a branch over one move |
+
+An extended operation may leave the flags in any state, so a `cmp` does not
+survive across one. That has always been true — the expansions are arithmetic,
+and arithmetic sets flags — and it is worth saying out loud now that some of
+them compare on purpose.
 
 `commonasmc --target-info TARGET` reports which are native there and which
 expand. `--emulate-extended` forces the expansion everywhere, which is what to

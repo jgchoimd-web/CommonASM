@@ -42,5 +42,22 @@ _start:
   mov r7, 13
   ror r6, r7
 
+  ; the comparing ones, which are signed. min and max take a register or an
+  ; immediate; abs leaves the most negative value alone, since negating it
+  ; would not fit.
+  mov r8, r0
+  mov r9, 1000
+  min r8, r9
+  mov r10, r0
+  max r10, 1000
+  mov r11, r0
+  abs r11
+
+  ; sel reads its condition from the destination and replaces it with one of
+  ; the two arms, so a branch is not needed to choose between two values.
+  mov r12, r0
+  and r12, 1
+  sel r12, r8, r10
+
   syscall write, stdout, msg, msg_len
   syscall exit, 0

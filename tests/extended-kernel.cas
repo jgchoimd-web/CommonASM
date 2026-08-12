@@ -16,6 +16,12 @@ cas_ror: qword 0
 cas_rol_reg: qword 0
 cas_ror_reg: qword 0
 cas_inline: qword 0
+cas_min: qword 0
+cas_max: qword 0
+cas_min_imm: qword 0
+cas_abs: qword 0
+cas_sel_true: qword 0
+cas_sel_false: qword 0
 
 .text
 global cas_run
@@ -29,6 +35,12 @@ global cas_ror
 global cas_rol_reg
 global cas_ror_reg
 global cas_inline
+global cas_min
+global cas_max
+global cas_min_imm
+global cas_abs
+global cas_sel_true
+global cas_sel_false
 
 func cas_run
   load.q r0, [cas_in]
@@ -85,6 +97,44 @@ func cas_run
     mul r0, r1
   }
   store.q [cas_inline], r0
+
+  ; The comparing operations. The second operand is negated so that the two
+  ; are on opposite sides of zero for most inputs and the signed comparison
+  ; is what decides, rather than the input happening to be small.
+  load.q r0, [cas_in]
+  load.q r1, [cas_in]
+  neg r1
+  min r0, r1
+  store.q [cas_min], r0
+
+  load.q r0, [cas_in]
+  load.q r1, [cas_in]
+  neg r1
+  max r0, r1
+  store.q [cas_max], r0
+
+  ; and once against an immediate rather than a register
+  load.q r0, [cas_in]
+  min r0, 1000
+  store.q [cas_min_imm], r0
+
+  load.q r0, [cas_in]
+  abs r0
+  store.q [cas_abs], r0
+
+  ; sel reads its condition from the destination, so the same input picks
+  ; one arm here and the other one after it is forced to zero
+  load.q r0, [cas_in]
+  mov r1, 111
+  mov r2, 222
+  sel r0, r1, r2
+  store.q [cas_sel_true], r0
+
+  mov r0, 0
+  mov r1, 111
+  mov r2, 222
+  sel r0, r1, r2
+  store.q [cas_sel_false], r0
 
   ret
 endfunc

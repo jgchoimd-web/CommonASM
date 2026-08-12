@@ -7,7 +7,9 @@
 
 extern void cas_run(void);
 extern uint64_t cas_in, cas_popcnt, cas_clz, cas_ctz, cas_bswap,
-                cas_rol, cas_ror, cas_rol_reg, cas_ror_reg, cas_inline;
+                cas_rol, cas_ror, cas_rol_reg, cas_ror_reg, cas_inline,
+                cas_min, cas_max, cas_min_imm, cas_abs, cas_sel_true,
+                cas_sel_false;
 
 static uint64_t ref_popcnt(uint64_t x) {
     uint64_t n = 0;
@@ -43,6 +45,22 @@ static uint64_t ref_rol(uint64_t x, unsigned n) {
 static uint64_t ref_ror(uint64_t x, unsigned n) {
     n &= 63u;
     return n == 0 ? x : (x >> n) | (x << (64 - n));
+}
+
+/* The comparing operations are signed, so the reference reads the same bits
+   as a signed value rather than the unsigned one everything above uses. */
+static uint64_t ref_min(uint64_t a, uint64_t b) {
+    return (int64_t)a <= (int64_t)b ? a : b;
+}
+
+static uint64_t ref_max(uint64_t a, uint64_t b) {
+    return (int64_t)a >= (int64_t)b ? a : b;
+}
+
+static uint64_t ref_abs(uint64_t x) {
+    /* Negating the most negative value overflows, and the answer is itself,
+       which is what the expansion produces too. */
+    return (int64_t)x < 0 ? (uint64_t)0 - x : x;
 }
 
 static int failures = 0;
@@ -81,7 +99,13 @@ int main(void) {
         /* Whichever inline arm the target picked, it has to have multiplied
            by three, which is how the block is shown to have gone in and run. */
         check("inline", inputs[i], cas_inline, inputs[i] * 3u);
+        check("min", inputs[i], cas_min, ref_min(inputs[i], (uint64_t)0 - inputs[i]));
+        check("max", inputs[i], cas_max, ref_max(inputs[i], (uint64_t)0 - inputs[i]));
+        check("min/imm", inputs[i], cas_min_imm, ref_min(inputs[i], 1000));
+        check("abs", inputs[i], cas_abs, ref_abs(inputs[i]));
+        check("sel/true", inputs[i], cas_sel_true, inputs[i] != 0 ? 111u : 222u);
+        check("sel/false", inputs[i], cas_sel_false, 222u);
     }
-    printf("  %d inputs x 9 checks: %d failures\n", count, failures);
+    printf("  %d inputs x 15 checks: %d failures\n", count, failures);
     return failures != 0;
 }

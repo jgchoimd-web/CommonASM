@@ -258,7 +258,10 @@ enum {
     CAP_CLZ = 1u << 1,
     CAP_CTZ = 1u << 2,
     CAP_BSWAP = 1u << 3,
-    CAP_ROT = 1u << 4
+    CAP_ROT = 1u << 4,
+    CAP_MINMAX = 1u << 5,
+    CAP_ABS = 1u << 6,
+    CAP_SEL = 1u << 7
 };
 
 typedef struct {
@@ -855,22 +858,30 @@ static unsigned target_caps(const char *target) {
     switch (desc->cls) {
         case CLASS_X86_64:
             /* popcnt needs POPCNT and lzcnt/tzcnt need LZCNT/BMI1; both are
-               reported by --target-info so the requirement is not hidden. */
-            return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
+               reported by --target-info so the requirement is not hidden.
+               min, max and sel are a compare and a cmov, which is 686. */
+            return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT |
+                   CAP_MINMAX | CAP_SEL;
         case CLASS_I386:
             /* bswap is 486, and the rotates are 386. bsr and bsf could serve
                for clz and ctz but they leave the result undefined for a zero
                input, so those are expanded instead. */
             return CAP_BSWAP | CAP_ROT;
         case CLASS_RISCV:
-            return (desc->flags & TF_RV_ZBB) ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT) : 0;
+            /* Zbb carries min and max themselves, as three-operand
+               instructions, but nothing for abs or a select. */
+            return (desc->flags & TF_RV_ZBB)
+                 ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT | CAP_MINMAX) : 0;
         case CLASS_WASM:
             /* wasm counts bits and rotates natively, but has nothing that
                reverses bytes. */
             return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_ROT;
         case CLASS_GENERIC:
             if (desc->flags & TF_AARCH64) {
-                return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
+                /* csel decides min, max and sel without a branch, and cneg
+                   is abs once the sign has been tested. */
+                return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT |
+                       CAP_MINMAX | CAP_ABS | CAP_SEL;
             }
             if (desc->flags & TF_ARM32) {
                 unsigned caps = CAP_ROT; /* the barrel shifter is always there */
@@ -921,7 +932,11 @@ static const ExtendedOp extended_ops[] = {
     {"ctz", CAP_CTZ, 1},
     {"bswap", CAP_BSWAP, 1},
     {"rol", CAP_ROT, 2},
-    {"ror", CAP_ROT, 2}
+    {"ror", CAP_ROT, 2},
+    {"min", CAP_MINMAX, 2},
+    {"max", CAP_MINMAX, 2},
+    {"abs", CAP_ABS, 1},
+    {"sel", CAP_SEL, 3}
 };
 
 #define EXTENDED_OP_COUNT (sizeof(extended_ops) / sizeof(extended_ops[0]))
@@ -2937,6 +2952,34 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
+    if ((op_is(op, "min") || op_is(op, "max")) && argc == 2) {
+        /* csel picks one of two registers on the flags a compare just set, so
+           there is no branch here and nothing to save. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        const char *src = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+        buf_appendf(text, "  cmp %s, %s\n", dst, src);
+        buf_appendf(text, "  csel %s, %s, %s, %s\n", dst, dst, src, op_is(op, "min") ? "le" : "ge");
+        return;
+    }
+    if (op_is(op, "abs") && argc == 1) {
+        /* cneg negates when the condition holds and copies when it does not,
+           so testing the sign is the whole of it. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        buf_appendf(text, "  cmp %s, #0\n", dst);
+        buf_appendf(text, "  cneg %s, %s, lt\n", dst, dst);
+        return;
+    }
+    if (op_is(op, "sel") && argc == 3) {
+        /* Both arms are brought in before the compare, since materialising an
+           immediate leaves the flags alone but reading the condition out of
+           the destination has to happen before the destination is written. */
+        const char *dst = a64_reg(args[0], line_no, op);
+        const char *yes = a64_operand_reg(text, args[1], A64_SCRATCH, line_no, op);
+        const char *no = a64_operand_reg(text, args[2], A64_SCRATCH2, line_no, op);
+        buf_appendf(text, "  cmp %s, #0\n", dst);
+        buf_appendf(text, "  csel %s, %s, %s, ne\n", dst, yes, no);
+        return;
+    }
     if ((op_is(op, "clz") || op_is(op, "ctz") || op_is(op, "bswap")) && argc == 1) {
         const char *dst = a64_reg(args[0], line_no, op);
         if (op_is(op, "clz")) buf_appendf(text, "  clz %s, %s\n", dst, dst);
@@ -3201,6 +3244,40 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
             buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
         } else {
             buf_appendf(text, "  %s %s, %s\n", mnemonic, x86_reg(args[0], line_no, op), x86_reg(args[0], line_no, op));
+        }
+        return;
+    }
+    if ((op_is(op, "min") || op_is(op, "max")) && argc == 2) {
+        /* cmov cannot take an immediate, so the other operand goes through a
+           register whatever it started as. */
+        const char *cc = op_is(op, "min") ? "cmovg" : "cmovl";
+        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+        buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_operand(args[1], line_no, op));
+        buf_appendf(text, "  cmp %s, %s\n", X86_SCRATCH, X86_ADDR_SCRATCH);
+        buf_appendf(text, "  %s %s, %s\n", cc, X86_SCRATCH, X86_ADDR_SCRATCH);
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "sel") && argc == 3) {
+        /* The condition is read out of the destination, so it is tested
+           before either arm is loaded. Moving a value does not touch the
+           flags, so the compare survives until the cmov reads it. */
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  cmp qword %s, 0\n", x86_reg(args[0], line_no, op));
+        } else {
+            buf_appendf(text, "  cmp %s, 0\n", x86_reg(args[0], line_no, op));
+        }
+        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_operand(args[1], line_no, op));
+        buf_appendf(text, "  mov %s, %s\n", X86_ADDR_SCRATCH, x86_operand(args[2], line_no, op));
+        buf_appendf(text, "  cmovz %s, %s\n", X86_SCRATCH, X86_ADDR_SCRATCH);
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
         }
         return;
     }
@@ -3548,6 +3625,22 @@ static void emit_rv_instruction(Buffer *text, const char *target, const char *op
         buf_appendf(text, "  %s %s, %s\n", native, dst, dst);
         return;
     }
+    if ((op_is(op, "min") || op_is(op, "max")) && argc == 2) {
+        /* The bit-manipulation extension carries these as ordinary
+           three-operand instructions. They only take registers, so an
+           immediate is loaded first. */
+        const char *dst = rv_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *rhs;
+        if (src >= 0) {
+            rhs = rv_regs[src];
+        } else {
+            buf_appendf(text, "  li %s, %s\n", RV_SCRATCH, args[1]);
+            rhs = RV_SCRATCH;
+        }
+        buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, rhs);
+        return;
+    }
     if ((op_is(op, "rol") || op_is(op, "ror")) && argc == 2) {
         const char *dst = rv_reg(args[0], line_no, op);
         int src = virtual_reg_index(args[1]);
@@ -3782,6 +3875,53 @@ static void ext_expand_rotate(Buffer *text, const char *target, int line_no,
     emit_cas(text, target, line_no, "pop r%d", s1);
 }
 
+/* Labels the expansions below branch over. Nothing in the language can
+   produce this spelling, since a source label cannot start with a digit and
+   these are only ever emitted here. */
+static int ext_label_serial = 0;
+
+static void ext_expand_abs(Buffer *text, const char *target, int line_no, const char *dst) {
+    int bits = target_word_bits(target);
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    /* The sign bit smeared across the word is zero for a positive value and
+       all ones for a negative one, and x ^ m - m is x in the first case and
+       -x in the second. No branch, and no compare to lose. */
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "mov r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "sar r%d, %d", s1, bits - 1);
+    emit_cas(text, target, line_no, "xor %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "sub %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_minmax(Buffer *text, const char *target, int line_no,
+                              const char *dst, const char *other, bool want_min) {
+    int serial = ++ext_label_serial;
+    /* Keeping what is already there when it is already the answer means the
+       operand is only read once, which matters when it is a spill slot. */
+    emit_cas(text, target, line_no, "cmp %s, %s", dst, other);
+    emit_cas(text, target, line_no, "%s __cas_ext_%d", want_min ? "jle" : "jge", serial);
+    emit_cas(text, target, line_no, "mov %s, %s", dst, other);
+    emit_cas(text, target, line_no, "__cas_ext_%d:", serial);
+}
+
+static void ext_expand_sel(Buffer *text, const char *target, int line_no,
+                           const char *dst, const char *when_true, const char *when_false) {
+    int taken = ++ext_label_serial;
+    int done = ++ext_label_serial;
+    /* The destination carries the condition in, so both arms are chosen
+       before either one writes it, and naming it as an arm is allowed. */
+    emit_cas(text, target, line_no, "cmp %s, 0", dst);
+    emit_cas(text, target, line_no, "jne __cas_ext_%d", taken);
+    emit_cas(text, target, line_no, "mov %s, %s", dst, when_false);
+    emit_cas(text, target, line_no, "jmp __cas_ext_%d", done);
+    emit_cas(text, target, line_no, "__cas_ext_%d:", taken);
+    emit_cas(text, target, line_no, "mov %s, %s", dst, when_true);
+    emit_cas(text, target, line_no, "__cas_ext_%d:", done);
+}
+
 /* True when the operation was handled here, either because the target has no
    instruction for it or because it is not an extended operation at all. */
 static bool emit_extended_fallback(Buffer *text, const char *target, const char *op,
@@ -3801,7 +3941,12 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
     else if (strcmp(op, "clz") == 0) ext_expand_clz(text, target, line_no, args[0]);
     else if (strcmp(op, "ctz") == 0) ext_expand_ctz(text, target, line_no, args[0]);
     else if (strcmp(op, "bswap") == 0) ext_expand_bswap(text, target, line_no, args[0]);
-    else ext_expand_rotate(text, target, line_no, args[0], args[1], strcmp(op, "rol") == 0);
+    else if (strcmp(op, "abs") == 0) ext_expand_abs(text, target, line_no, args[0]);
+    else if (strcmp(op, "min") == 0 || strcmp(op, "max") == 0) {
+        ext_expand_minmax(text, target, line_no, args[0], args[1], strcmp(op, "min") == 0);
+    } else if (strcmp(op, "sel") == 0) {
+        ext_expand_sel(text, target, line_no, args[0], args[1], args[2]);
+    } else ext_expand_rotate(text, target, line_no, args[0], args[1], strcmp(op, "rol") == 0);
     return true;
 }
 
