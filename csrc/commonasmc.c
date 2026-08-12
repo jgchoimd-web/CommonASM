@@ -882,8 +882,9 @@ static unsigned target_caps(const char *target) {
         case CLASS_I386:
             /* bswap is 486, and the rotates are 386. bsr and bsf could serve
                for clz and ctz but they leave the result undefined for a zero
-               input, so those are expanded instead. */
-            return CAP_BSWAP | CAP_ROT;
+               input, so those are expanded instead. The locked instructions
+               are 486 as well. */
+            return CAP_BSWAP | CAP_ROT | CAP_ATOMIC;
         case CLASS_RISCV:
             /* Zbb carries min and max themselves, as three-operand
                instructions, but nothing for abs or a select. */
@@ -894,8 +895,9 @@ static unsigned target_caps(const char *target) {
         case CLASS_LOONG:
             /* Counting leading and trailing zeros, reversing bytes and
                rotating are all single instructions; counting set bits is not,
-               and neither is a minimum or a maximum. */
-            return CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT;
+               and neither is a minimum or a maximum. The atomic memory
+               instructions carry their own barrier. */
+            return CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT | CAP_ATOMIC;
         case CLASS_WASM:
             /* wasm counts bits and rotates natively, but has nothing that
                reverses bytes. */
@@ -918,6 +920,16 @@ static unsigned target_caps(const char *target) {
                 return caps;
             }
             return 0;
+        /* Every one of these has an instruction, or a pair of them, that can
+           change a word without anything getting in between: the linked load
+           and conditional store on MIPS and PowerPC, laag and csg on
+           z/Architecture, cas.l on m68k. They have nothing else on this list,
+           which is why they only appear here now. */
+        case CLASS_MIPS:
+        case CLASS_PPC:
+        case CLASS_S390:
+        case CLASS_M68K:
+            return CAP_ATOMIC;
         default:
             return 0;
     }
@@ -2512,6 +2524,43 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
             buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_operand(args[1], line_no, op));
             buf_appendf(text, "  mov %s %s, %s\n", i386_size_word(size), addr,
                         strcmp(size, "b") == 0 ? "al" : strcmp(size, "w") == 0 ? "ax" : "eax");
+        }
+        return;
+    }
+    if (op_is(op, "fence") && argc == 0) {
+        /* mfence needs SSE2, which a 386 has not got. A locked read-modify-
+           write of the top of the stack orders everything either side of it
+           and changes nothing, which is the barrier this family had first. */
+        buf_append(text, "  lock or dword [esp], 0\n");
+        return;
+    }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg")) && argc == 2) {
+        char addr[256];
+        bool spilled = i386_reg_is_spilled(args[0]);
+        const char *val = spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op);
+        if (spilled) buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+        i386_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (op_is(op, "atomic_add")) buf_appendf(text, "  lock xadd %s, %s\n", addr, val);
+        else buf_appendf(text, "  xchg %s, %s\n", val, addr);
+        if (spilled) buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        return;
+    }
+    if (op_is(op, "cas") && argc == 3) {
+        char addr[256];
+        bool borrowed = virtual_reg_index(args[2]) < 0 || i386_reg_is_spilled(args[2]);
+        const char *newv = borrowed ? "ecx" : i386_reg(args[2], line_no, op);
+        buf_appendf(text, "  mov %s, %s\n", I386_SCRATCH, i386_reg(args[0], line_no, op));
+        if (borrowed) {
+            buf_append(text, "  push ecx\n");
+            buf_appendf(text, "  mov ecx, %s\n", i386_operand(args[2], line_no, op));
+        }
+        i386_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "  lock cmpxchg %s, %s\n", addr, newv);
+        if (borrowed) buf_append(text, "  pop ecx\n");
+        if (i386_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov dword %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", i386_reg(args[0], line_no, op), I386_SCRATCH);
         }
         return;
     }
@@ -4634,6 +4683,41 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         compare_emit_branch(text, &mips_cmp, op, args[0], line_no);
         return;
     }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  sync\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* There is no read-modify-write instruction, only a linked load and
+           a conditional store that fails if anything touched the word in
+           between. So each of these is that pair in a loop. */
+        int again = ++ext_label_serial;
+        int done = ++ext_label_serial;
+        char addr[256];
+        const char *dst = mips_reg(args[0], line_no, op);
+        const char *ll = wide ? "lld" : "ll";
+        const char *sc = wide ? "scd" : "sc";
+        const char *newv = argc == 3 ? mips_reg(args[2], line_no, op) : NULL;
+        mips_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        /* $at is normally left to the assembler's own macros. None of the
+           instructions below need it, and nothing else here is free. */
+        buf_append(text, "  .set noat\n");
+        buf_appendf(text, "__cas_ext_%d:\n", again);
+        buf_appendf(text, "  %s %s, %s\n", ll, MIPS_SCRATCH2, addr);
+        if (op_is(op, "cas")) {
+            buf_appendf(text, "  bne %s, %s, __cas_ext_%d\n", MIPS_SCRATCH2, dst, done);
+            buf_appendf(text, "  move $at, %s\n", newv);
+        } else if (op_is(op, "atomic_add")) {
+            buf_appendf(text, "  %s $at, %s, %s\n", addu, MIPS_SCRATCH2, dst);
+        } else {
+            buf_appendf(text, "  move $at, %s\n", dst);
+        }
+        buf_appendf(text, "  %s $at, %s\n", sc, addr);
+        buf_appendf(text, "  beqz $at, __cas_ext_%d\n", again);
+        buf_appendf(text, "__cas_ext_%d:\n", done);
+        buf_append(text, "  .set at\n");
+        buf_appendf(text, "  move %s, %s\n", dst, MIPS_SCRATCH2);
+        buf_append(text, "  sync\n");
+        return;
+    }
     if (op_is(op, "push") && argc == 1) {
         const char *value = mips_operand_reg(text, args[0], MIPS_SCRATCH, line_no, op);
         buf_appendf(text, "  %s $sp, $sp, -%d\n", addiu, slot);
@@ -4963,6 +5047,40 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
             }
         }
         buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  sync\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* The reservation pair, in a loop. It addresses memory by register
+           only, with no displacement, so the address is worked out first. */
+        int again = ++ext_label_serial;
+        int done = ++ext_label_serial;
+        char addr[256];
+        const char *dst = ppc_reg(args[0], line_no, op);
+        const char *larx = wide ? "ldarx" : "lwarx";
+        const char *stcx = wide ? "stdcx." : "stwcx.";
+        const char *newv = argc == 3 ? ppc_reg(args[2], line_no, op) : NULL;
+        ppc_emit_address(text, args[1], addr, sizeof(addr), PPC_SCRATCH, line_no, op);
+        buf_appendf(text, "  la %s, %s\n", PPC_SCRATCH, addr);
+        buf_appendf(text, "__cas_ext_%d:\n", again);
+        buf_appendf(text, "  %s %s, 0, %s\n", larx, PPC_SCRATCH2, PPC_SCRATCH);
+        if (op_is(op, "cas")) {
+            buf_appendf(text, "  %s %s, %s\n", wide ? "cmpd" : "cmpw", PPC_SCRATCH2, dst);
+            buf_appendf(text, "  bne __cas_ext_%d\n", done);
+            buf_appendf(text, "  %s %s, 0, %s\n", stcx, newv, PPC_SCRATCH);
+        } else if (op_is(op, "atomic_add")) {
+            /* r0 takes the sum: the register the addend is in has to still
+               hold it if the store fails and this goes round again. */
+            buf_appendf(text, "  add 0, %s, %s\n", PPC_SCRATCH2, dst);
+            buf_appendf(text, "  %s 0, 0, %s\n", stcx, PPC_SCRATCH);
+        } else {
+            buf_appendf(text, "  %s %s, 0, %s\n", stcx, dst, PPC_SCRATCH);
+        }
+        buf_appendf(text, "  bne __cas_ext_%d\n", again);
+        buf_appendf(text, "__cas_ext_%d:\n", done);
+        buf_appendf(text, "  mr %s, %s\n", dst, PPC_SCRATCH2);
+        buf_append(text, "  sync\n");
         return;
     }
     if (op_is(op, "push") && argc == 1) {
@@ -5617,6 +5735,47 @@ static void emit_loong_instruction(Buffer *text, const char *op, const char *siz
         compare_emit_branch(text, &loong_cmp, op, args[0], line_no);
         return;
     }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  dbar 0\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* The atomic memory instructions answer with the old value and carry
+           their own barrier in the _db forms. There is no compare-and-swap
+           among them, so that one is the linked load and conditional store
+           pair in a loop. The address has to be a register on its own. */
+        char base[64];
+        long long off = 0;
+        const char *dst = loong_dst_reg(args[0], line_no, op);
+        const char *value = loong_value_reg(text, args[0], LOONG_SCRATCH2, line_no, op);
+        loong_emit_address(text, args[1], base, sizeof(base), &off, LOONG_SCRATCH, line_no, op);
+        if (off != 0) {
+            buf_appendf(text, "  addi.d %s, %s, %lld\n", LOONG_SCRATCH, base, off);
+            snprintf(base, sizeof(base), "%s", LOONG_SCRATCH);
+        }
+        if (op_is(op, "cas")) {
+            int again = ++ext_label_serial;
+            int done = ++ext_label_serial;
+            /* The expected value is parked in $t7 so it survives a retry:
+               the register it arrived in is the one the conditional store
+               writes its answer into. An atomic does not preserve a pending
+               comparison, which is what that pair is otherwise for. */
+            const char *newv = loong_value_reg(text, args[2], LOONG_SCRATCH2, line_no, op);
+            buf_appendf(text, "  move $t7, %s\n", value);
+            buf_appendf(text, "__cas_ext_%d:\n", again);
+            buf_appendf(text, "  ll.d $t8, %s, 0\n", base);
+            buf_appendf(text, "  bne $t8, $t7, __cas_ext_%d\n", done);
+            buf_appendf(text, "  move %s, %s\n", LOONG_SCRATCH2, newv);
+            buf_appendf(text, "  sc.d %s, %s, 0\n", LOONG_SCRATCH2, base);
+            buf_appendf(text, "  beqz %s, __cas_ext_%d\n", LOONG_SCRATCH2, again);
+            buf_appendf(text, "__cas_ext_%d:\n", done);
+            buf_appendf(text, "  move %s, $t8\n", dst);
+        } else {
+            const char *native = op_is(op, "atomic_add") ? "amadd_db.d" : "amswap_db.d";
+            buf_appendf(text, "  %s $t8, %s, %s\n", native, value, base);
+            buf_appendf(text, "  move %s, $t8\n", dst);
+        }
+        loong_store_back(text, args[0], dst, LOONG_SCRATCH);
+        return;
+    }
     if (op_is(op, "push") && argc == 1) {
         const char *value = loong_value_reg(text, args[0], LOONG_SCRATCH2, line_no, op);
         buf_append(text, "  addi.d $sp, $sp, -8\n");
@@ -5901,6 +6060,38 @@ static void emit_m68k_instruction(Buffer *text, const char *op, const char *size
                              op_is(op, "ja") ? "bhi" : op_is(op, "jb") ? "bcs" :
                              op_is(op, "jae") ? "bcc" : "bls";
         buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "fence") && argc == 0) {
+        /* Nothing to emit. This machine does not reorder what it is told. */
+        return;
+    }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* cas compares its first register against memory and stores the
+           second if they matched, loading the register from memory if they
+           did not. A compare-and-swap is that once; the other two are that
+           in a loop, since what to store depends on what was read. */
+        char addr[256];
+        m68k_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (op_is(op, "cas")) {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[0], line_no, op), M68K_SCRATCH);
+            buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[2], line_no, op), M68K_SCRATCH2);
+            buf_appendf(text, "  cas.l %s, %s, %s\n", M68K_SCRATCH, M68K_SCRATCH2, addr);
+        } else {
+            int again = ++ext_label_serial;
+            buf_appendf(text, "  move.l %s, %s\n", addr, M68K_SCRATCH);
+            buf_appendf(text, "__cas_ext_%d:\n", again);
+            if (op_is(op, "atomic_add")) {
+                buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, M68K_SCRATCH2);
+                buf_appendf(text, "  add.l %s, %s\n", m68k_operand(args[0], line_no, op), M68K_SCRATCH2);
+            } else {
+                buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[0], line_no, op), M68K_SCRATCH2);
+            }
+            buf_appendf(text, "  cas.l %s, %s, %s\n", M68K_SCRATCH, M68K_SCRATCH2, addr);
+            buf_appendf(text, "  bne __cas_ext_%d\n", again);
+        }
+        buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
         return;
     }
     if (op_is(op, "push") && argc == 1) {
@@ -6266,6 +6457,34 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
             buf_appendf(text, "  %s %s, %s\n", unsigned_test ? "clgr" : "cgr", lhs, S390_SCRATCH);
         }
         buf_appendf(text, "  %s %s\n", branch, args[0]);
+        return;
+    }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  bcr 14, %r0\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
+        (argc == 2 || argc == 3)) {
+        /* laag adds and answers with the old value in one instruction. The
+           other two are csg, which compares against a register and swaps if
+           it matched, reloading that register if it did not - so an exchange
+           is csg in a loop and a compare-and-swap is csg once. */
+        char addr[256];
+        const char *dst = s390_dst_reg(args[0], line_no, op);
+        const char *value = s390_value_reg(text, args[0], S390_SCRATCH2, line_no, op);
+        s390_emit_address(text, args[1], addr, sizeof(addr), S390_SCRATCH, line_no, op);
+        if (op_is(op, "atomic_add")) {
+            buf_appendf(text, "  laag %%r0, %s, %s\n", value, addr);
+        } else if (op_is(op, "cas")) {
+            const char *newv = s390_value_reg(text, args[2], "%r12", line_no, op);
+            buf_appendf(text, "  lgr %%r0, %s\n", value);
+            buf_appendf(text, "  csg %%r0, %s, %s\n", newv, addr);
+        } else {
+            int again = ++ext_label_serial;
+            buf_appendf(text, "  lg %%r0, %s\n", addr);
+            buf_appendf(text, "__cas_ext_%d:\n", again);
+            buf_appendf(text, "  csg %%r0, %s, %s\n", value, addr);
+            buf_appendf(text, "  jne __cas_ext_%d\n", again);
+        }
+        buf_appendf(text, "  lgr %s, %%r0\n", dst);
+        s390_store_back(text, args[0], dst, S390_SCRATCH);
         return;
     }
     if (op_is(op, "push") && argc == 1) {

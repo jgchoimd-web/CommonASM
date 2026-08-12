@@ -361,10 +361,15 @@ indivisibility.
 
 | target | `atomic_add` |
 | --- | --- |
-| `x86_64-nasm` | `lock xadd` |
+| `x86_64-nasm`, `i386-nasm` | `lock xadd` |
 | `aarch64-gnu` | `ldaddal` |
 | `riscv64-gnu` | `amoadd.d` |
-| everything else | a load, an add and a store |
+| `loongarch64-gnu` | `amadd_db.d` |
+| `zarch` | `laag` |
+| `m68k` | a `cas.l` retry loop |
+| `mips32-gnu` | an `ll`/`sc` retry loop |
+| `ppcg4-gnu` | an `lwarx`/`stwcx.` retry loop |
+| `armv4-gnu`..`armv7a-gnu`, `sparcv8-gnu` | a load, an add and a store |
 
 The AArch64 instructions are the ones ARMv8.1 added, so a program that uses
 one raises the floor of its own output to that — announced by an `.arch`
