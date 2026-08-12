@@ -461,6 +461,24 @@ if command -v wat2wasm > /dev/null 2>&1; then
     wat2wasm "$BUILD_DIR/wasm-${name}.wat" -o "$BUILD_DIR/wasm-${name}.wasm"
   done
   echo "wat2wasm assembled and validated every wasm output."
+  # And then the same program the emulated machines run, run here too. wasm
+  # needs no emulator and no cross toolchain, so this works anywhere node and
+  # wat2wasm both are, Linux or not.
+  if command -v node > /dev/null 2>&1; then
+    "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/exec-kernel.cas" --target wasm -O1 \
+      -o "$BUILD_DIR/exec-wasm.wat"
+    wat2wasm "$BUILD_DIR/exec-wasm.wat" -o "$BUILD_DIR/exec-wasm.wasm"
+    node "$ROOT_DIR/tests/wasm-run.js" "$BUILD_DIR/exec-wasm.wasm" > "$BUILD_DIR/exec-wasm.txt" 2>&1 || true
+    if [ "$(cat "$BUILD_DIR/exec-wasm.txt")" = "$EXEC_EXPECTED" ]; then
+      echo "  wasm: ran and printed the expected line"
+    else
+      echo "  wasm: printed [$(cat "$BUILD_DIR/exec-wasm.txt")]"
+      echo "        expected [$EXEC_EXPECTED]"
+      exit 1
+    fi
+  else
+    echo "no node found; skipped running the wasm output."
+  fi
 else
   echo "no wat2wasm found; skipped validating the wasm output."
 fi

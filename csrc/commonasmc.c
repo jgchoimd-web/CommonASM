@@ -5296,10 +5296,13 @@ static long long wasm_data_size = 0;
 static bool wasm_uses_read = false;
 static bool wasm_uses_write = false;
 static bool wasm_uses_close = false;
+/* Names the blocks that a call returns into. */
+static int wasm_continuations = 0;
 
 static void wasm_begin(void) {
     wasm_block_count = 0;
     wasm_symbol_count = 0;
+    wasm_continuations = 0;
     wasm_uses_read = false;
     wasm_uses_write = false;
     wasm_uses_close = false;
@@ -5580,10 +5583,18 @@ static void emit_wasm_instruction(const char *op, const char *size, char **args,
     }
     if (op_is(op, "call") && argc == 1) {
         /* The return index goes on a shadow stack, because the dispatch loop
-           has no call stack of its own. */
+           has no call stack of its own. The index is the block after this
+           one, so the instruction after the call has to start a block of its
+           own: returning otherwise lands at the next label in the program,
+           and the two are only the same thing when a call happens to be the
+           last instruction before one. The name cannot collide with a label
+           from the source, which is a single token and so has no space. */
+        char label[96];
         buf_appendf(out, "    local.get $sp\n    i32.const 4\n    i32.sub\n    local.set $sp\n");
         buf_appendf(out, "    local.get $sp\n    i32.const @@next@@\n    i32.store\n");
         buf_appendf(out, "    i32.const @%s@\n    local.set $pc\n    br $dispatch\n", args[0]);
+        snprintf(label, sizeof(label), " after call %d", ++wasm_continuations);
+        wasm_open_block(label);
         return;
     }
     if (op_is(op, "ret") && argc == 0) {
