@@ -1570,6 +1570,23 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     *colon = '\0';
     name = trim(line);
     kind = trim(colon + 1);
+    /* A label has to be aligned for the instructions that will reach it. Most
+       of these machines fault on a word load from an odd address, and
+       z/Architecture needs every label even whatever it holds: larl encodes
+       half the distance to its target, so an odd address cannot be named at
+       all, and asking for one gets the label before it instead. A one-byte
+       newline sitting behind a one-byte space printed the space. */
+    if (rv || (generic && !nasm && !is_toy_target(target) && !is_vm_ir_target(target))) {
+        int align = 1;
+        if (strncmp(kind, "word", 4) == 0 && isspace((unsigned char)kind[4])) align = 2;
+        else if (strncmp(kind, "dword", 5) == 0 && isspace((unsigned char)kind[5])) align = 4;
+        else if (strncmp(kind, "qword", 5) == 0 && isspace((unsigned char)kind[5])) align = 8;
+        else if (strncmp(kind, "zero", 4) == 0 && isspace((unsigned char)kind[4])) {
+            align = target_word_bits(target) / 8;
+        }
+        if (is_s390_target(target) && align < 2) align = 2;
+        if (align > 1) buf_appendf(out, ".balign %d\n", align);
+    }
     if (strncmp(kind, "string", 6) == 0 && isspace((unsigned char)kind[6])) {
         char *quote = trim(kind + 6);
         int byte_count = 0;
