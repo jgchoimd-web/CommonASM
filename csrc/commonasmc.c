@@ -1455,6 +1455,90 @@ static void scan_functions_that_call(const char *source) {
     }
 }
 
+/* One byte per source line, set where the comparison that line records is
+   read by exactly one branch. Machines with no condition flags keep a
+   comparison alive in the compiler until a branch spells it out, and they pay
+   for keeping it alive: anything that writes an operand in between has to
+   copy the operands aside first. That is only worth doing when a second
+   branch is still coming. */
+static unsigned char *cmp_single_use = NULL;
+static int cmp_single_use_lines = 0;
+
+static bool compare_is_single_use(int line_no) {
+    if (!cmp_single_use || line_no < 1 || line_no > cmp_single_use_lines) return false;
+    return cmp_single_use[line_no - 1] != 0;
+}
+
+static bool line_is_conditional_branch_text(const char *line, size_t len) {
+    static const char *const names[] = {"je", "jne", "jg", "jl", "jge", "jle",
+                                        "ja", "jb", "jae", "jbe"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t n = strlen(names[i]);
+        if (len > n && strncmp(line, names[i], n) == 0 && isspace((unsigned char)line[n])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Walks the source once and marks each cmp whose comparison only one branch
+   goes on to read. The run ends at a label, at the next cmp, or at a function
+   boundary, because a comparison does not survive any of those. The extended
+   operations that compare - min, max and sel - expand into exactly one
+   comparison and one branch each, so their lines are marked too. */
+static void scan_single_use_compares(const char *source) {
+    const char *p = source;
+    int total = 1;
+    int index = 0;
+    for (const char *c = source; *c; c++) {
+        if (*c == '\n') total++;
+    }
+    cmp_single_use = xmalloc((size_t)total);
+    memset(cmp_single_use, 0, (size_t)total);
+    cmp_single_use_lines = total;
+    while (*p) {
+        const char *line = p;
+        const char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        const char *next;
+        while (len > 0 && isspace((unsigned char)*line)) { line++; len--; }
+        while (len > 0 && isspace((unsigned char)line[len - 1])) len--;
+        index++;
+        if ((len > 4 && strncmp(line, "min ", 4) == 0) ||
+            (len > 4 && strncmp(line, "max ", 4) == 0) ||
+            (len > 4 && strncmp(line, "sel ", 4) == 0)) {
+            cmp_single_use[index - 1] = 1;
+        } else if (len > 4 && strncmp(line, "cmp ", 4) == 0) {
+            int readers = 0;
+            next = end ? end + 1 : line + len;
+            while (*next) {
+                const char *nend = strchr(next, '\n');
+                size_t nlen = nend ? (size_t)(nend - next) : strlen(next);
+                const char *ntrim = next;
+                while (nlen > 0 && isspace((unsigned char)*ntrim)) { ntrim++; nlen--; }
+                while (nlen > 0 && isspace((unsigned char)ntrim[nlen - 1])) nlen--;
+                if (nlen == 0) { /* blank lines change nothing */ }
+                else if (ntrim[0] == ';') { /* nor do comments */ }
+                else if (ntrim[nlen - 1] == ':' ||
+                         (nlen > 4 && strncmp(ntrim, "cmp ", 4) == 0) ||
+                         (nlen > 5 && strncmp(ntrim, "func ", 5) == 0) ||
+                         (nlen == 7 && strncmp(ntrim, "endfunc", 7) == 0) ||
+                         (nlen > 4 && strncmp(ntrim, "asm ", 4) == 0)) {
+                    break;
+                } else if (line_is_conditional_branch_text(ntrim, nlen)) {
+                    readers++;
+                    if (readers > 1) break;
+                }
+                if (!nend) break;
+                next = nend + 1;
+            }
+            if (readers == 1) cmp_single_use[index - 1] = 1;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
 /* True when the source asks for a stack frame anywhere, which is the only
    thing that needs a frame pointer. */
 static bool source_uses_frame(const char *source) {
@@ -3542,11 +3626,17 @@ typedef struct {
     const char *rhs_snapshot;
     const char *move_op;
     const char *load_imm_op;
+    /* True when exactly one branch reads this comparison, so it can be
+       dropped once that branch is emitted rather than kept alive - and
+       snapshotted into registers whenever something writes an operand - for a
+       second branch that never comes. Last, so the tables below can keep
+       initialising the rest by position. */
+    bool single_use;
 } DeferredCompare;
 
 #define RV_SCRATCH "a6"
 
-static DeferredCompare rv_cmp = {CMP_NONE, {0}, {0}, false, "s10", "s11", "mv", "li"};
+static DeferredCompare rv_cmp = {CMP_NONE, {0}, {0}, false, "s10", "s11", "mv", "li", false};
 
 static bool rv_parse_long(const char *text, long long *value) {
     char *end = NULL;
@@ -3591,11 +3681,15 @@ static bool compare_reads(const DeferredCompare *cmp, const char *reg) {
     return cmp->rhs_is_reg && strcmp(cmp->rhs, reg) == 0;
 }
 
-static void compare_record(DeferredCompare *cmp, const char *lhs, const char *rhs, bool rhs_is_reg) {
+static bool compare_is_single_use(int line_no);
+
+static void compare_record(DeferredCompare *cmp, const char *lhs, const char *rhs, bool rhs_is_reg,
+                           int line_no) {
     snprintf(cmp->lhs, sizeof(cmp->lhs), "%s", lhs);
     snprintf(cmp->rhs, sizeof(cmp->rhs), "%s", rhs);
     cmp->rhs_is_reg = rhs_is_reg;
     cmp->state = CMP_PENDING;
+    cmp->single_use = compare_is_single_use(line_no);
 }
 
 /* A label starts a new basic block, so a comparison recorded before it no
@@ -3634,6 +3728,7 @@ static void compare_emit_branch(Buffer *text, DeferredCompare *cmp, const char *
         rhs = cmp->rhs_snapshot;
     }
     buf_appendf(text, "  %s %s, %s, %s\n", mnemonic, cmp->lhs, rhs, label);
+    if (cmp->single_use) cmp->state = CMP_NONE;
 }
 
 static void emit_rv_instruction(Buffer *text, const char *target, const char *op, const char *size,
@@ -3812,7 +3907,7 @@ static void emit_rv_instruction(Buffer *text, const char *target, const char *op
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         compare_record(&rv_cmp, rv_reg(args[0], line_no, op),
-                       src >= 0 ? rv_regs[src] : args[1], src >= 0);
+                       src >= 0 ? rv_regs[src] : args[1], src >= 0, line_no);
         return;
     }
     if (is_conditional_branch(op) && argc == 1) {
@@ -4117,7 +4212,7 @@ static const char *mips_regs[] = {
    per instruction from the target, because the helpers below are shared. */
 static const char *mips_li_op = "li";
 
-static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move", "li"};
+static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move", "li", false};
 
 static bool mips_is_64(const char *target) {
     return target_word_bits(target) == 64;
@@ -4350,7 +4445,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         compare_record(&mips_cmp, mips_reg(args[0], line_no, op),
-                       src >= 0 ? mips_regs[src] : args[1], src >= 0);
+                       src >= 0 ? mips_regs[src] : args[1], src >= 0, line_no);
         return;
     }
     if (is_conditional_branch(op) && argc == 1) {
@@ -4399,7 +4494,7 @@ static const char *ppc_regs[] = {
 
 /* PowerPC decides signedness at the comparison rather than at the branch, so
    the compare is held until the branch says which it wanted. */
-static DeferredCompare ppc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mr", "li"};
+static DeferredCompare ppc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mr", "li", false};
 
 static bool ppc_is_64(const char *target) {
     return target_word_bits(target) == 64;
@@ -4657,7 +4752,7 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         compare_record(&ppc_cmp, ppc_reg(args[0], line_no, op),
-                       src >= 0 ? ppc_regs[src] : args[1], src >= 0);
+                       src >= 0 ? ppc_regs[src] : args[1], src >= 0, line_no);
         return;
     }
     if (is_conditional_branch(op) && argc == 1) {
@@ -4730,7 +4825,7 @@ static const char *sparc_regs[] = {
 #define SPARC_SCRATCH "%g1"
 #define SPARC_SCRATCH2 "%g4"
 
-static DeferredCompare sparc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mov", "set"};
+static DeferredCompare sparc_cmp = {CMP_NONE, {0}, {0}, false, "", "", "mov", "set", false};
 
 static bool sparc_is_64(const char *target) {
     return target_word_bits(target) == 64;
@@ -4946,7 +5041,7 @@ static void emit_sparc_instruction(Buffer *text, const char *target, const char 
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
         compare_record(&sparc_cmp, sparc_reg(args[0], line_no, op),
-                       src >= 0 ? sparc_regs[src] : args[1], src >= 0);
+                       src >= 0 ? sparc_regs[src] : args[1], src >= 0, line_no);
         return;
     }
     if (is_conditional_branch(op) && argc == 1) {
@@ -5300,7 +5395,7 @@ static const char *s390_regs[] = {
 #define S390_SCRATCH2 "%r0"
 
 static unsigned s390_spill_used = 0;
-static DeferredCompare s390_cmp = {CMP_NONE, {0}, {0}, false, "", "", "lgr", "lgfi"};
+static DeferredCompare s390_cmp = {CMP_NONE, {0}, {0}, false, "", "", "lgr", "lgfi", false};
 
 static bool s390_reg_is_spilled(const char *value) {
     return virtual_reg_index(value) >= S390_MAPPED_COUNT;
@@ -5605,7 +5700,7 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
     }
     if (op_is(op, "cmp") && argc == 2) {
         int src = virtual_reg_index(args[1]);
-        compare_record(&s390_cmp, args[0], src >= 0 ? args[1] : args[1], src >= 0);
+        compare_record(&s390_cmp, args[0], args[1], src >= 0, line_no);
         return;
     }
     if (is_conditional_branch(op) && argc == 1) {
@@ -7446,6 +7541,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     /* Scanned before the loop starts chopping the source into lines. */
     mentioned_vregs = scan_mentioned_vregs(source);
     scan_functions_that_call(source);
+    scan_single_use_compares(source);
     if (source_uses_frame(source)) i386_mapped_count = 4;
     if (is_wasm_target(target)) wasm_begin();
     optimizer.enabled = opt_level > 0;

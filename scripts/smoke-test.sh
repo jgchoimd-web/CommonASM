@@ -106,6 +106,58 @@ for pair in "aarch64-gnu@str x30" "armv7a-gnu@push {lr}" "riscv64-gnu@sd ra, 0(s
 done
 echo "a nested call keeps its return address, and a leaf does not pay for it."
 
+# A machine with no condition flags keeps a comparison alive in the compiler
+# until a branch spells it out, and copies the operands aside if anything
+# writes them in the meantime. That copy is only worth making when a second
+# branch is still coming.
+cat > "$BUILD_DIR/onebranch.cas" <<'CAS'
+.text
+global _start
+_start:
+  mov r0, 5
+  mov r1, 5
+  cmp r0, r1
+  jl low
+  add r0, 1
+  syscall exit, 7
+low:
+  syscall exit, 1
+CAS
+cat > "$BUILD_DIR/twobranch.cas" <<'CAS'
+.text
+global _start
+_start:
+  mov r0, 5
+  mov r1, 5
+  cmp r0, r1
+  jl low
+  add r0, 1
+  jg high
+  syscall exit, 7
+low:
+  syscall exit, 1
+high:
+  syscall exit, 2
+CAS
+for cmp_pair in "riscv64-gnu@  mv s10," "mips32-gnu@  move \$t8,"; do
+  cmp_target=${cmp_pair%%@*}
+  cmp_snap=${cmp_pair#*@}
+  "$BUILD_DIR/commonasmc" "$BUILD_DIR/onebranch.cas" --target "$cmp_target" -O1 \
+    -o "$BUILD_DIR/onebranch-$cmp_target.s"
+  "$BUILD_DIR/commonasmc" "$BUILD_DIR/twobranch.cas" --target "$cmp_target" -O1 \
+    -o "$BUILD_DIR/twobranch-$cmp_target.s"
+  # one reader: nothing is copied aside
+  if grep -qF -- "$cmp_snap" "$BUILD_DIR/onebranch-$cmp_target.s"; then
+    echo "$cmp_target: kept a comparison alive that only one branch read"
+    exit 1
+  fi
+  # two readers, with a write in between: it has to be
+  grep -qF -- "$cmp_snap" "$BUILD_DIR/twobranch-$cmp_target.s"
+  # and both branches are still there
+  test "$(grep -cE "^  (blt|bgt) " "$BUILD_DIR/twobranch-$cmp_target.s")" = 2
+done
+echo "a comparison is kept alive only for a branch that is still coming."
+
 # i386 has ebp to allocate unless the program asks for a stack frame.
 printf '.text
 global _start
