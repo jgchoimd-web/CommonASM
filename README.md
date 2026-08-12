@@ -109,10 +109,13 @@ GitHub Actions runs both `scripts/smoke-test.sh` and `scripts/smoke-test.ps1`
 on every commit. They check four different things, in rising order of what
 they can prove:
 
-1. **It compiles.** Every example, test and demo is built for every target, at
-   both optimization levels and in both extended-operation modes — 3876
-   combinations. This catches a backend that refuses an instruction it should
-   accept.
+1. **It compiles.** Every example is built at both optimization levels and in
+   both extended-operation modes for every target the step it belongs to
+   covers, and the two newest test programs are built for *every* target
+   there is, at both levels — the run prints how many that came to. This
+   catches a backend that refuses an instruction it should accept, which is
+   not hypothetical: no example used an unsigned branch, so ten targets
+   rejected `jb` and nothing noticed until a test program used one.
 2. **A real assembler accepts it.** NASM takes the x86-64 and i386 output with
    `-w+error=number-overflow`, so a truncated immediate is an error rather
    than a warning; clang takes AArch64, ARMv7 and Thumb-2; the GNU assembler
