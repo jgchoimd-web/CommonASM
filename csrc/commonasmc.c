@@ -6689,8 +6689,10 @@ static const char hppa_divmod_routine[] =
     "  comb,<= %r0, %r26, __cas_hppa_pos2\n"
     "  nop\n"
     "  sub %r0, %r26, %r26\n"
-    "  xori 1, %r1, %r1\n"
-    "  ori 2, %r1, %r1\n"
+    "  ldi 1, %r20\n"
+    "  xor %r1, %r20, %r1\n"
+    "  ldi 2, %r20\n"
+    "  or %r1, %r20, %r1\n"
     "__cas_hppa_pos2:\n"
     "  copy %r0, %r24\n"                /* remainder */
     "  ldi 32, %r23\n"                  /* bits left */
@@ -6702,7 +6704,8 @@ static const char hppa_divmod_routine[] =
     "  comb,<<  %r24, %r25, __cas_hppa_skip\n"
     "  nop\n"
     "  sub %r24, %r25, %r24\n"
-    "  ori 1, %r26, %r26\n"
+    "  ldi 1, %r20\n"
+    "  or %r26, %r20, %r26\n"
     "__cas_hppa_skip:\n"
     "  addi -1, %r23, %r23\n"
     "  comb,<> %r0, %r23, __cas_hppa_loop\n"
