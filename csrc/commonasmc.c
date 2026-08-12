@@ -230,6 +230,7 @@ typedef enum {
     CLASS_NIOS2,
     CLASS_ALPHA,
     CLASS_HPPA,
+    CLASS_SH,
     CLASS_S390,
     CLASS_WASM,
     CLASS_ENCODING
@@ -341,7 +342,7 @@ static const TargetDesc target_table[] = {
     {"i8051", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"msp430", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"xtensa", CLASS_LEGACY, GROUP_LEGACY, 0},
-    {"superh", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"superh", CLASS_SH, GROUP_LEGACY, 0},
     {"rx", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"nios2", CLASS_NIOS2, GROUP_LEGACY, 0},
     {"microblaze", CLASS_LEGACY, GROUP_LEGACY, 0},
@@ -853,6 +854,10 @@ static bool is_ia64_target(const char *target) {
     return target_has_flag(target, TF_IA64);
 }
 
+static bool is_sh_target(const char *target) {
+    return target_has_class(target, CLASS_SH);
+}
+
 static bool is_hppa_target(const char *target) {
     return target_has_class(target, CLASS_HPPA);
 }
@@ -974,6 +979,7 @@ static int target_word_bits(const char *target) {
     if (desc->cls == CLASS_NIOS2) return 32;
     if (desc->cls == CLASS_ALPHA) return 64;
     if (desc->cls == CLASS_HPPA) return 32;
+    if (desc->cls == CLASS_SH) return 32;
     if (desc->cls == CLASS_S390) return 64;
     if (desc->cls == CLASS_RISCV) return (desc->flags & TF_RV32) ? 32 : 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
@@ -1080,7 +1086,7 @@ static const char *target_support_level(const char *target) {
    the class alone is not the answer. */
 static bool target_emits_assembly(const TargetDesc *desc) {
     switch (desc->cls) {
-        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2: case CLASS_ALPHA: case CLASS_HPPA:
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2: case CLASS_ALPHA: case CLASS_HPPA: case CLASS_SH:
         case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
         case CLASS_WASM:
             return true;
@@ -1108,6 +1114,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_NIOS2: return "GNU Nios II assembly";
         case CLASS_ALPHA: return "GNU Alpha assembly";
         case CLASS_HPPA: return "GNU PA-RISC assembly";
+        case CLASS_SH: return "GNU SuperH assembly";
         case CLASS_S390: return "GNU z/Architecture assembly";
         case CLASS_WASM: return "WebAssembly text";
         case CLASS_GENERIC:
@@ -1818,7 +1825,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_sh_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -7005,6 +7012,491 @@ static void emit_hppa_instruction(Buffer *text, const char *op, const char *size
     line_error(line_no, op, "unsupported instruction or wrong argument count for PA-RISC");
 }
 
+/* ---------------------------------------------------------------- SuperH */
+
+/* R15 is the stack, R14 the frame pointer for programs that ask for a frame,
+   and R0 is the register a great many of this machine's instructions insist
+   on, so it is one of the compiler's scratch pair rather than a virtual
+   register. Ten virtual registers get a machine register and six get spill
+   slots, which is generous by this backend's standards: R11 and R12 are the
+   pair a pending comparison is copied into and R0 and R13 are the scratch.
+
+   Two things shape everything below. Every branch has a delay slot, filled
+   with nop the way the SPARC and PA-RISC ones are. And an immediate wider
+   than a byte cannot be written into an instruction at all: it has to be put
+   in memory and loaded from there, PC-relative, forwards only. */
+static const char *sh_machine_regs[] = {
+    "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"
+};
+
+#define SH_MAPPED_COUNT ((int)(sizeof(sh_machine_regs) / sizeof(sh_machine_regs[0])))
+#define SH_SPILL_COUNT (16 - SH_MAPPED_COUNT)
+#define SH_SCRATCH "r0"
+#define SH_SCRATCH2 "r13"
+
+static unsigned sh_spill_used = 0;
+static bool sh_divmod_used = false;
+
+static DeferredCompare sh_cmp = {CMP_NONE, {0}, {0}, false, "r11", "r12", "mov", "mov", false};
+
+static void sh_delay_slot(Buffer *text) {
+    buf_append(text, "  nop\n");
+}
+
+static bool sh_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= SH_MAPPED_COUNT;
+}
+
+static int sh_spill_offset(const char *value) {
+    return (virtual_reg_index(value) - SH_MAPPED_COUNT) * 4;
+}
+
+/* mov takes eight bits with a sign on them and nothing wider. A named
+   constant is looked up rather than left to the assembler, because on this
+   machine the difference between fitting and not is a word of memory and
+   three extra instructions. */
+static bool sh_fits_imm8(const char *value, long long *out) {
+    char *end = NULL;
+    long long parsed;
+    if (is_known_constant(value)) {
+        if (!constant_value(value, &parsed)) return false;
+    } else {
+        if (!is_int(value)) return false;
+        errno = 0;
+        parsed = strtoll(value, &end, 0);
+        if (errno != 0 || !end || *end != '\0') return false;
+    }
+    if (parsed < -128 || parsed > 127) return false;
+    *out = parsed;
+    return true;
+}
+
+/* Anything wider than that, and every symbol's address, is put in a word of
+   its own and loaded from it. The load reaches forwards only, so the word
+   goes immediately after the instruction that reads it, with a branch over
+   it. Keeping a pool and dumping it later would be fewer instructions and a
+   great deal more to get wrong: the pool would have to stay inside the
+   thousand bytes the load can see. */
+static void sh_load_constant(Buffer *text, const char *reg, const char *value) {
+    int serial = ++ext_label_serial;
+    buf_appendf(text, "  mov.l __cas_ext_%d, %s\n", serial, reg);
+    buf_appendf(text, "  bra __cas_ext_%d\n", serial + 1);
+    sh_delay_slot(text);
+    buf_append(text, "  .align 2\n");
+    buf_appendf(text, "__cas_ext_%d:\n  .long %s\n", serial, value);
+    buf_appendf(text, "__cas_ext_%d:\n", serial + 1);
+    ext_label_serial++;
+}
+
+static const char *sh_value_reg(Buffer *text, const char *value, const char *scratch,
+                                int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    long long imm;
+    if (reg >= 0 && reg < SH_MAPPED_COUNT) return sh_machine_regs[reg];
+    if (reg >= 0) {
+        sh_spill_used |= 1u << (unsigned)(reg - SH_MAPPED_COUNT);
+        sh_load_constant(text, scratch, X86_SPILL_SYMBOL);
+        buf_appendf(text, "  mov.l @(%d,%s), %s\n", sh_spill_offset(value), scratch, scratch);
+        return scratch;
+    }
+    if (is_int(value) || is_known_constant(value)) {
+        if (sh_fits_imm8(value, &imm)) buf_appendf(text, "  mov #%lld, %s\n", imm, scratch);
+        else sh_load_constant(text, scratch, value);
+    } else if (is_symbol(value)) {
+        sh_load_constant(text, scratch, value);
+    } else {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    return scratch;
+}
+
+static const char *sh_dst_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    return reg < SH_MAPPED_COUNT ? sh_machine_regs[reg] : SH_SCRATCH;
+}
+
+static void sh_store_back(Buffer *text, const char *value, const char *from) {
+    const char *base = strcmp(from, SH_SCRATCH) == 0 ? SH_SCRATCH2 : SH_SCRATCH;
+    if (!sh_reg_is_spilled(value)) return;
+    sh_spill_used |= 1u << (unsigned)(virtual_reg_index(value) - SH_MAPPED_COUNT);
+    sh_load_constant(text, base, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  mov.l %s, @(%d,%s)\n", from, sh_spill_offset(value), base);
+}
+
+/* Every access goes through a register holding the whole address. The forms
+   that carry a displacement only reach sixty bytes and only from R0 for the
+   narrow ones, which is not worth the special cases. */
+static const char *sh_address_reg(Buffer *text, const char *addr_text, const char *scratch,
+                                  int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        const char *base = sh_value_reg(text, addr.base, scratch, line_no, op);
+        if (addr.offset == 0) return base;
+        if (strcmp(base, scratch) != 0) {
+            buf_appendf(text, "  mov %s, %s\n", base, scratch);
+        }
+    } else {
+        sh_load_constant(text, scratch, addr.symbol);
+        if (addr.offset == 0) return scratch;
+    }
+    {
+        long long imm;
+        char text_offset[32];
+        snprintf(text_offset, sizeof(text_offset), "%lld", addr.offset);
+        if (sh_fits_imm8(text_offset, &imm)) {
+            buf_appendf(text, "  add #%lld, %s\n", imm, scratch);
+        } else {
+            /* The offset needs a register of its own, and the only one left
+               is the other half of the scratch pair. */
+            const char *other = strcmp(scratch, SH_SCRATCH) == 0 ? SH_SCRATCH2 : SH_SCRATCH;
+            sh_load_constant(text, other, text_offset);
+            buf_appendf(text, "  add %s, %s\n", other, scratch);
+        }
+    }
+    return scratch;
+}
+
+static const char sh_divmod_routine[] =
+    "\n  .align 2\n"
+    "__commonasm_divmod:\n"
+    "  mov.l r8, @-r15\n"
+    "  mov.l r9, @-r15\n"
+    "  mov.l r10, @-r15\n"
+    "  mov #0, r10\n"                  /* sign bookkeeping */
+    "  mov #0, r6\n"                   /* quotient out */
+    "  mov #0, r7\n"                   /* remainder out */
+    "  tst r5, r5\n"
+    "  bt __cas_sh_done\n"
+    "  cmp/pz r5\n"
+    "  bt __cas_sh_pos1\n"
+    "  neg r5, r5\n"
+    "  mov #1, r10\n"
+    "__cas_sh_pos1:\n"
+    "  cmp/pz r4\n"
+    "  bt __cas_sh_pos2\n"
+    "  neg r4, r4\n"
+    "  mov #1, r0\n"
+    "  xor r0, r10\n"
+    "  mov #2, r0\n"
+    "  or r0, r10\n"
+    "__cas_sh_pos2:\n"
+    "  mov #0, r8\n"                   /* remainder */
+    "  mov #32, r9\n"                  /* bits left */
+    "__cas_sh_loop:\n"
+    "  mov r4, r0\n"
+    "  shlr16 r0\n"
+    "  shlr8 r0\n"
+    "  shlr8 r0\n"
+    "  add r8, r8\n"
+    "  or r0, r8\n"
+    "  add r4, r4\n"
+    "  cmp/hs r5, r8\n"
+    "  bf __cas_sh_skip\n"
+    "  sub r5, r8\n"
+    "  mov #1, r0\n"
+    "  or r0, r4\n"
+    "__cas_sh_skip:\n"
+    "  dt r9\n"
+    "  bf __cas_sh_loop\n"
+    "  mov r4, r6\n"
+    "  mov r8, r7\n"
+    "  mov r10, r0\n"
+    "  tst #1, r0\n"
+    "  bt __cas_sh_nq\n"
+    "  neg r6, r6\n"
+    "__cas_sh_nq:\n"
+    "  mov r10, r0\n"
+    "  tst #2, r0\n"
+    "  bt __cas_sh_done\n"
+    "  neg r7, r7\n"
+    "__cas_sh_done:\n"
+    "  mov.l @r15+, r10\n"
+    "  mov.l @r15+, r9\n"
+    "  mov.l @r15+, r8\n"
+    "  rts\n"
+    "  nop\n";
+
+static void emit_sh_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"r4", "r5", "r6", "r7", "r0", "r1"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    /* SuperH kept the numbers this family of ports started with, the same
+       ones i386 has. */
+    if (strcmp(args[0], "exit") == 0) number = 1;
+    else if (strcmp(args[0], "read") == 0) number = 3;
+    else if (strcmp(args[0], "write") == 0) number = 4;
+    else if (strcmp(args[0], "open") == 0) number = 5;
+    else if (strcmp(args[0], "close") == 0) number = 6;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* r1 to r10 carry virtual registers, and the first four arguments land on
+       four of them, so the ones in the way are saved across the call. */
+    for (int i = 0; i < count && i < 4; i++) buf_appendf(text, "  mov.l %s, @-r15\n", arg_regs[i]);
+    for (int i = count - 1; i >= 0; i--) {
+        const char *value = sh_value_reg(text, args[i + 1], SH_SCRATCH2, line_no, "syscall");
+        buf_appendf(text, "  mov %s, %s\n", value, arg_regs[i]);
+    }
+    buf_appendf(text, "  mov #%d, r3\n", number);
+    buf_append(text, "  trapa #0x10\n");
+    if (result) {
+        /* The answer arrives in r0, before the saved registers come back. */
+        buf_appendf(text, "  mov r0, %s\n", SH_SCRATCH2);
+    }
+    for (int i = (count < 4 ? count : 4) - 1; i >= 0; i--) {
+        buf_appendf(text, "  mov.l @r15+, %s\n", arg_regs[i]);
+    }
+    if (result) {
+        const char *dst = sh_dst_reg(result, line_no, "syscall");
+        buf_appendf(text, "  mov %s, %s\n", SH_SCRATCH2, dst);
+        sh_store_back(text, result, dst);
+    }
+}
+
+/* The comparison sets the T bit and the branch reads it. Both are emitted at
+   the branch, so nothing in between can disturb T. The branch that reads T
+   only reaches two hundred and fifty bytes, so it jumps over an unconditional
+   one rather than to the target itself. */
+static void sh_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
+    const char *lhs;
+    const char *rhs;
+    const char *compare;
+    bool swap = false;
+    bool branch_if_set = true;
+    int over = ++ext_label_serial;
+    if (sh_cmp.state == CMP_NONE) {
+        line_error(line_no, op, "conditional jump with no preceding cmp");
+    }
+    lhs = sh_cmp.lhs;
+    rhs = sh_cmp.rhs;
+    if (!sh_cmp.rhs_is_reg) {
+        long long imm;
+        if (sh_fits_imm8(sh_cmp.rhs, &imm)) buf_appendf(text, "  mov #%lld, %s\n", imm, SH_SCRATCH2);
+        else sh_load_constant(text, SH_SCRATCH2, sh_cmp.rhs);
+        rhs = SH_SCRATCH2;
+    }
+    /* cmp/gt and cmp/hi ask whether the second operand is above the first,
+       so half of these are the same comparison with the operands the other
+       way round, and half are the answer read the other way. */
+    if (op_is(op, "je")) compare = "cmp/eq";
+    else if (op_is(op, "jne")) { compare = "cmp/eq"; branch_if_set = false; }
+    else if (op_is(op, "jl")) compare = "cmp/gt";
+    else if (op_is(op, "jge")) { compare = "cmp/gt"; branch_if_set = false; }
+    else if (op_is(op, "jg")) { compare = "cmp/gt"; swap = true; }
+    else if (op_is(op, "jle")) { compare = "cmp/gt"; swap = true; branch_if_set = false; }
+    else if (op_is(op, "jb")) compare = "cmp/hi";
+    else if (op_is(op, "jae")) { compare = "cmp/hi"; branch_if_set = false; }
+    else if (op_is(op, "ja")) { compare = "cmp/hi"; swap = true; }
+    else { compare = "cmp/hi"; swap = true; branch_if_set = false; }
+    buf_appendf(text, "  %s %s, %s\n", compare, swap ? rhs : lhs, swap ? lhs : rhs);
+    buf_appendf(text, "  %s __cas_ext_%d\n", branch_if_set ? "bf" : "bt", over);
+    buf_appendf(text, "  bra %s\n", label);
+    sh_delay_slot(text);
+    buf_appendf(text, "__cas_ext_%d:\n", over);
+    if (sh_cmp.single_use) sh_cmp.state = CMP_NONE;
+}
+
+static void emit_sh_instruction(Buffer *text, const char *op, const char *size,
+                                char **args, int argc, int line_no) {
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* bsr leaves the return address in the procedure register, which is
+           not a general one: it is read and written with its own
+           instructions. A function that calls stacks it. */
+        if (func_needs_link_save(args[0])) buf_append(text, "  sts.l pr, @-r15\n");
+        return;
+    }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_append(text, "  sts.l pr, @-r15\n  mov.l r14, @-r15\n  mov r15, r14\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (sh_fits_imm8(args[0], &frame)) buf_appendf(text, "  add #%lld, r15\n", -frame);
+        else {
+            sh_load_constant(text, SH_SCRATCH, args[0]);
+            buf_append(text, "  sub r0, r15\n");
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  mov r14, r15\n  mov.l @r15+, r14\n  lds.l @r15+, pr\n");
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *value = sh_value_reg(text, args[1], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  mov %s, %s\n", value, dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        sh_load_constant(text, dst, args[1]);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *base = sh_address_reg(text, args[1], SH_SCRATCH2, line_no, op);
+        /* The narrow loads spread the sign for themselves here. */
+        const char *mnemonic = size[0] == 'b' ? "mov.b" : size[0] == 'w' ? "mov.w" : "mov.l";
+        buf_appendf(text, "  %s @%s, %s\n", mnemonic, base, dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        const char *mnemonic = size[0] == 'b' ? "mov.b" : size[0] == 'w' ? "mov.w" : "mov.l";
+        const char *base = sh_address_reg(text, args[0], SH_SCRATCH2, line_no, op);
+        const char *value = sh_value_reg(text, args[1], SH_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, @%s\n", mnemonic, value, base);
+        return;
+    }
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        /* There is a step instruction to build a division out of and no
+           division, so this calls the routine at the end of the file. It
+           takes r4 and r5 and answers in r6 and r7. */
+        const char *lhs;
+        const char *dst;
+        sh_divmod_used = true;
+        buf_append(text, "  mov.l r4, @-r15\n  mov.l r5, @-r15\n");
+        buf_append(text, "  mov.l r6, @-r15\n  mov.l r7, @-r15\n");
+        lhs = sh_value_reg(text, args[0], SH_SCRATCH, line_no, op);
+        buf_appendf(text, "  mov %s, %s\n", lhs, SH_SCRATCH2);
+        {
+            const char *rhs = sh_value_reg(text, args[1], SH_SCRATCH, line_no, op);
+            buf_appendf(text, "  mov %s, r5\n", rhs);
+        }
+        buf_appendf(text, "  mov %s, r4\n", SH_SCRATCH2);
+        buf_append(text, "  sts.l pr, @-r15\n");
+        buf_append(text, "  bsr __commonasm_divmod\n");
+        sh_delay_slot(text);
+        buf_append(text, "  lds.l @r15+, pr\n");
+        buf_appendf(text, "  mov %s, %s\n", op_is(op, "div") ? "r6" : "r7", SH_SCRATCH2);
+        buf_append(text, "  mov.l @r15+, r7\n  mov.l @r15+, r6\n");
+        buf_append(text, "  mov.l @r15+, r5\n  mov.l @r15+, r4\n");
+        dst = sh_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  mov %s, %s\n", SH_SCRATCH2, dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "mul") && argc == 2) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *lhs = sh_value_reg(text, args[0], dst, line_no, op);
+        const char *rhs;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", lhs, dst);
+        rhs = sh_value_reg(text, args[1], SH_SCRATCH2, line_no, op);
+        buf_appendf(text, "  mul.l %s, %s\n", rhs, dst);
+        buf_appendf(text, "  sts macl, %s\n", dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") || op_is(op, "or") ||
+         op_is(op, "xor")) && argc == 2) {
+        const char *native = op_is(op, "add") ? "add" : op_is(op, "sub") ? "sub" :
+                             op_is(op, "and") ? "and" : op_is(op, "or") ? "or" : "xor";
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *lhs = sh_value_reg(text, args[0], dst, line_no, op);
+        long long imm;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", lhs, dst);
+        if (op_is(op, "add") && sh_fits_imm8(args[1], &imm)) {
+            buf_appendf(text, "  add #%lld, %s\n", imm, dst);
+        } else if (op_is(op, "sub") && sh_fits_imm8(args[1], &imm) && imm != -128) {
+            buf_appendf(text, "  add #%lld, %s\n", -imm, dst);
+        } else {
+            const char *rhs = sh_value_reg(text, args[1], SH_SCRATCH2, line_no, op);
+            buf_appendf(text, "  %s %s, %s\n", native, rhs, dst);
+        }
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        /* The shifting instructions that take a distance take it in a
+           register, and a negative one means the other way. */
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *lhs = sh_value_reg(text, args[0], dst, line_no, op);
+        long long imm;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  mov %s, %s\n", lhs, dst);
+        if (is_int(args[1]) && sh_fits_imm8(args[1], &imm) && imm >= 0 && imm < 32) {
+            buf_appendf(text, "  mov #%lld, %s\n", op_is(op, "shl") ? imm : -imm, SH_SCRATCH2);
+        } else {
+            const char *amount = sh_value_reg(text, args[1], SH_SCRATCH2, line_no, op);
+            if (strcmp(amount, SH_SCRATCH2) != 0) buf_appendf(text, "  mov %s, %s\n", amount, SH_SCRATCH2);
+            if (!op_is(op, "shl")) buf_appendf(text, "  neg %s, %s\n", SH_SCRATCH2, SH_SCRATCH2);
+        }
+        buf_appendf(text, "  %s %s, %s\n", op_is(op, "sar") ? "shad" : "shld", SH_SCRATCH2, dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *value = sh_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  mov %s, %s\n", value, dst);
+        if (op_is(op, "neg")) buf_appendf(text, "  neg %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  not %s, %s\n", dst, dst);
+        else buf_appendf(text, "  add #%s, %s\n", op_is(op, "inc") ? "1" : "-1", dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "bswap") && argc == 1) {
+        /* Two swaps and a rotate of the halves is the whole reversal. */
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        const char *value = sh_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  mov %s, %s\n", value, dst);
+        buf_appendf(text, "  swap.b %s, %s\n", dst, dst);
+        buf_appendf(text, "  swap.w %s, %s\n", dst, dst);
+        buf_appendf(text, "  swap.b %s, %s\n", dst, dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        const char *lhs = sh_value_reg(text, args[0], sh_cmp.lhs_snapshot, line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *rhs = src >= 0 ? sh_value_reg(text, args[1], sh_cmp.rhs_snapshot, line_no, op)
+                                   : args[1];
+        compare_record(&sh_cmp, lhs, rhs, src >= 0, line_no);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        sh_emit_branch(text, op, args[0], line_no);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = sh_value_reg(text, args[0], SH_SCRATCH2, line_no, op);
+        buf_appendf(text, "  mov.l %s, @-r15\n", value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        const char *dst = sh_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  mov.l @r15+, %s\n", dst);
+        sh_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) {
+        buf_appendf(text, "  bra %s\n", args[0]);
+        sh_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "call") && argc == 1) {
+        buf_appendf(text, "  bsr %s\n", args[0]);
+        sh_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) buf_append(text, "  lds.l @r15+, pr\n");
+        buf_append(text, "  rts\n");
+        sh_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "syscall")) { emit_sh_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for SuperH");
+}
+
 /* ------------------------------------------------------------------ m68k */
 
 /* Only the data registers can do arithmetic and logic, and d0 and d1 are the
@@ -9069,7 +9561,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_sh_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -9080,7 +9572,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_sh_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -9130,6 +9622,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (is_nios2_target(target)) emit_nios2_instruction(text, base_op, size, args, argc, line_no);
     else if (is_alpha_target(target)) emit_alpha_instruction(text, base_op, size, args, argc, line_no);
     else if (is_hppa_target(target)) emit_hppa_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_sh_target(target)) emit_sh_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
@@ -9514,7 +10007,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_sh_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -9716,6 +10209,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         buf_append(&bss, ".balign 8\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, S390_SPILL_COUNT * 8);
     }
+    if (is_sh_target(target) && sh_spill_used) {
+        buf_append(&bss, ".balign 4\n");
+        buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, SH_SPILL_COUNT * 4);
+    }
     if (is_alpha_target(target) && alpha_spill_used) {
         buf_append(&bss, ".balign 8\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, ALPHA_SPILL_COUNT * 8);
@@ -9796,6 +10293,9 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
                unless it is told. Every machine anyone still runs has both,
                and the emulator this is checked on is an EV67. */
             if (is_alpha_target(target)) buf_append(&out, ".arch ev67\n");
+            /* shad, shld and mul.l are SH-2 and later, and this is the
+               member the emulator here implements. */
+            if (is_sh_target(target)) buf_append(&out, ".little\n");
             if (is_nios2_target(target) && nios2_noat_used) buf_append(&out, ".set noat\n");
             if (is_mips_target(target) && mips_llsc_used) {
                 buf_append(&out, target_word_bits(target) == 64 ? ".set mips3\n"
@@ -9813,6 +10313,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (is_arm32_target(target) && arm_divmod_used) buf_append(&out, arm_divmod_routine);
     if (is_alpha_target(target) && alpha_divmod_used) buf_append(&out, alpha_divmod_routine);
     if (is_hppa_target(target) && hppa_divmod_used) buf_append(&out, hppa_divmod_routine);
+    if (is_sh_target(target) && sh_divmod_used) buf_append(&out, sh_divmod_routine);
     return out;
 }
 
