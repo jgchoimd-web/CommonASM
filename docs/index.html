@@ -24,6 +24,7 @@
       <nav aria-label="Main navigation">
         <a href="#targets">Targets</a>
         <a href="#syntax">Syntax</a>
+        <a href="#fast-paths">Fast paths</a>
         <a href="#build">Build</a>
         <a href="https://ygsmsite.neocities.org/CommonASM">Neocities</a>
       </nav>
@@ -54,12 +55,12 @@
 
       <section class="summary-band" aria-label="Project summary">
         <div>
-          <strong>Primary backends</strong>
-          <span>x86_64 NASM and RISC-V GNU assembly.</span>
+          <strong>Ten machines run the same program</strong>
+          <span>Built, linked and executed under emulation on every commit.</span>
         </div>
         <div>
-          <strong>Experimental backends</strong>
-          <span>MIPS, PowerPC, SPARC, m68k, eBPF, Wasm, LLVM IR, and more.</span>
+          <strong>Eleven assemblers check the output</strong>
+          <span>NASM, wat2wasm, clang, and the GNU assembler for six more CPUs.</span>
         </div>
         <div>
           <strong>Toy and encoding backends</strong>
@@ -70,37 +71,50 @@
       <section class="section" id="targets">
         <div class="section-heading">
           <p class="eyebrow">Target strategy</p>
-          <h2>Three support levels keep the promise honest.</h2>
+          <h2>What a target claims is what CI checks.</h2>
+          <p>
+            A backend is only worth as much as the evidence behind it, so the
+            three levels below are levels of evidence, not of ambition. Run
+            <code>--target-info TARGET</code> to see which one a target is in.
+          </p>
         </div>
         <div class="target-grid">
           <article class="target-card primary-card">
-            <h3>Primary</h3>
+            <h3>Executed</h3>
             <p>
-              These targets are the reference outputs for the portable IR design.
-              They are the first place to verify new CommonASM instructions.
+              One program that uses arithmetic, control flow, memory, the stack
+              and syscalls is built for each of these, linked, run under
+              qemu-user, and required to print the same thing as all the others.
+              An answer that is merely well-formed does not pass.
             </p>
             <ul>
-              <li><code>x86_64-nasm</code></li>
-              <li><code>riscv64-gnu</code></li>
+              <li><code>x86_64-nasm</code>, <code>i386-nasm</code></li>
+              <li><code>aarch64-gnu</code>, <code>armv7a-gnu</code></li>
+              <li><code>riscv64-gnu</code>, <code>mips32-gnu</code>, <code>ppcg4-gnu</code></li>
+              <li><code>sparcv8-gnu</code>, <code>m68k</code>, <code>zarch</code></li>
             </ul>
           </article>
           <article class="target-card">
-            <h3>Experimental assembly and IR</h3>
+            <h3>Assembled</h3>
             <p>
-              These outputs use real assembly or familiar IR style where possible,
-              while staying inside the CommonASM portable subset.
+              Real assembly for a real assembler, which accepts every example on
+              every commit. These share the emitters above, so what separates
+              them is that nothing here can emulate them yet.
             </p>
             <ul>
-              <li><code>i386-nasm</code>, <code>aarch64-gnu</code>, <code>rv32i-gnu</code></li>
-              <li><code>mips32-gnu</code>, <code>ppcg4-gnu</code>, <code>sparcv9-gnu</code></li>
-              <li><code>m68k</code>, <code>avr</code>, <code>ebpf</code>, <code>wasm</code>, <code>llvm-ir</code></li>
+              <li><code>wasm</code> through wat2wasm, <code>thumb2-gnu</code>, <code>thumb-gnu</code></li>
+              <li><code>armv4-gnu</code>, <code>armv5-gnu</code>, <code>rv64i-gnu</code>, <code>riscv64-zbb</code></li>
+              <li><code>mips64-gnu</code>, <code>power1-gnu</code> through <code>power10-gnu</code></li>
+              <li><code>sparcv9-gnu</code>, and the rest of the SPARC and PowerPC families</li>
             </ul>
           </article>
           <article class="target-card">
-            <h3>Encoding and pseudo targets</h3>
+            <h3>Pseudo assembly</h3>
             <p>
               Machines with very different memory models, tiny register sets, or
-              esoteric semantics use readable pseudo assembly or source encodings.
+              esoteric semantics get readable pseudo assembly or a source
+              encoding. These are for reading and for porting from, not for
+              running.
             </p>
             <ul>
               <li><code>chip8</code>, <code>subleq</code>, <code>redcode</code></li>
@@ -134,6 +148,77 @@ global _start
 _start:
   syscall write, stdout, msg, msg_len
   syscall exit, 0</code></pre>
+        </div>
+      </section>
+
+      <section class="section" id="fast-paths">
+        <div class="section-heading">
+          <p class="eyebrow">Using what a machine actually has</p>
+          <h2>A portable language that still reaches the fast instruction.</h2>
+          <p>
+            A common subset that only ever emits what every machine can do is a
+            middle-level language wearing assembly's clothes. These three let a
+            program use the instruction its CPU really has, and still build for
+            one that has never heard of it.
+          </p>
+        </div>
+        <div class="target-grid">
+          <article class="target-card">
+            <h3>Extended operations</h3>
+            <p>
+              <code>popcnt</code>, <code>clz</code>, <code>ctz</code>,
+              <code>bswap</code>, <code>rol</code> and <code>ror</code> are one
+              instruction where the machine has one. Where it does not, each
+              expands into ordinary CommonASM that goes through the same
+              lowering as hand-written code, so the program still builds and
+              still gives the same answer.
+            </p>
+            <pre><code>popcnt r0     ; cpop on riscv64-zbb
+              ; a SWAR fold on riscv64-gnu</code></pre>
+            <p>
+              <code>--target-info TARGET</code> lists which are native there;
+              <code>--emulate-extended</code> expands them anyway, which is how
+              the two paths are tested against each other.
+            </p>
+          </article>
+          <article class="target-card">
+            <h3>Inline assembly</h3>
+            <p>
+              An <code>asm</code> block is not compiled. It goes into the output
+              as written, so a program can reach anything its machine has.
+              Consecutive blocks are alternatives for one spot: the first
+              selector that matches wins, and a <code>portable</code> arm keeps
+              the fast path optional. <code>{r0}</code> becomes whatever
+              register the backend put <code>r0</code> in.
+            </p>
+            <pre><code>asm x86_64 {
+  lea {r0}, [{r0} + {r0} * 2]
+}
+asm portable {
+  mov r1, 3
+  mul r0, r1
+}</code></pre>
+            <p>
+              A spot where nothing matches is an error rather than a silently
+              missing instruction.
+            </p>
+          </article>
+          <article class="target-card">
+            <h3>Assembly to assembly</h3>
+            <p>
+              The lowering runs backwards too. <code>--from FAMILY</code> reads a
+              whole assembly file back into CommonASM, which can then be
+              compiled for a different machine, and <code>--translate-asm</code>
+              does the same for an <code>asm</code> block whose selector did not
+              match, instead of failing for want of an arm.
+            </p>
+            <pre><code>commonasmc old.s --from aarch64 \
+  --target x86_64-nasm -o new.asm</code></pre>
+            <p>
+              Every family's assembly is required to read back into the
+              CommonASM it was generated from, on every commit.
+            </p>
+          </article>
         </div>
       </section>
 

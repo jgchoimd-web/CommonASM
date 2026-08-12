@@ -239,6 +239,7 @@ h1 {
 .terminal-art pre,
 .code-panel pre,
 .diagnostic-output pre,
+.target-card pre,
 .steps pre {
   margin: 0;
   overflow-x: auto;
@@ -246,6 +247,22 @@ h1 {
   color: #e6edf3;
   font-size: clamp(0.82rem, 1.5vw, 1rem);
   line-height: 1.7;
+}
+
+/* A card is a third of the row, so its samples are the ones most likely to
+   need scrolling rather than wrapping. */
+.target-card pre {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+
+.target-card pre code {
+  padding: 0;
+  background: none;
+  color: inherit;
 }
 
 .terminal-art pre {

@@ -79,20 +79,46 @@ machine model does not match Linux syscalls or random-access memory.
 
 ## Compiler implementations
 
-- `csrc/commonasmc.c`: C AOT compiler
-- `selfhost/compiler.cal`: self-hosting compiler source sketch
+`csrc/commonasmc.c` is the compiler, and the only one. It prints ANSI-colored
+diagnostics with the source line, column, and highlighted token when
+compilation fails.
 
-The C compiler prints ANSI-colored diagnostics with the source line, column, and
-highlighted token when compilation fails.
+`selfhost/compiler.cal` is a design sketch for a self-hosting compiler. The
+language it is written in has no implementation, nothing builds or checks the
+file, and its target list predates most of the backends — see
+[`selfhost/README.md`](selfhost/README.md). Do not read it as a second
+implementation.
 
 ## CI
 
-GitHub Actions runs both `scripts/smoke-test.sh` and
-`scripts/smoke-test.ps1`. The smoke tests build `csrc/commonasmc.c`, check CLI
-helpers, compile every example for the primary targets, compile representative
-experimental targets, check stdin/stdout piping, and verify that diagnostics
-highlight invalid source tokens. They also check that `-O1` removes simple
-no-op instructions and folds adjacent constant arithmetic.
+GitHub Actions runs both `scripts/smoke-test.sh` and `scripts/smoke-test.ps1`
+on every commit. They check four different things, in rising order of what
+they can prove:
+
+1. **It compiles.** Every example, test and demo is built for every target, at
+   both optimization levels and in both extended-operation modes — 3876
+   combinations. This catches a backend that refuses an instruction it should
+   accept.
+2. **A real assembler accepts it.** NASM takes the x86-64 and i386 output with
+   `-w+error=number-overflow`, so a truncated immediate is an error rather
+   than a warning; clang takes AArch64, ARMv7 and Thumb-2; the GNU assembler
+   takes RISC-V, MIPS, PowerPC, SPARC, m68k and z/Architecture; and wat2wasm
+   validates the wasm module.
+3. **It runs and gets the right answer.** `tests/exec-kernel.cas` uses
+   arithmetic, all three shifts, the extended operations, a loop with a
+   comparison, byte memory access, a call with a stack, and syscalls, then
+   prints thirteen numbers. It is built for x86-64, i386, AArch64, ARMv7,
+   RISC-V, MIPS, PowerPC, SPARC, m68k and z/Architecture, linked, run under
+   `qemu-user`, and all ten have to print the same line. Assembling only says
+   the text was well-formed; this is what catches a backend that assembles
+   perfectly and computes the wrong number. Every backend bug found since it
+   was added had passed step 2.
+4. **It reads back.** Each family's assembly is lifted into CommonASM and
+   required to match the source it came from, and the extended operations are
+   run against a C reference both natively and expanded.
+
+Tests that are supposed to fail are checked to actually fail, so a test that
+has stopped testing anything is caught too.
 
 Local shortcuts:
 

@@ -1,24 +1,23 @@
-# Self-Hosting Plan
+# selfhost/
 
-The self-hosting compiler will be written in the language it compiles.
+`compiler.cal` is a design sketch, not a program. Read it as a proposal for
+what a self-hosting CommonASM compiler could look like, and nothing more.
 
-Bootstrapping stages:
+Specifically:
 
-1. C compiler: dependency-free AOT compiler.
-2. Self-host compiler source: `compiler.cal`.
-3. Bootstrap: C compiler compiles the self-host compiler runtime pieces.
-4. Self-host: the generated compiler compiles future versions of itself.
+- **The language it is written in does not exist.** There is no compiler or
+  interpreter for `.cal`, here or anywhere. `module`, `type Target = ...` and
+  the rest are invented notation for the sketch's own use.
+- **Nothing builds or checks it.** It is not in the Makefile and CI never
+  opens it, so it cannot be known to be correct, or even consistent.
+- **It has drifted.** Its target list stops at the ones that existed when it
+  was written, so it knows nothing about the MIPS, PowerPC, SPARC, m68k,
+  z/Architecture or wasm backends, and nothing about extended operations,
+  inline assembly, or reading assembly back into CommonASM.
 
-Current status: `compiler.cal` is a concrete source sketch for the self-hosted compiler.
-The CommonASM language now has constants, byte arrays, automatic string length symbols,
-arithmetic, stack operations, memory load/store, and compare/branch operations.
-It also sketches portable data sizes, `.rodata`/`.bss`, functions, bit operations,
-and Linux syscall names shared by the C compiler.
-The CLI sketch recognizes `-O1`/`--optimize` and includes the peephole optimizer
-pass location so the self-hosted compiler can mirror `commonasmc.c`.
-Experimental minority targets include MMIXAL, DCPU-16, FRACTRAN source encoding,
-and Cellular Automaton Rule 110 seed output.
-Experimental common architecture targets include IA-32, ARMv4/v5/v7-A, AArch64,
-Thumb/Thumb-2, RV32I/RV128I, Itanium, and LoongArch64.
-The sketch also recognizes the expanded legacy, retro, MCU, mainframe, GPU/DSP,
-VM/IR, and educational/esoteric target names used by the C compiler.
+The compiler that works is [`csrc/commonasmc.c`](../csrc/commonasmc.c). It is
+the only implementation, and every claim the project makes is about that one.
+
+Turning this sketch into something real would mean writing a `.cal` front end
+first, which no one has started. Until then the useful part of the file is the
+shape of the idea, not the contents.
