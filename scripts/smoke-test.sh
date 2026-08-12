@@ -293,9 +293,37 @@ if grep -qE "^  (mov|add|sub|xor|and|or|imul|neg|not|inc|dec|shl|shr|sar) (rsp|r
   echo "a virtual register was lowered onto rsp or rbp"
   exit 1
 fi
-# Virtual registers past the machine register file need backing store.
-grep -q "__cas_spill: resq" "$BUILD_DIR/regress-x86.asm"
-grep -q "mov qword \[rel __cas_spill+8\], 111" "$BUILD_DIR/regress-x86.asm"
+# Registers past the machine register file need backing store. This program
+# names eight, which x86-64 has room for now that the slots go by use rather
+# than by number, so the machine to ask is the one with five.
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/regress.cas" --target i386-nasm -o "$BUILD_DIR/regress-i386.asm"
+grep -q "__cas_spill: resd" "$BUILD_DIR/regress-i386.asm"
+grep -q "__cas_spill" "$BUILD_DIR/regress-i386.asm"
+# and a program that names more than any machine has still spills everywhere
+printf '.text
+global _start
+_start:
+  mov r0, 0
+  mov r1, 1
+  mov r2, 2
+  mov r3, 3
+  mov r4, 4
+  mov r5, 5
+  mov r6, 6
+  mov r7, 7
+  mov r8, 8
+  mov r9, 9
+  mov r10, 10
+  mov r11, 11
+  mov r12, 12
+  mov r13, 13
+  mov r14, 14
+  mov r15, 111
+  syscall exit, 0
+' > "$BUILD_DIR/allsixteen.cas"
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/allsixteen.cas" --target x86_64-nasm -o "$BUILD_DIR/allsixteen.asm"
+grep -q "__cas_spill: resq" "$BUILD_DIR/allsixteen.asm"
+grep -q "mov qword \[rel __cas_spill+24\], 111" "$BUILD_DIR/allsixteen.asm"
 # A variable shift count has to reach cl; "shl reg, reg" does not assemble.
 grep -q "shl rax, cl" "$BUILD_DIR/regress-x86.asm"
 # idiv overwrites rdx, which carries a virtual register.
