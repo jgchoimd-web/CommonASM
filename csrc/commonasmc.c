@@ -228,6 +228,7 @@ typedef enum {
     CLASS_M68K,
     CLASS_LOONG,
     CLASS_NIOS2,
+    CLASS_ALPHA,
     CLASS_S390,
     CLASS_WASM,
     CLASS_ENCODING
@@ -330,7 +331,7 @@ static const TargetDesc target_table[] = {
     {"power10-gnu", CLASS_PPC, GROUP_LEGACY, TF_64BIT},
     {"sparcv8-gnu", CLASS_SPARC, GROUP_LEGACY, 0},
     {"sparcv9-gnu", CLASS_SPARC, GROUP_LEGACY, TF_64BIT},
-    {"alpha-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"alpha-gnu", CLASS_ALPHA, GROUP_LEGACY, 0},
     {"parisc-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"m88k-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"m68k", CLASS_M68K, GROUP_LEGACY, 0},
@@ -851,6 +852,10 @@ static bool is_ia64_target(const char *target) {
     return target_has_flag(target, TF_IA64);
 }
 
+static bool is_alpha_target(const char *target) {
+    return target_has_class(target, CLASS_ALPHA);
+}
+
 static bool is_nios2_target(const char *target) {
     return target_has_class(target, CLASS_NIOS2);
 }
@@ -933,6 +938,11 @@ static unsigned target_caps(const char *target) {
            and conditional store on MIPS and PowerPC, laag and csg on
            z/Architecture, cas.l on m68k. They have nothing else on this list,
            which is why they only appear here now. */
+        case CLASS_ALPHA:
+            /* ctpop, ctlz and cttz came with EV67, which the output asks for.
+               There is no byte swap and no atomic read-modify-write among
+               what this backend emits. */
+            return CAP_POPCNT | CAP_CLZ | CAP_CTZ;
         case CLASS_MIPS:
             return (desc->flags & TF_LLSC) ? CAP_ATOMIC : 0;
         case CLASS_PPC:
@@ -957,6 +967,7 @@ static int target_word_bits(const char *target) {
     if (desc->cls == CLASS_M68K) return 32;
     if (desc->cls == CLASS_LOONG) return 64;
     if (desc->cls == CLASS_NIOS2) return 32;
+    if (desc->cls == CLASS_ALPHA) return 64;
     if (desc->cls == CLASS_S390) return 64;
     if (desc->cls == CLASS_RISCV) return (desc->flags & TF_RV32) ? 32 : 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
@@ -1063,7 +1074,7 @@ static const char *target_support_level(const char *target) {
    the class alone is not the answer. */
 static bool target_emits_assembly(const TargetDesc *desc) {
     switch (desc->cls) {
-        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2:
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2: case CLASS_ALPHA:
         case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
         case CLASS_WASM:
             return true;
@@ -1089,6 +1100,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_M68K: return "GNU m68k assembly";
         case CLASS_LOONG: return "GNU LoongArch assembly";
         case CLASS_NIOS2: return "GNU Nios II assembly";
+        case CLASS_ALPHA: return "GNU Alpha assembly";
         case CLASS_S390: return "GNU z/Architecture assembly";
         case CLASS_WASM: return "WebAssembly text";
         case CLASS_GENERIC:
@@ -1799,7 +1811,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -6146,6 +6158,417 @@ static void emit_nios2_instruction(Buffer *text, const char *op, const char *siz
     line_error(line_no, op, "unsupported instruction or wrong argument count for Nios II");
 }
 
+/* ------------------------------------------------------------------ Alpha */
+
+/* $0 carries a system call's number and its answer, $16 to $21 its arguments,
+   $26 the return address, $27 the address of the function being entered, $28
+   is the assembler's own temporary, $29 the global pointer, $30 the stack and
+   $31 reads as zero. That leaves $1 to $15 and $22 to $25. Fourteen of them
+   hold virtual registers, $15 is kept as the frame pointer for the programs
+   that ask for a frame, and the four above are the compiler's scratch pair
+   and the pair a pending comparison is copied into. Virtual r14 and r15 get
+   spill slots.
+
+   This machine has no instruction that compares and branches. It compares
+   into a register and branches on that being zero or not, so the comparison
+   is held until the branch the way it is on the machines with no flags, and
+   the branch emits both halves. */
+static const char *alpha_machine_regs[] = {
+    "$1", "$2", "$3", "$4", "$5", "$6", "$7",
+    "$8", "$9", "$10", "$11", "$12", "$13", "$14"
+};
+
+#define ALPHA_MAPPED_COUNT ((int)(sizeof(alpha_machine_regs) / sizeof(alpha_machine_regs[0])))
+#define ALPHA_SPILL_COUNT (16 - ALPHA_MAPPED_COUNT)
+#define ALPHA_SCRATCH "$22"
+#define ALPHA_SCRATCH2 "$23"
+/* Where a comparison's answer lands on the way into the branch that reads it. */
+#define ALPHA_CMP_RESULT "$25"
+
+static unsigned alpha_spill_used = 0;
+/* Set when something divided, so the divide routine is written out. */
+static bool alpha_divmod_used = false;
+
+static DeferredCompare alpha_cmp = {CMP_NONE, {0}, {0}, false, "$24", "$25", "mov", "ldiq", false};
+
+static bool alpha_reg_is_spilled(const char *value) {
+    return virtual_reg_index(value) >= ALPHA_MAPPED_COUNT;
+}
+
+static int alpha_spill_offset(const char *value) {
+    return (virtual_reg_index(value) - ALPHA_MAPPED_COUNT) * 8;
+}
+
+/* The second operand of an arithmetic instruction is either a register or a
+   literal of eight bits with no sign on it. */
+static bool alpha_fits_literal(const char *value, long long *out) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0 || !end || *end != '\0') return false;
+    if (parsed < 0 || parsed > 255) return false;
+    *out = parsed;
+    return true;
+}
+
+static const char *alpha_value_reg(Buffer *text, const char *value, const char *scratch,
+                                   int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg >= 0 && reg < ALPHA_MAPPED_COUNT) return alpha_machine_regs[reg];
+    if (reg >= 0) {
+        alpha_spill_used |= 1u << (unsigned)(reg - ALPHA_MAPPED_COUNT);
+        buf_appendf(text, "  lda %s, %s\n", scratch, X86_SPILL_SYMBOL);
+        buf_appendf(text, "  ldq %s, %d(%s)\n", scratch, alpha_spill_offset(value), scratch);
+        return scratch;
+    }
+    if (is_int(value) || is_known_constant(value)) {
+        buf_appendf(text, "  ldiq %s, %s\n", scratch, value);
+    } else if (is_symbol(value)) {
+        buf_appendf(text, "  lda %s, %s\n", scratch, value);
+    } else {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    return scratch;
+}
+
+static const char *alpha_dst_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    return reg < ALPHA_MAPPED_COUNT ? alpha_machine_regs[reg] : ALPHA_SCRATCH;
+}
+
+static void alpha_store_back(Buffer *text, const char *value, const char *from) {
+    /* The slot's address needs a register that is not the one holding the
+       value, or taking it would overwrite what is about to be stored. */
+    const char *base = strcmp(from, ALPHA_SCRATCH) == 0 ? ALPHA_SCRATCH2 : ALPHA_SCRATCH;
+    if (!alpha_reg_is_spilled(value)) return;
+    alpha_spill_used |= 1u << (unsigned)(virtual_reg_index(value) - ALPHA_MAPPED_COUNT);
+    buf_appendf(text, "  lda %s, %s\n", base, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  stq %s, %d(%s)\n", from, alpha_spill_offset(value), base);
+}
+
+static void alpha_emit_address(Buffer *text, const char *addr_text, char *base_out, size_t base_size,
+                               long long *offset_out, const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    *offset_out = addr.offset;
+    if (addr.has_base) {
+        snprintf(base_out, base_size, "%s", alpha_value_reg(text, addr.base, scratch, line_no, op));
+        return;
+    }
+    buf_appendf(text, "  lda %s, %s\n", scratch, addr.symbol);
+    snprintf(base_out, base_size, "%s", scratch);
+}
+
+/* Signed division for a machine that has none. $16 divided by $17 leaves the
+   quotient in $18 and the remainder in $19, and nothing else changes. It is
+   the same restoring division the ARM one is, one quotient bit per turn,
+   with the signs taken off first so the doubled remainder stays inside the
+   word. Dividing by zero answers zero, because there is no trap to take. */
+static const char alpha_divmod_routine[] =
+    "\n__commonasm_divmod:\n"
+    "  subq $30, 32, $30\n"
+    "  stq $1, 0($30)\n"
+    "  stq $2, 8($30)\n"
+    "  stq $3, 16($30)\n"
+    "  stq $4, 24($30)\n"
+    "  bis $31, $31, $4\n"        /* sign bookkeeping */
+    "  bis $31, $31, $18\n"
+    "  bis $31, $31, $19\n"
+    "  beq $17, 9f\n"
+    "  bge $17, 1f\n"
+    "  subq $31, $17, $17\n"
+    "  bis $31, 1, $4\n"
+    "1:\n"
+    "  bge $16, 2f\n"
+    "  subq $31, $16, $16\n"
+    "  xor $4, 1, $4\n"
+    "  bis $4, 2, $4\n"
+    "2:\n"
+    "  bis $31, $31, $1\n"        /* remainder */
+    "  bis $31, 64, $2\n"         /* bits left to do */
+    "3:\n"
+    "  srl $16, 63, $3\n"
+    "  addq $1, $1, $1\n"
+    "  bis $1, $3, $1\n"
+    "  addq $16, $16, $16\n"
+    "  cmpult $1, $17, $3\n"
+    "  bne $3, 4f\n"
+    "  subq $1, $17, $1\n"
+    "  bis $16, 1, $16\n"
+    "4:\n"
+    "  subq $2, 1, $2\n"
+    "  bne $2, 3b\n"
+    "  bis $31, $16, $18\n"
+    "  bis $31, $1, $19\n"
+    "  blbc $4, 5f\n"
+    "  subq $31, $18, $18\n"
+    "5:\n"
+    "  and $4, 2, $3\n"
+    "  beq $3, 9f\n"
+    "  subq $31, $19, $19\n"
+    "9:\n"
+    "  ldq $1, 0($30)\n"
+    "  ldq $2, 8($30)\n"
+    "  ldq $3, 16($30)\n"
+    "  ldq $4, 24($30)\n"
+    "  addq $30, 32, $30\n"
+    "  ret $31, ($26), 1\n";
+
+static void emit_alpha_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"$16", "$17", "$18", "$19", "$20", "$21"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    /* Alpha's Linux kept the numbers OSF/1 gave them. */
+    if (strcmp(args[0], "exit") == 0) number = 1;
+    else if (strcmp(args[0], "read") == 0) number = 3;
+    else if (strcmp(args[0], "write") == 0) number = 4;
+    else if (strcmp(args[0], "close") == 0) number = 6;
+    else if (strcmp(args[0], "open") == 0) number = 45;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* No virtual register maps onto $16-$21 or $0, so nothing needs saving. */
+    for (int i = 0; i < count; i++) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0 && reg < ALPHA_MAPPED_COUNT) {
+            buf_appendf(text, "  bis $31, %s, %s\n", alpha_machine_regs[reg], arg_regs[i]);
+        } else if (reg >= 0) {
+            buf_appendf(text, "  lda %s, %s\n", arg_regs[i], X86_SPILL_SYMBOL);
+            buf_appendf(text, "  ldq %s, %d(%s)\n", arg_regs[i], alpha_spill_offset(args[i + 1]), arg_regs[i]);
+        } else if (is_int(args[i + 1]) || is_known_constant(args[i + 1])) {
+            buf_appendf(text, "  ldiq %s, %s\n", arg_regs[i], args[i + 1]);
+        } else {
+            buf_appendf(text, "  lda %s, %s\n", arg_regs[i], args[i + 1]);
+        }
+    }
+    buf_appendf(text, "  ldiq $0, %d\n", number);
+    buf_append(text, "  call_pal 0x83\n");
+    if (result) {
+        const char *dst = alpha_dst_reg(result, line_no, "syscall");
+        buf_appendf(text, "  bis $31, $0, %s\n", dst);
+        alpha_store_back(text, result, dst);
+    }
+}
+
+/* The comparison and the branch that reads it, emitted together because this
+   machine has no instruction that does both. */
+static void alpha_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
+    const char *lhs;
+    const char *rhs;
+    const char *compare;
+    bool swap = false;
+    bool branch_if_set = true;
+    if (alpha_cmp.state == CMP_NONE) {
+        line_error(line_no, op, "conditional jump with no preceding cmp");
+    }
+    lhs = alpha_cmp.lhs;
+    rhs = alpha_cmp.rhs;
+    if (!alpha_cmp.rhs_is_reg) {
+        buf_appendf(text, "  ldiq %s, %s\n", ALPHA_SCRATCH2, alpha_cmp.rhs);
+        rhs = ALPHA_SCRATCH2;
+    }
+    /* Only three comparisons exist - equal, less than, less or equal - and
+       each of the others is one of those with the operands the other way
+       round, or with the answer read the other way. */
+    if (op_is(op, "je")) { compare = "cmpeq"; }
+    else if (op_is(op, "jne")) { compare = "cmpeq"; branch_if_set = false; }
+    else if (op_is(op, "jl")) { compare = "cmplt"; }
+    else if (op_is(op, "jge")) { compare = "cmplt"; branch_if_set = false; }
+    else if (op_is(op, "jg")) { compare = "cmplt"; swap = true; }
+    else if (op_is(op, "jle")) { compare = "cmple"; }
+    else if (op_is(op, "jb")) { compare = "cmpult"; }
+    else if (op_is(op, "jae")) { compare = "cmpult"; branch_if_set = false; }
+    else if (op_is(op, "ja")) { compare = "cmpult"; swap = true; }
+    else { compare = "cmpule"; }
+    buf_appendf(text, "  %s %s, %s, %s\n", compare, swap ? rhs : lhs, swap ? lhs : rhs,
+                ALPHA_CMP_RESULT);
+    buf_appendf(text, "  %s %s, %s\n", branch_if_set ? "bne" : "beq", ALPHA_CMP_RESULT, label);
+    if (alpha_cmp.single_use) alpha_cmp.state = CMP_NONE;
+}
+
+static void emit_alpha_instruction(Buffer *text, const char *op, const char *size,
+                                   char **args, int argc, int line_no) {
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* bsr overwrites $26, so a function that calls keeps its own. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  subq $30, 8, $30\n  stq $26, 0($30)\n");
+        }
+        return;
+    }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_append(text, "  subq $30, 16, $30\n  stq $26, 8($30)\n  stq $15, 0($30)\n");
+        buf_append(text, "  bis $31, $30, $15\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (alpha_fits_literal(args[0], &frame)) {
+            buf_appendf(text, "  subq $30, %lld, $30\n", frame);
+        } else {
+            buf_appendf(text, "  ldiq %s, %s\n", ALPHA_SCRATCH, args[0]);
+            buf_appendf(text, "  subq $30, %s, $30\n", ALPHA_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  bis $31, $15, $30\n  ldq $15, 0($30)\n  ldq $26, 8($30)\n");
+        buf_append(text, "  addq $30, 16, $30\n");
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0 && src < ALPHA_MAPPED_COUNT) {
+            buf_appendf(text, "  bis $31, %s, %s\n", alpha_machine_regs[src], dst);
+        } else {
+            const char *value = alpha_value_reg(text, args[1], dst, line_no, op);
+            if (strcmp(value, dst) != 0) buf_appendf(text, "  bis $31, %s, %s\n", value, dst);
+        }
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  lda %s, %s\n", dst, args[1]);
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char base[16];
+        long long off = 0;
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        alpha_emit_address(text, args[1], base, sizeof(base), &off, ALPHA_SCRATCH, line_no, op);
+        /* A four-byte load already spreads its sign across the register. The
+           two narrower ones do not, so the sign is spread afterwards. */
+        if (size[0] == 'b') {
+            buf_appendf(text, "  ldbu %s, %lld(%s)\n", dst, off, base);
+            buf_appendf(text, "  sextb %s, %s\n", dst, dst);
+        } else if (size[0] == 'w') {
+            buf_appendf(text, "  ldwu %s, %lld(%s)\n", dst, off, base);
+            buf_appendf(text, "  sextw %s, %s\n", dst, dst);
+        } else if (size[0] == 'd') {
+            buf_appendf(text, "  ldl %s, %lld(%s)\n", dst, off, base);
+        } else {
+            buf_appendf(text, "  ldq %s, %lld(%s)\n", dst, off, base);
+        }
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char base[16];
+        long long off = 0;
+        const char *mnemonic = size[0] == 'b' ? "stb" : size[0] == 'w' ? "stw" :
+                               size[0] == 'd' ? "stl" : "stq";
+        const char *value = alpha_value_reg(text, args[1], ALPHA_SCRATCH2, line_no, op);
+        alpha_emit_address(text, args[0], base, sizeof(base), &off, ALPHA_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %lld(%s)\n", mnemonic, value, off, base);
+        return;
+    }
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        /* There is no divide instruction at all, so this is a call to the
+           routine written out at the end. It takes $16 and $17 and answers in
+           $18 and $19, and the registers the caller cares about are saved
+           around it along with the return address the call overwrites. */
+        const char *lhs = alpha_value_reg(text, args[0], ALPHA_SCRATCH, line_no, op);
+        const char *rhs;
+        const char *dst;
+        alpha_divmod_used = true;
+        buf_appendf(text, "  bis $31, %s, $16\n", lhs);
+        rhs = alpha_value_reg(text, args[1], ALPHA_SCRATCH2, line_no, op);
+        buf_appendf(text, "  bis $31, %s, $17\n", rhs);
+        buf_append(text, "  subq $30, 8, $30\n  stq $26, 0($30)\n");
+        buf_append(text, "  bsr $26, __commonasm_divmod\n");
+        buf_append(text, "  ldq $26, 0($30)\n  addq $30, 8, $30\n");
+        dst = alpha_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  bis $31, %s, %s\n", op_is(op, "div") ? "$18" : "$19", dst);
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") || op_is(op, "or") ||
+         op_is(op, "xor") || op_is(op, "mul") || op_is(op, "shl") || op_is(op, "shr") ||
+         op_is(op, "sar")) && argc == 2) {
+        const char *native = op_is(op, "add") ? "addq" : op_is(op, "sub") ? "subq" :
+                             op_is(op, "and") ? "and" : op_is(op, "or") ? "bis" :
+                             op_is(op, "xor") ? "xor" : op_is(op, "mul") ? "mulq" :
+                             op_is(op, "shl") ? "sll" : op_is(op, "shr") ? "srl" : "sra";
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        const char *lhs = alpha_value_reg(text, args[0], dst, line_no, op);
+        long long imm;
+        if (strcmp(lhs, dst) != 0) buf_appendf(text, "  bis $31, %s, %s\n", lhs, dst);
+        if (alpha_fits_literal(args[1], &imm)) {
+            buf_appendf(text, "  %s %s, %lld, %s\n", native, dst, imm, dst);
+        } else {
+            const char *rhs = alpha_value_reg(text, args[1], ALPHA_SCRATCH2, line_no, op);
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, rhs, dst);
+        }
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        const char *value = alpha_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  bis $31, %s, %s\n", value, dst);
+        if (op_is(op, "neg")) buf_appendf(text, "  subq $31, %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  ornot $31, %s, %s\n", dst, dst);
+        else buf_appendf(text, "  %s %s, 1, %s\n", op_is(op, "inc") ? "addq" : "subq", dst, dst);
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if ((op_is(op, "popcnt") || op_is(op, "clz") || op_is(op, "ctz")) && argc == 1) {
+        /* The counting instructions, which arrived with EV67. */
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        const char *native = op_is(op, "popcnt") ? "ctpop" : op_is(op, "clz") ? "ctlz" : "cttz";
+        const char *value = alpha_value_reg(text, args[0], dst, line_no, op);
+        if (strcmp(value, dst) != 0) buf_appendf(text, "  bis $31, %s, %s\n", value, dst);
+        buf_appendf(text, "  %s %s, %s\n", native, dst, dst);
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        const char *lhs = alpha_value_reg(text, args[0], alpha_cmp.lhs_snapshot, line_no, op);
+        int src = virtual_reg_index(args[1]);
+        const char *rhs = src >= 0 ? alpha_value_reg(text, args[1], alpha_cmp.rhs_snapshot, line_no, op)
+                                   : args[1];
+        compare_record(&alpha_cmp, lhs, rhs, src >= 0, line_no);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        alpha_emit_branch(text, op, args[0], line_no);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = alpha_value_reg(text, args[0], ALPHA_SCRATCH2, line_no, op);
+        buf_append(text, "  subq $30, 8, $30\n");
+        buf_appendf(text, "  stq %s, 0($30)\n", value);
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        const char *dst = alpha_dst_reg(args[0], line_no, op);
+        buf_appendf(text, "  ldq %s, 0($30)\n", dst);
+        buf_append(text, "  addq $30, 8, $30\n");
+        alpha_store_back(text, args[0], dst);
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) { buf_appendf(text, "  br %s\n", args[0]); return; }
+    if (op_is(op, "call") && argc == 1) { buf_appendf(text, "  bsr $26, %s\n", args[0]); return; }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  ldq $26, 0($30)\n  addq $30, 8, $30\n");
+        }
+        buf_append(text, "  ret $31, ($26), 1\n");
+        return;
+    }
+    if (op_is(op, "syscall")) { emit_alpha_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for Alpha");
+}
+
 /* ------------------------------------------------------------------ m68k */
 
 /* Only the data registers can do arithmetic and logic, and d0 and d1 are the
@@ -8189,6 +8612,18 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     if (len > 0 && line[len - 1] == ':') {
         line[len - 1] = '\0';
         if (is_wasm_target(target)) { wasm_open_block(line); return; }
+        if (is_alpha_target(target) && strcmp(line, "_start") == 0) {
+            /* Every symbol's address on this machine is reached through
+               the global pointer, which the C runtime's startup code sets
+               up. There is no C runtime here, so the entry sets it up
+               itself: br leaves the address of the next instruction in
+               $27, which is what ldgp needs to work out where it is. */
+            buf_append(text, "_start:\n");
+            buf_append(text, "  br $27, __cas_alpha_gp\n");
+            buf_append(text, "__cas_alpha_gp:\n");
+            buf_append(text, "  ldgp $29, 0($27)\n");
+            return;
+        }
         if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s\n", line);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, ":%s\n", line);
         else buf_appendf(text, "%s:\n", line);
@@ -8198,7 +8633,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -8209,7 +8644,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -8257,6 +8692,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (is_m68k_target(target)) emit_m68k_instruction(text, base_op, size, args, argc, line_no);
     else if (is_loong_target(target)) emit_loong_instruction(text, base_op, size, args, argc, line_no);
     else if (is_nios2_target(target)) emit_nios2_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_alpha_target(target)) emit_alpha_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
@@ -8641,7 +9077,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -8842,6 +9278,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
         buf_append(&bss, ".balign 8\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, S390_SPILL_COUNT * 8);
     }
+    if (is_alpha_target(target) && alpha_spill_used) {
+        buf_append(&bss, ".balign 8\n");
+        buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, ALPHA_SPILL_COUNT * 8);
+    }
     if (is_nios2_target(target) && nios2_spill_used) {
         buf_append(&bss, ".balign 4\n");
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, NIOS2_SPILL_COUNT * 4);
@@ -8913,6 +9353,11 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             if (is_sparc_target(target) && sparc_is_64(target)) {
                 buf_append(&out, ".register %g2, #scratch\n.register %g3, #scratch\n");
             }
+            /* Byte and halfword access arrived with EV56 and the counting
+               instructions with EV67, and the assembler assumes neither
+               unless it is told. Every machine anyone still runs has both,
+               and the emulator this is checked on is an EV67. */
+            if (is_alpha_target(target)) buf_append(&out, ".arch ev67\n");
             if (is_nios2_target(target) && nios2_noat_used) buf_append(&out, ".set noat\n");
             if (is_mips_target(target) && mips_llsc_used) {
                 buf_append(&out, target_word_bits(target) == 64 ? ".set mips3\n"
@@ -8928,6 +9373,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     }
     buf_append(&out, text.data);
     if (is_arm32_target(target) && arm_divmod_used) buf_append(&out, arm_divmod_routine);
+    if (is_alpha_target(target) && alpha_divmod_used) buf_append(&out, alpha_divmod_routine);
     return out;
 }
 

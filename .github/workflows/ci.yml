@@ -28,6 +28,9 @@ jobs:
             binutils-s390x-linux-gnu binutils-aarch64-linux-gnu \
             binutils-arm-linux-gnueabi wabt qemu-user-static gcc-multilib
 
+      - name: Install the Alpha assembler
+        run: sudo apt-get install -y binutils-alpha-linux-gnu
+
       - name: Report which other machines this image could check
         run: |
           echo "cross assemblers available:"
