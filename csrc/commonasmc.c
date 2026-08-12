@@ -915,9 +915,28 @@ static const char *target_support_level(const char *target) {
     }
 }
 
+/* True when the target has a backend of its own rather than sharing the
+   assembly-shaped text emitters. AArch64 and ARM32 sit in the generic class
+   for their register files but have had their own emitters for a while, so
+   the class alone is not the answer. */
+static bool target_emits_assembly(const TargetDesc *desc) {
+    switch (desc->cls) {
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RV64: case CLASS_MIPS:
+        case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
+        case CLASS_WASM:
+            return true;
+        case CLASS_GENERIC:
+            return (desc->flags & (TF_AARCH64 | TF_ARM32)) != 0;
+        default:
+            return false;
+    }
+}
+
 static const char *target_output_kind(const char *target) {
     const TargetDesc *desc = target_lookup(target);
     if (!desc) return "unknown output";
+    if (desc->cls == CLASS_GENERIC && (desc->flags & TF_AARCH64)) return "GNU AArch64 assembly";
+    if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return "GNU ARM assembly";
     switch (desc->cls) {
         case CLASS_X86_64: return "NASM x86-64 assembly";
         case CLASS_RV64: return "GNU RISC-V 64 assembly";
@@ -942,6 +961,9 @@ static const char *target_output_kind(const char *target) {
 static const char *target_portability_note(const char *target) {
     const TargetDesc *desc = target_lookup(target);
     if (!desc) return "Unknown target.";
+    if (target_emits_assembly(desc) && desc->group != GROUP_PRIMARY) {
+        return "Assembly an assembler accepts; the portable subset, not a complete ABI-level port.";
+    }
     switch (desc->group) {
         case GROUP_PRIMARY:
             return "Reference backend for CommonASM portable semantics.";
@@ -1193,15 +1215,28 @@ static const char *mmix_reg(const char *value, int line_no, const char *op) {
     return mmix_regs[reg];
 }
 
+/* DCPU-16 has eight registers, so the other eight virtual ones live in a
+   reserved block of memory. The machine addresses memory in most operand
+   positions, so a slot reads and writes like a register does. */
+#define DCPU_MAPPED_COUNT 8
+#define DCPU_SPILL_COUNT (16 - DCPU_MAPPED_COUNT)
+
+static unsigned dcpu_spill_used = 0;
+
 static const char *dcpu_reg(const char *value, int line_no, const char *op) {
+    static char pool[4][48];
+    static unsigned next = 0;
+    char *slot;
     int reg = virtual_reg_index(value);
     if (reg < 0) {
         line_error_token(line_no, value, op, "expected virtual register r0-r15");
     }
-    if (reg >= 8) {
-        line_error_token(line_no, value, op, "DCPU-16 maps only r0-r7 directly");
-    }
-    return dcpu_regs[reg];
+    if (reg < DCPU_MAPPED_COUNT) return dcpu_regs[reg];
+    dcpu_spill_used |= 1u << (reg - DCPU_MAPPED_COUNT);
+    slot = pool[next];
+    next = (next + 1) % 4;
+    snprintf(slot, sizeof(pool[0]), "[%s+%d]", X86_SPILL_SYMBOL, reg - DCPU_MAPPED_COUNT);
+    return slot;
 }
 
 static const char *generic_reg_for_target(const char *value, const char *target, int line_no, const char *op) {
@@ -1823,17 +1858,24 @@ static void emit_dcpu_instruction(Buffer *text, const char *op, const char *size
     if (op_is(op, "load") && argc == 2) { char addr[256]; dcpu_format_address(args[1], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", dcpu_reg(args[0], line_no, op), addr); return; }
     if (op_is(op, "store") && argc == 2) { char addr[256]; dcpu_format_address(args[0], addr, sizeof(addr), line_no, op); buf_appendf(text, "        SET %s, %s\n", addr, dcpu_operand(args[1], line_no, op)); return; }
     if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "mul") || op_is(op, "div") ||
-         op_is(op, "mod") || op_is(op, "and") || op_is(op, "xor") || op_is(op, "shl") || op_is(op, "shr")) && argc == 2) {
-        const char *native = op_is(op, "or") ? "BOR" : op_is(op, "shl") ? "SHL" : op_is(op, "shr") ? "SHR" : op_is(op, "and") ? "AND" : op_is(op, "xor") ? "XOR" : op_is(op, "mod") ? "MOD" : op_is(op, "mul") ? "MUL" : op_is(op, "div") ? "DIV" : op_is(op, "sub") ? "SUB" : "ADD";
+         op_is(op, "mod") || op_is(op, "and") || op_is(op, "xor") || op_is(op, "shl") ||
+         op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        /* MLI, DVI and MDI are the signed forms, which is what the language
+           means by mul, div and mod; MUL, DIV and MOD are unsigned. ASR is
+           the arithmetic shift the older lowering claimed did not exist. */
+        const char *native = op_is(op, "or") ? "BOR" : op_is(op, "shl") ? "SHL" :
+                             op_is(op, "shr") ? "SHR" : op_is(op, "sar") ? "ASR" :
+                             op_is(op, "and") ? "AND" : op_is(op, "xor") ? "XOR" :
+                             op_is(op, "mod") ? "MDI" : op_is(op, "mul") ? "MLI" :
+                             op_is(op, "div") ? "DVI" : op_is(op, "sub") ? "SUB" : "ADD";
         buf_appendf(text, "        %s %s, %s\n", native, dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return;
     }
     if (op_is(op, "or") && argc == 2) { buf_appendf(text, "        BOR %s, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
-    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") || op_is(op, "sar")) && argc >= 1) {
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
         if (op_is(op, "neg")) { buf_appendf(text, "        XOR %s, 0xffff\n        ADD %s, 1\n", dcpu_reg(args[0], line_no, op), dcpu_reg(args[0], line_no, op)); return; }
         if (op_is(op, "not")) { buf_appendf(text, "        XOR %s, 0xffff\n", dcpu_reg(args[0], line_no, op)); return; }
         if (op_is(op, "inc")) { buf_appendf(text, "        ADD %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
-        if (op_is(op, "dec")) { buf_appendf(text, "        SUB %s, 1\n", dcpu_reg(args[0], line_no, op)); return; }
-        line_error(line_no, op, "DCPU-16 has no portable arithmetic right shift");
+        buf_appendf(text, "        SUB %s, 1\n", dcpu_reg(args[0], line_no, op)); return;
     }
     if (op_is(op, "cmp") && argc == 2) { buf_appendf(text, "        SET EX, %s\n        SUB EX, %s\n", dcpu_reg(args[0], line_no, op), dcpu_operand(args[1], line_no, op)); return; }
     if (op_is(op, "je") && argc == 1) { buf_appendf(text, "        IFE EX, 0\n        SET PC, %s\n", args[0]); return; }
@@ -7044,6 +7086,9 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (i386 && i386_spill_used) {
         buf_append(&bss, "alignb 4\n");
         buf_appendf(&bss, "%s: resd %d\n", X86_SPILL_SYMBOL, I386_SPILL_COUNT);
+    }
+    if (dcpu && dcpu_spill_used) {
+        buf_appendf(&bss, ":%s DAT %d DUP(0)\n", X86_SPILL_SYMBOL, DCPU_SPILL_COUNT);
     }
     if (is_m68k_target(target) && m68k_spill_used) {
         buf_appendf(&bss, "%s: .zero %d\n", X86_SPILL_SYMBOL, M68K_SPILL_COUNT * 4);
