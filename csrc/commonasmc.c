@@ -4997,13 +4997,28 @@ static void emit_m68k_instruction(Buffer *text, const char *op, const char *size
         }
         return;
     }
+    if (op_is(op, "cmp") && argc == 2) {
+        /* cmp is the one of these whose destination cannot be memory: it
+           compares an operand against a data register and nothing else. So a
+           spilled destination is staged into a register too. Both scratch
+           registers are free for it, since a compare leaves no result to
+           carry back. */
+        buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH);
+        if (m68k_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  move.l %s, %s\n", m68k_reg(args[0], line_no, op), M68K_SCRATCH2);
+            buf_appendf(text, "  cmp.l %s, %s\n", M68K_SCRATCH, M68K_SCRATCH2);
+        } else {
+            buf_appendf(text, "  cmp.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
+        }
+        return;
+    }
     if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") ||
-         op_is(op, "or") || op_is(op, "xor") || op_is(op, "cmp")) && argc == 2) {
+         op_is(op, "or") || op_is(op, "xor")) && argc == 2) {
         const char *native = op_is(op, "xor") ? "eor" : op;
-        /* Only one side may be memory, and eor and cmp need their source in a
+        /* Only one side may be memory, and eor needs its source in a
            register, so anything else is staged there first. */
         if ((m68k_reg_is_spilled(args[0]) && m68k_reg_is_spilled(args[1])) ||
-            op_is(op, "xor") || op_is(op, "cmp") || virtual_reg_index(args[1]) < 0) {
+            op_is(op, "xor") || virtual_reg_index(args[1]) < 0) {
             buf_appendf(text, "  move.l %s, %s\n", m68k_operand(args[1], line_no, op), M68K_SCRATCH);
             buf_appendf(text, "  %s.l %s, %s\n", native, M68K_SCRATCH, m68k_reg(args[0], line_no, op));
         } else {
