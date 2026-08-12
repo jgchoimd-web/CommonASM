@@ -5526,10 +5526,21 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
         const char *dividend = s390_value_reg(text, args[0], S390_SCRATCH, line_no, op);
         const char *divisor;
         const char *dst;
+        /* r0 and r1 are the division's own pair, so a divisor that has to be
+           materialised - an immediate, or a spilled register - needs a third
+           register, and every one left carries a virtual register. r12 is
+           borrowed and put back. It used to be taken and not returned, which
+           quietly destroyed whatever virtual r10 was holding: a running total
+           kept across a divide came out wrong. */
+        bool borrowed = virtual_reg_index(args[1]) < 0 || s390_reg_is_spilled(args[1]);
         if (strcmp(dividend, S390_SCRATCH) != 0) buf_appendf(text, "  lgr %s, %s\n", S390_SCRATCH, dividend);
+        if (borrowed) buf_append(text, "  aghi %r15, -8\n  stg %r12, 0(%r15)\n");
         divisor = s390_value_reg(text, args[1], "%r12", line_no, op);
         buf_append(text, "  srag %r0, %r1, 63\n");
         buf_appendf(text, "  dsgr %%r0, %s\n", divisor);
+        /* Put r12 back before the result is moved out, in case the result is
+           going to r12 itself. Both answers are in the r0:r1 pair by now. */
+        if (borrowed) buf_append(text, "  lg %r12, 0(%r15)\n  aghi %r15, 8\n");
         dst = s390_dst_reg(args[0], line_no, op);
         buf_appendf(text, "  lgr %s, %s\n", dst, op_is(op, "div") ? "%r1" : "%r0");
         s390_store_back(text, args[0], dst, S390_SCRATCH);

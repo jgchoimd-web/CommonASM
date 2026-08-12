@@ -501,6 +501,12 @@ run_exec_case() {
   else
     echo "  $EXEC_NAME/$case_target: printed [$(cat "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt")]"
     echo "                 expected [$EXEC_EXPECTED]"
+    # Say where it got to, rather than only that it did not get there. The
+    # syscall trace ends at whatever the program was doing when it stopped.
+    if [ -n "$case_qemu" ]; then
+      echo "    last syscalls before it stopped:"
+      timeout 30 "$case_qemu" -strace "$BUILD_DIR/exec-$EXEC_NAME-$case_target" 2>&1         | tail -12 | sed 's/^/      /' || true
+    fi
     exec_failures=$((exec_failures+1))
   fi
 }
