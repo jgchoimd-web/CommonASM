@@ -3489,8 +3489,13 @@ static void emit_vm_ir_instruction(Buffer *text, const char *target, const char 
     if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec") || op_is(op, "push") || op_is(op, "pop")) && argc == 1) {
         buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
     }
+    /* The unsigned four are part of the language as much as the signed four,
+       and this emitter writes the name it was given, so leaving them out only
+       meant these targets rejected a program the rest of them accepted. */
     if ((op_is(op, "jmp") || op_is(op, "je") || op_is(op, "jne") || op_is(op, "jg") ||
-         op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") || op_is(op, "call")) && argc == 1) {
+         op_is(op, "jl") || op_is(op, "jge") || op_is(op, "jle") ||
+         op_is(op, "ja") || op_is(op, "jb") || op_is(op, "jae") || op_is(op, "jbe") ||
+         op_is(op, "call")) && argc == 1) {
         buf_appendf(text, "  %s.%s %s\n", target, op, args[0]); return;
     }
     if (op_is(op, "ret") && argc == 0) { buf_appendf(text, "  %s.ret\n", target); return; }
@@ -5190,6 +5195,19 @@ static const char *sparc_reg(const char *value, int line_no, const char *op) {
     return sparc_regs[reg];
 }
 
+/* A divisor the compiler can read as a number, and one that is not
+   negative. The divide below has to work around a negative divisor, and
+   there is no reason to pay for that when the value is written down. */
+static bool sparc_divisor_is_nonneg(const char *value) {
+    char *end = NULL;
+    long long parsed;
+    if (virtual_reg_index(value) >= 0) return false;
+    if (!is_int(value)) return constant_value(value, &parsed) && parsed >= 0;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    return errno == 0 && parsed >= 0;
+}
+
 /* The immediate field is 13 bits signed; wider values go through set, which
    the assembler expands into however many instructions it needs. */
 static bool sparc_fits_imm13(const char *value, long long *out) {
@@ -5359,7 +5377,29 @@ static void emit_sparc_instruction(Buffer *text, const char *target, const char 
         }
         if (!wide) {
             /* The 32-bit divide reads the Y register as the high half of the
-               dividend, so it has to be given the sign extension first. */
+               dividend, so it has to be given the sign extension first.
+
+               It also has to be kept away from a negative divisor. Under the
+               emulator this is tested on, a signed divide by a negative
+               number answers zero -- from a register, from an immediate,
+               with instructions between the write to %y and the divide, and
+               with that write spelled the other way round; only a positive
+               divisor comes back right. So the machine is never asked. The
+               divisor is replaced by its magnitude, and for a division the
+               dividend's sign is flipped along with it, since a/b and
+               (-a)/(-b) are the same quotient. A remainder needs no fixing
+               at all: it takes its sign from the dividend, so a %% b and
+               a %% |b| are already the same number. */
+            if (!sparc_divisor_is_nonneg(args[1])) {
+                buf_appendf(text, "  sra %s, 31, %s\n", src, SPARC_SCRATCH2);
+                buf_appendf(text, "  xor %s, %s, %s\n", src, SPARC_SCRATCH2, SPARC_SCRATCH);
+                buf_appendf(text, "  sub %s, %s, %s\n", SPARC_SCRATCH, SPARC_SCRATCH2, SPARC_SCRATCH);
+                if (op_is(op, "div")) {
+                    buf_appendf(text, "  xor %s, %s, %s\n", dst, SPARC_SCRATCH2, dst);
+                    buf_appendf(text, "  sub %s, %s, %s\n", dst, SPARC_SCRATCH2, dst);
+                }
+                src = SPARC_SCRATCH;
+            }
             buf_appendf(text, "  sra %s, 31, %s\n", dst, SPARC_SCRATCH2);
             buf_appendf(text, "  wr %s, %%g0, %%y\n", SPARC_SCRATCH2);
         }
