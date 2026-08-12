@@ -7236,12 +7236,21 @@ static void emit_sh_syscall(Buffer *text, char **args, int argc, int line_no) {
     else line_error(line_no, "syscall", "unknown syscall");
     count = argc - 1;
     if (count > 6) count = 6;
-    /* r1 to r10 carry virtual registers, and the first four arguments land on
-       four of them, so the ones in the way are saved across the call. */
-    for (int i = 0; i < count && i < 4; i++) buf_appendf(text, "  mov.l %s, @-r15\n", arg_regs[i]);
-    for (int i = count - 1; i >= 0; i--) {
+    /* r1 to r10 carry virtual registers, and the argument registers are four
+       of them, so the ones in the way are saved across the call.
+
+       Every argument's value is then worked out and stacked before any of
+       them is put in place, because on this machine an argument register is
+       quite likely to be where a later argument's value is still living.
+       Filling them in one order or the other does not help: write's buffer
+       and its length were in the two registers each other's argument needed. */
+    for (int i = 0; i < count; i++) buf_appendf(text, "  mov.l %s, @-r15\n", arg_regs[i]);
+    for (int i = 0; i < count; i++) {
         const char *value = sh_value_reg(text, args[i + 1], SH_SCRATCH2, line_no, "syscall");
-        buf_appendf(text, "  mov %s, %s\n", value, arg_regs[i]);
+        buf_appendf(text, "  mov.l %s, @-r15\n", value);
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        buf_appendf(text, "  mov.l @r15+, %s\n", arg_regs[i]);
     }
     buf_appendf(text, "  mov #%d, r3\n", number);
     buf_append(text, "  trapa #0x10\n");
@@ -7249,7 +7258,7 @@ static void emit_sh_syscall(Buffer *text, char **args, int argc, int line_no) {
         /* The answer arrives in r0, before the saved registers come back. */
         buf_appendf(text, "  mov r0, %s\n", SH_SCRATCH2);
     }
-    for (int i = (count < 4 ? count : 4) - 1; i >= 0; i--) {
+    for (int i = count - 1; i >= 0; i--) {
         buf_appendf(text, "  mov.l @r15+, %s\n", arg_regs[i]);
     }
     if (result) {
