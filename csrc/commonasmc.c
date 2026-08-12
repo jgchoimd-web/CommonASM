@@ -1892,6 +1892,10 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
         else if (rv) buf_appendf(constants, ".equ %s_len, %d\n", name, byte_count);
         else if (mmix) buf_appendf(constants, "%s_len IS %d\n", name, byte_count);
         else if (dcpu) buf_appendf(constants, "%s_len EQU %d\n", name, byte_count);
+        /* PA-RISC keeps HP's spelling of .equ, where the name comes first.
+           A plain assignment means the same thing to every assembler here,
+           so that is what the one target that needs it gets. */
+        else if (is_hppa_target(target)) buf_appendf(constants, "%s_len = %d\n", name, byte_count);
         else if (generic && !is_toy_target(target)) buf_appendf(constants, ".equ %s_len, %d\n", name, byte_count);
         else if (generic) buf_appendf(constants, "; const %s_len = %d\n", name, byte_count);
         return;
@@ -9652,6 +9656,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
             else if (rv) buf_appendf(&constants, ".equ %s, %s\n", name, value);
             else if (mmix) buf_appendf(&constants, "%s IS %s\n", name, value);
             else if (dcpu) buf_appendf(&constants, "%s EQU %s\n", name, value);
+            else if (is_hppa_target(target)) buf_appendf(&constants, "%s = %s\n", name, value);
             else if (generic && !is_toy_target(target)) buf_appendf(&constants, ".equ %s, %s\n", name, value);
             else if (generic) buf_appendf(&constants, "; const %s = %s\n", name, value);
             continue;
