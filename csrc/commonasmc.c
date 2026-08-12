@@ -7186,23 +7186,23 @@ static const char sh_divmod_routine[] =
     "__cas_sh_pos2:\n"
     "  mov #0, r8\n"                   /* remainder */
     "  mov #32, r9\n"                  /* bits left */
+    "  mov #0, r6\n"
+    /* shll puts the numerator's top bit in T and rotcl brings it into
+       the bottom of the remainder, which is what this machine has
+       instead of a shift by thirty-one. The quotient bit is set by
+       hand, because the compare's answer does not survive dt. */
     "__cas_sh_loop:\n"
-    "  mov r4, r0\n"
-    "  shlr16 r0\n"
-    "  shlr8 r0\n"
-    "  shlr8 r0\n"
-    "  add r8, r8\n"
-    "  or r0, r8\n"
-    "  add r4, r4\n"
+    "  shll r4\n"
+    "  rotcl r8\n"
+    "  shll r6\n"
     "  cmp/hs r5, r8\n"
     "  bf __cas_sh_skip\n"
     "  sub r5, r8\n"
     "  mov #1, r0\n"
-    "  or r0, r4\n"
+    "  or r0, r6\n"
     "__cas_sh_skip:\n"
     "  dt r9\n"
     "  bf __cas_sh_loop\n"
-    "  mov r4, r6\n"
     "  mov r8, r7\n"
     "  mov r10, r0\n"
     "  tst #1, r0\n"
