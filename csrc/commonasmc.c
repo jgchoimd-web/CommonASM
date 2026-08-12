@@ -5194,10 +5194,18 @@ static const char *loong_dst_reg(const char *value, int line_no, const char *op)
 }
 
 static void loong_store_back(Buffer *text, const char *value, const char *from, const char *via) {
+    /* The slot's address needs a register of its own: taking it in the one
+       holding the value would overwrite the value and store the address
+       instead. The result is computed in the first scratch whenever the
+       destination is spilled, so the address goes in whichever scratch the
+       value is not in. By the time anything is stored back, the second
+       operand it was computed from is dead. */
+    const char *base = strcmp(from, LOONG_SCRATCH) == 0 ? LOONG_SCRATCH2 : LOONG_SCRATCH;
+    (void)via;
     if (!loong_reg_is_spilled(value)) return;
     loong_spill_used |= 1u << (unsigned)(virtual_reg_index(value) - LOONG_MAPPED_COUNT);
-    buf_appendf(text, "  la.local %s, %s\n", via, X86_SPILL_SYMBOL);
-    buf_appendf(text, "  st.d %s, %s, %d\n", from, via, loong_spill_offset(value));
+    buf_appendf(text, "  la.local %s, %s\n", base, X86_SPILL_SYMBOL);
+    buf_appendf(text, "  st.d %s, %s, %d\n", from, base, loong_spill_offset(value));
 }
 
 /* An address is a base register and a signed 12-bit displacement. A symbol
