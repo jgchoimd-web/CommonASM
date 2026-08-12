@@ -229,6 +229,7 @@ typedef enum {
     CLASS_LOONG,
     CLASS_NIOS2,
     CLASS_ALPHA,
+    CLASS_HPPA,
     CLASS_S390,
     CLASS_WASM,
     CLASS_ENCODING
@@ -332,7 +333,7 @@ static const TargetDesc target_table[] = {
     {"sparcv8-gnu", CLASS_SPARC, GROUP_LEGACY, 0},
     {"sparcv9-gnu", CLASS_SPARC, GROUP_LEGACY, TF_64BIT},
     {"alpha-gnu", CLASS_ALPHA, GROUP_LEGACY, 0},
-    {"parisc-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
+    {"parisc-gnu", CLASS_HPPA, GROUP_LEGACY, 0},
     {"m88k-gnu", CLASS_LEGACY, GROUP_LEGACY, 0},
     {"m68k", CLASS_M68K, GROUP_LEGACY, 0},
     {"coldfire", CLASS_M68K, GROUP_LEGACY, 0},
@@ -852,6 +853,10 @@ static bool is_ia64_target(const char *target) {
     return target_has_flag(target, TF_IA64);
 }
 
+static bool is_hppa_target(const char *target) {
+    return target_has_class(target, CLASS_HPPA);
+}
+
 static bool is_alpha_target(const char *target) {
     return target_has_class(target, CLASS_ALPHA);
 }
@@ -968,6 +973,7 @@ static int target_word_bits(const char *target) {
     if (desc->cls == CLASS_LOONG) return 64;
     if (desc->cls == CLASS_NIOS2) return 32;
     if (desc->cls == CLASS_ALPHA) return 64;
+    if (desc->cls == CLASS_HPPA) return 32;
     if (desc->cls == CLASS_S390) return 64;
     if (desc->cls == CLASS_RISCV) return (desc->flags & TF_RV32) ? 32 : 64;
     if (desc->cls == CLASS_GENERIC && (desc->flags & TF_ARM32)) return 32;
@@ -1074,7 +1080,7 @@ static const char *target_support_level(const char *target) {
    the class alone is not the answer. */
 static bool target_emits_assembly(const TargetDesc *desc) {
     switch (desc->cls) {
-        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2: case CLASS_ALPHA:
+        case CLASS_X86_64: case CLASS_I386: case CLASS_RISCV: case CLASS_MIPS: case CLASS_LOONG: case CLASS_NIOS2: case CLASS_ALPHA: case CLASS_HPPA:
         case CLASS_PPC: case CLASS_SPARC: case CLASS_M68K: case CLASS_S390:
         case CLASS_WASM:
             return true;
@@ -1101,6 +1107,7 @@ static const char *target_output_kind(const char *target) {
         case CLASS_LOONG: return "GNU LoongArch assembly";
         case CLASS_NIOS2: return "GNU Nios II assembly";
         case CLASS_ALPHA: return "GNU Alpha assembly";
+        case CLASS_HPPA: return "GNU PA-RISC assembly";
         case CLASS_S390: return "GNU z/Architecture assembly";
         case CLASS_WASM: return "WebAssembly text";
         case CLASS_GENERIC:
@@ -1811,7 +1818,7 @@ static void emit_data_line(Buffer *out, Buffer *constants, char *line, int line_
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_i386_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     /* Both NASM targets take NASM directives. i386 used to fall through to the
        GNU spellings, which produced ".equ msg_len, 10" in a file NASM was
        about to read. */
@@ -6569,6 +6576,428 @@ static void emit_alpha_instruction(Buffer *text, const char *op, const char *siz
     line_error(line_no, op, "unsupported instruction or wrong argument count for Alpha");
 }
 
+/* ---------------------------------------------------------------- PA-RISC */
+
+/* %r0 reads as zero, %r1 is where ldil puts a value and so belongs to the
+   assembler's own long-address sequences, %r2 holds the return address, %r19
+   is the linkage table pointer that static code has no use for, %r20 to %r22
+   are temporaries, %r23 to %r26 carry a system call's arguments, %r27 is the
+   data pointer, %r28 and %r29 its answer, %r30 is the stack and %r31 is where
+   the branch-and-link that enters the kernel leaves its return address.
+
+   That leaves %r3 to %r18, which is exactly sixteen, so nothing spills. The
+   compiler's scratch pair is %r20 and %r21, and a pending comparison is
+   copied into %r22 and %r19.
+
+   Every branch has a delay slot and this backend fills all of them with nop,
+   the way the SPARC one does: getting an instruction into them is a
+   scheduling problem, and being wrong about it is silent. */
+static const char *hppa_machine_regs[] = {
+    "%r3", "%r4", "%r5", "%r6", "%r7", "%r8", "%r9", "%r10",
+    "%r11", "%r12", "%r13", "%r14", "%r15", "%r16", "%r17", "%r18"
+};
+
+#define HPPA_MAPPED_COUNT ((int)(sizeof(hppa_machine_regs) / sizeof(hppa_machine_regs[0])))
+#define HPPA_SCRATCH "%r20"
+#define HPPA_SCRATCH2 "%r21"
+
+/* Set when something divided, so the divide routine is written out. */
+static bool hppa_divmod_used = false;
+
+static DeferredCompare hppa_cmp = {CMP_NONE, {0}, {0}, false, "%r22", "%r19", "copy", "ldi", false};
+
+static void hppa_delay_slot(Buffer *text) {
+    buf_append(text, "  nop\n");
+}
+
+static const char *hppa_reg(const char *value, int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    if (reg < 0) line_error_token(line_no, value, op, "expected virtual register r0-r15");
+    return hppa_machine_regs[reg];
+}
+
+/* addi and the immediate compares carry eleven bits with a sign on them. */
+static bool hppa_fits_imm11(const char *value, long long *out) {
+    char *end = NULL;
+    long long parsed;
+    if (!is_int(value)) return false;
+    errno = 0;
+    parsed = strtoll(value, &end, 0);
+    if (errno != 0 || !end || *end != '\0') return false;
+    if (parsed < -1024 || parsed > 1023) return false;
+    *out = parsed;
+    return true;
+}
+
+/* A symbol's address is the high part put in place and the low part added,
+   which needs no data pointer set up beforehand - the one thing PA-RISC
+   makes easier than Alpha. */
+static const char *hppa_value_reg(Buffer *text, const char *value, const char *scratch,
+                                  int line_no, const char *op) {
+    int reg = virtual_reg_index(value);
+    long long imm;
+    if (reg >= 0) return hppa_machine_regs[reg];
+    if (is_int(value) || is_known_constant(value)) {
+        if (hppa_fits_imm11(value, &imm)) buf_appendf(text, "  ldi %lld, %s\n", imm, scratch);
+        else {
+            buf_appendf(text, "  ldil L'%s, %s\n", value, scratch);
+            buf_appendf(text, "  ldo R'%s(%s), %s\n", value, scratch, scratch);
+        }
+    } else if (is_symbol(value)) {
+        buf_appendf(text, "  ldil L'%s, %s\n", value, scratch);
+        buf_appendf(text, "  ldo R'%s(%s), %s\n", value, scratch, scratch);
+    } else {
+        line_error_token(line_no, value, op, "expected register, integer, symbol, or constant");
+    }
+    return scratch;
+}
+
+static void hppa_emit_address(Buffer *text, const char *addr_text, char *out, size_t out_size,
+                              const char *scratch, int line_no, const char *op) {
+    Address addr;
+    if (!parse_address(addr_text, &addr)) {
+        line_error_token(line_no, addr_text, op, "expected address like [r0 + 8] or [symbol + 8]");
+    }
+    if (addr.has_base) {
+        snprintf(out, out_size, "%lld(%s)", addr.offset, hppa_reg(addr.base, line_no, op));
+        return;
+    }
+    buf_appendf(text, "  ldil L'%s, %s\n", addr.symbol, scratch);
+    buf_appendf(text, "  ldo R'%s(%s), %s\n", addr.symbol, scratch, scratch);
+    snprintf(out, out_size, "%lld(%s)", addr.offset, scratch);
+}
+
+/* Signed division for a machine whose divide lives in millicode this output
+   cannot call. %r26 divided by %r25 leaves the quotient in %r28 and the
+   remainder in %r29. Same restoring division as the others. */
+static const char hppa_divmod_routine[] =
+    "\n__commonasm_divmod:\n"
+    "  copy %r0, %r1\n"                 /* sign bookkeeping */
+    "  copy %r0, %r28\n"
+    "  copy %r0, %r29\n"
+    "  comb,= %r0, %r25, __cas_hppa_done\n"
+    "  nop\n"
+    "  comb,<= %r0, %r25, __cas_hppa_pos1\n"
+    "  nop\n"
+    "  sub %r0, %r25, %r25\n"
+    "  ldi 1, %r1\n"
+    "__cas_hppa_pos1:\n"
+    "  comb,<= %r0, %r26, __cas_hppa_pos2\n"
+    "  nop\n"
+    "  sub %r0, %r26, %r26\n"
+    "  xori 1, %r1, %r1\n"
+    "  ori 2, %r1, %r1\n"
+    "__cas_hppa_pos2:\n"
+    "  copy %r0, %r24\n"                /* remainder */
+    "  ldi 32, %r23\n"                  /* bits left */
+    "__cas_hppa_loop:\n"
+    "  extru %r26, 0, 1, %r31\n"
+    "  add %r24, %r24, %r24\n"
+    "  or %r24, %r31, %r24\n"
+    "  add %r26, %r26, %r26\n"
+    "  comb,<<  %r24, %r25, __cas_hppa_skip\n"
+    "  nop\n"
+    "  sub %r24, %r25, %r24\n"
+    "  ori 1, %r26, %r26\n"
+    "__cas_hppa_skip:\n"
+    "  addi -1, %r23, %r23\n"
+    "  comb,<> %r0, %r23, __cas_hppa_loop\n"
+    "  nop\n"
+    "  copy %r26, %r28\n"
+    "  copy %r24, %r29\n"
+    "  extru %r1, 31, 1, %r31\n"
+    "  comb,= %r0, %r31, __cas_hppa_nq\n"
+    "  nop\n"
+    "  sub %r0, %r28, %r28\n"
+    "__cas_hppa_nq:\n"
+    "  extru %r1, 30, 1, %r31\n"
+    "  comb,= %r0, %r31, __cas_hppa_done\n"
+    "  nop\n"
+    "  sub %r0, %r29, %r29\n"
+    "__cas_hppa_done:\n"
+    "  bv %r0(%r2)\n"
+    "  nop\n";
+
+static void emit_hppa_syscall(Buffer *text, char **args, int argc, int line_no) {
+    static const char *const arg_regs[] = {"%r26", "%r25", "%r24", "%r23", "%r22", "%r21"};
+    const char *result = syscall_result_operand(&args, &argc);
+    int number = -1;
+    int count;
+    if (argc < 1) line_error(line_no, "syscall", "needs a syscall name");
+    if (strcmp(args[0], "exit") == 0) number = 1;
+    else if (strcmp(args[0], "read") == 0) number = 3;
+    else if (strcmp(args[0], "write") == 0) number = 4;
+    else if (strcmp(args[0], "close") == 0) number = 6;
+    else if (strcmp(args[0], "open") == 0) number = 5;
+    else line_error(line_no, "syscall", "unknown syscall");
+    count = argc - 1;
+    if (count > 6) count = 6;
+    /* The arguments go in backwards, because the last two of them are the
+       registers this backend otherwise uses as its scratch pair. */
+    for (int i = count - 1; i >= 0; i--) {
+        int reg = virtual_reg_index(args[i + 1]);
+        if (reg >= 0) buf_appendf(text, "  copy %s, %s\n", hppa_machine_regs[reg], arg_regs[i]);
+        else {
+            long long imm;
+            if (hppa_fits_imm11(args[i + 1], &imm)) buf_appendf(text, "  ldi %lld, %s\n", imm, arg_regs[i]);
+            else {
+                buf_appendf(text, "  ldil L'%s, %s\n", args[i + 1], arg_regs[i]);
+                buf_appendf(text, "  ldo R'%s(%s), %s\n", args[i + 1], arg_regs[i], arg_regs[i]);
+            }
+        }
+    }
+    buf_appendf(text, "  ldi %d, %%r20\n", number);
+    /* The kernel is entered through a fixed address in space register 2, and
+       the instruction in the delay slot is the one the convention names. */
+    buf_append(text, "  be,l 0x100(%sr2, %r0), %sr0, %r31\n");
+    buf_append(text, "  nop\n");
+    if (result) buf_appendf(text, "  copy %%r28, %s\n", hppa_reg(result, line_no, "syscall"));
+}
+
+/* PA-RISC compares and branches in one instruction, but names the condition
+   the other way round from most machines: comb,< branches when the first
+   operand is less than the second. */
+static void hppa_emit_branch(Buffer *text, const char *op, const char *label, int line_no) {
+    const char *lhs;
+    const char *rhs;
+    const char *cond;
+    bool swap = false;
+    if (hppa_cmp.state == CMP_NONE) {
+        line_error(line_no, op, "conditional jump with no preceding cmp");
+    }
+    lhs = hppa_cmp.lhs;
+    rhs = hppa_cmp.rhs;
+    if (!hppa_cmp.rhs_is_reg) {
+        long long imm;
+        if (hppa_fits_imm11(hppa_cmp.rhs, &imm)) buf_appendf(text, "  ldi %lld, %s\n", imm, HPPA_SCRATCH2);
+        else {
+            buf_appendf(text, "  ldil L'%s, %s\n", hppa_cmp.rhs, HPPA_SCRATCH2);
+            buf_appendf(text, "  ldo R'%s(%s), %s\n", hppa_cmp.rhs, HPPA_SCRATCH2, HPPA_SCRATCH2);
+        }
+        rhs = HPPA_SCRATCH2;
+    }
+    if (op_is(op, "je")) cond = "=";
+    else if (op_is(op, "jne")) cond = "<>";
+    else if (op_is(op, "jl")) cond = "<";
+    else if (op_is(op, "jge")) cond = ">=";
+    else if (op_is(op, "jg")) { cond = "<"; swap = true; }
+    else if (op_is(op, "jle")) { cond = ">="; swap = true; }
+    else if (op_is(op, "jb")) cond = "<<";
+    else if (op_is(op, "jae")) cond = ">>=";
+    else if (op_is(op, "ja")) { cond = "<<"; swap = true; }
+    else { cond = ">>="; swap = true; }
+    buf_appendf(text, "  comb,%s %s, %s, %s\n", cond, swap ? rhs : lhs, swap ? lhs : rhs, label);
+    hppa_delay_slot(text);
+    if (hppa_cmp.single_use) hppa_cmp.state = CMP_NONE;
+}
+
+static void emit_hppa_instruction(Buffer *text, const char *op, const char *size,
+                                  char **args, int argc, int line_no) {
+    if (op_is(op, "func") && argc == 1) {
+        buf_appendf(text, "%s:\n", args[0]);
+        /* bl overwrites %r2, so a function that calls keeps its own. */
+        if (func_needs_link_save(args[0])) {
+            buf_append(text, "  stw %r2, -20(%r30)\n  ldo 64(%r30), %r30\n");
+        }
+        return;
+    }
+    if (op_is(op, "endfunc") && argc == 0) return;
+    if (op_is(op, "enter") && argc == 1) {
+        long long frame;
+        buf_append(text, "  stw %r2, -20(%r30)\n  copy %r30, %r3\n  ldo 64(%r30), %r30\n");
+        if (strcmp(args[0], "0") == 0) return;
+        if (hppa_fits_imm11(args[0], &frame)) buf_appendf(text, "  ldo %lld(%%r30), %%r30\n", frame);
+        else {
+            buf_appendf(text, "  ldil L'%s, %s\n", args[0], HPPA_SCRATCH);
+            buf_appendf(text, "  ldo R'%s(%s), %s\n", args[0], HPPA_SCRATCH, HPPA_SCRATCH);
+            buf_appendf(text, "  add %%r30, %s, %%r30\n", HPPA_SCRATCH);
+        }
+        return;
+    }
+    if (op_is(op, "leave") && argc == 0) {
+        buf_append(text, "  copy %r3, %r30\n  ldw -20(%r30), %r2\n");
+        return;
+    }
+    if (op_is(op, "mov") && argc == 2) {
+        const char *dst = hppa_reg(args[0], line_no, op);
+        int src = virtual_reg_index(args[1]);
+        if (src >= 0) buf_appendf(text, "  copy %s, %s\n", hppa_machine_regs[src], dst);
+        else {
+            const char *value = hppa_value_reg(text, args[1], dst, line_no, op);
+            if (strcmp(value, dst) != 0) buf_appendf(text, "  copy %s, %s\n", value, dst);
+        }
+        return;
+    }
+    if (op_is(op, "load_addr") && argc == 2) {
+        const char *dst = hppa_reg(args[0], line_no, op);
+        buf_appendf(text, "  ldil L'%s, %s\n", args[1], dst);
+        buf_appendf(text, "  ldo R'%s(%s), %s\n", args[1], dst, dst);
+        return;
+    }
+    if (op_is(op, "load") && argc == 2) {
+        char addr[256];
+        const char *dst = hppa_reg(args[0], line_no, op);
+        hppa_emit_address(text, args[1], addr, sizeof(addr), HPPA_SCRATCH, line_no, op);
+        /* The narrow loads do not spread the sign, so it is spread after. */
+        if (size[0] == 'b') {
+            buf_appendf(text, "  ldb %s, %s\n", addr, dst);
+            buf_appendf(text, "  extrs %s, 31, 8, %s\n", dst, dst);
+        } else if (size[0] == 'w') {
+            buf_appendf(text, "  ldh %s, %s\n", addr, dst);
+            buf_appendf(text, "  extrs %s, 31, 16, %s\n", dst, dst);
+        } else {
+            buf_appendf(text, "  ldw %s, %s\n", addr, dst);
+        }
+        return;
+    }
+    if (op_is(op, "store") && argc == 2) {
+        char addr[256];
+        const char *mnemonic = size[0] == 'b' ? "stb" : size[0] == 'w' ? "sth" : "stw";
+        const char *value = hppa_value_reg(text, args[1], HPPA_SCRATCH2, line_no, op);
+        hppa_emit_address(text, args[0], addr, sizeof(addr), HPPA_SCRATCH, line_no, op);
+        buf_appendf(text, "  %s %s, %s\n", mnemonic, value, addr);
+        return;
+    }
+    if ((op_is(op, "div") || op_is(op, "mod")) && argc == 2) {
+        /* The divide lives in millicode, which this output has no way to
+           reach, so the routine at the end of the file is called instead. */
+        const char *lhs = hppa_value_reg(text, args[0], HPPA_SCRATCH, line_no, op);
+        const char *rhs;
+        hppa_divmod_used = true;
+        buf_appendf(text, "  copy %s, %%r26\n", lhs);
+        rhs = hppa_value_reg(text, args[1], HPPA_SCRATCH2, line_no, op);
+        buf_appendf(text, "  copy %s, %%r25\n", rhs);
+        buf_append(text, "  stw %r2, -20(%r30)\n");
+        buf_append(text, "  bl __commonasm_divmod, %r2\n");
+        hppa_delay_slot(text);
+        buf_append(text, "  ldw -20(%r30), %r2\n");
+        buf_appendf(text, "  copy %s, %s\n", op_is(op, "div") ? "%r28" : "%r29",
+                    hppa_reg(args[0], line_no, op));
+        return;
+    }
+    if ((op_is(op, "add") || op_is(op, "sub") || op_is(op, "and") || op_is(op, "or") ||
+         op_is(op, "xor")) && argc == 2) {
+        const char *dst = hppa_reg(args[0], line_no, op);
+        long long imm;
+        if (op_is(op, "add") && hppa_fits_imm11(args[1], &imm)) {
+            buf_appendf(text, "  addi %lld, %s, %s\n", imm, dst, dst);
+            return;
+        }
+        if (op_is(op, "sub") && hppa_fits_imm11(args[1], &imm) && imm != -1024) {
+            buf_appendf(text, "  addi %lld, %s, %s\n", -imm, dst, dst);
+            return;
+        }
+        {
+            const char *rhs = hppa_value_reg(text, args[1], HPPA_SCRATCH, line_no, op);
+            const char *native = op_is(op, "add") ? "add" : op_is(op, "sub") ? "sub" :
+                                 op_is(op, "and") ? "and" : op_is(op, "or") ? "or" : "xor";
+            buf_appendf(text, "  %s %s, %s, %s\n", native, dst, rhs, dst);
+        }
+        return;
+    }
+    if (op_is(op, "mul") && argc == 2) {
+        /* There is no integer multiply either. Shift and add, once per bit
+           of the multiplier, which is what the machine leaves anyone to do. */
+        int again = ++ext_label_serial;
+        int skip = ++ext_label_serial;
+        int done = ++ext_label_serial;
+        const char *dst = hppa_reg(args[0], line_no, op);
+        const char *rhs = hppa_value_reg(text, args[1], HPPA_SCRATCH, line_no, op);
+        buf_appendf(text, "  copy %s, %s\n", dst, HPPA_SCRATCH2);
+        buf_appendf(text, "  copy %%r0, %s\n", dst);
+        buf_appendf(text, "__cas_ext_%d:\n", again);
+        buf_appendf(text, "  comb,= %%r0, %s, __cas_ext_%d\n", rhs, done);
+        hppa_delay_slot(text);
+        buf_appendf(text, "  extru %s, 31, 1, %%r22\n", rhs);
+        buf_appendf(text, "  comb,= %%r0, %%r22, __cas_ext_%d\n", skip);
+        hppa_delay_slot(text);
+        buf_appendf(text, "  add %s, %s, %s\n", dst, HPPA_SCRATCH2, dst);
+        buf_appendf(text, "__cas_ext_%d:\n", skip);
+        buf_appendf(text, "  add %s, %s, %s\n", HPPA_SCRATCH2, HPPA_SCRATCH2, HPPA_SCRATCH2);
+        buf_appendf(text, "  extru %s, 30, 31, %s\n", rhs, rhs);
+        buf_appendf(text, "  b __cas_ext_%d\n", again);
+        hppa_delay_slot(text);
+        buf_appendf(text, "__cas_ext_%d:\n", done);
+        return;
+    }
+    if ((op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) && argc == 2) {
+        /* The shifts are bit-field instructions here, and their operands are
+           counted from the other end. A shift by a register goes through the
+           shift-amount register instead. */
+        const char *dst = hppa_reg(args[0], line_no, op);
+        long long imm;
+        if (is_int(args[1]) && hppa_fits_imm11(args[1], &imm) && imm >= 0 && imm < 32) {
+            if (op_is(op, "shl")) {
+                buf_appendf(text, "  zdep %s, %lld, %lld, %s\n", dst, 31 - imm, 32 - imm, dst);
+            } else {
+                buf_appendf(text, "  %s %s, %lld, %lld, %s\n", op_is(op, "shr") ? "extru" : "extrs",
+                            dst, 31 - imm, 32 - imm, dst);
+            }
+            return;
+        }
+        {
+            const char *amount = hppa_value_reg(text, args[1], HPPA_SCRATCH, line_no, op);
+            if (op_is(op, "shl")) {
+                buf_appendf(text, "  subi 31, %s, %s\n", amount, HPPA_SCRATCH2);
+                buf_appendf(text, "  mtsar %s\n", HPPA_SCRATCH2);
+                buf_appendf(text, "  zvdep %s, 32, %s\n", dst, dst);
+            } else {
+                buf_appendf(text, "  mtsar %s\n", amount);
+                buf_appendf(text, "  %s %s, 32, %s\n", op_is(op, "shr") ? "vextru" : "vextrs", dst, dst);
+            }
+        }
+        return;
+    }
+    if ((op_is(op, "neg") || op_is(op, "not") || op_is(op, "inc") || op_is(op, "dec")) && argc == 1) {
+        const char *dst = hppa_reg(args[0], line_no, op);
+        if (op_is(op, "neg")) buf_appendf(text, "  sub %%r0, %s, %s\n", dst, dst);
+        else if (op_is(op, "not")) buf_appendf(text, "  uaddcm %%r0, %s, %s\n", dst, dst);
+        else buf_appendf(text, "  addi %s, %s, %s\n", op_is(op, "inc") ? "1" : "-1", dst, dst);
+        return;
+    }
+    if (op_is(op, "cmp") && argc == 2) {
+        int src = virtual_reg_index(args[1]);
+        compare_record(&hppa_cmp, hppa_reg(args[0], line_no, op),
+                       src >= 0 ? hppa_machine_regs[src] : args[1], src >= 0, line_no);
+        return;
+    }
+    if (is_conditional_branch(op) && argc == 1) {
+        hppa_emit_branch(text, op, args[0], line_no);
+        return;
+    }
+    if (op_is(op, "push") && argc == 1) {
+        const char *value = hppa_value_reg(text, args[0], HPPA_SCRATCH2, line_no, op);
+        buf_appendf(text, "  stw %s, 0(%%r30)\n", value);
+        buf_append(text, "  ldo 8(%r30), %r30\n");
+        return;
+    }
+    if (op_is(op, "pop") && argc == 1) {
+        buf_append(text, "  ldo -8(%r30), %r30\n");
+        buf_appendf(text, "  ldw 0(%%r30), %s\n", hppa_reg(args[0], line_no, op));
+        return;
+    }
+    if (op_is(op, "jmp") && argc == 1) {
+        buf_appendf(text, "  b %s\n", args[0]);
+        hppa_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "call") && argc == 1) {
+        buf_appendf(text, "  bl %s, %%r2\n", args[0]);
+        hppa_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "ret") && argc == 0) {
+        if (func_saved_link) {
+            buf_append(text, "  ldo -64(%r30), %r30\n  ldw -20(%r30), %r2\n");
+        }
+        buf_append(text, "  bv %r0(%r2)\n");
+        hppa_delay_slot(text);
+        return;
+    }
+    if (op_is(op, "syscall")) { emit_hppa_syscall(text, args, argc, line_no); return; }
+    line_error(line_no, op, "unsupported instruction or wrong argument count for PA-RISC");
+}
+
 /* ------------------------------------------------------------------ m68k */
 
 /* Only the data registers can do arithmetic and logic, and d0 and d1 are the
@@ -8633,7 +9062,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "global %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".globl %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "global %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "%s IS @\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "; global %s\n", name);
@@ -8644,7 +9073,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
         const char *name = trim(line + 7);
         if (is_wasm_target(target)) return;
         if (strcmp(target, "x86_64-nasm") == 0) buf_appendf(text, "extern %s\n", name);
-        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
+        else if (is_riscv_target(target) || is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target)) buf_appendf(text, ".extern %s\n", name);
         else if (is_i386_target(target)) buf_appendf(text, "extern %s\n", name);
         else if (strcmp(target, "mmixal") == 0) buf_appendf(text, "        %% extern %s\n", name);
         else if (strcmp(target, "dcpu16") == 0) buf_appendf(text, "        ; extern %s\n", name);
@@ -8693,6 +9122,7 @@ static void emit_text_line(Buffer *text, char *line, int line_no, const char *ta
     else if (is_loong_target(target)) emit_loong_instruction(text, base_op, size, args, argc, line_no);
     else if (is_nios2_target(target)) emit_nios2_instruction(text, base_op, size, args, argc, line_no);
     else if (is_alpha_target(target)) emit_alpha_instruction(text, base_op, size, args, argc, line_no);
+    else if (is_hppa_target(target)) emit_hppa_instruction(text, base_op, size, args, argc, line_no);
     else if (is_ppc_target(target)) emit_ppc_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_mips_target(target)) emit_mips_instruction(text, target, base_op, size, args, argc, line_no);
     else if (is_arm32_target(target)) emit_arm_instruction(text, base_op, size, args, argc, line_no);
@@ -9077,7 +9507,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     const bool rv = is_riscv_target(target);
     const bool mmix = strcmp(target, "mmixal") == 0;
     const bool dcpu = strcmp(target, "dcpu16") == 0;
-    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_vm_ir_target(target) || is_toy_target(target);
+    const bool generic = is_generic_arch_target(target) || is_legacy_arch_target(target) || is_mips_target(target) || is_ppc_target(target) || is_sparc_target(target) || is_m68k_target(target) || is_s390_target(target) || is_loong_target(target) || is_nios2_target(target) || is_alpha_target(target) || is_hppa_target(target) || is_vm_ir_target(target) || is_toy_target(target);
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
@@ -9374,6 +9804,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     buf_append(&out, text.data);
     if (is_arm32_target(target) && arm_divmod_used) buf_append(&out, arm_divmod_routine);
     if (is_alpha_target(target) && alpha_divmod_used) buf_append(&out, alpha_divmod_routine);
+    if (is_hppa_target(target) && hppa_divmod_used) buf_append(&out, hppa_divmod_routine);
     return out;
 }
 

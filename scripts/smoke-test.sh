@@ -514,6 +514,17 @@ else
   echo "no m68k assembler found; skipped assembling the m68k output."
 fi
 
+if command -v hppa-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target parisc-gnu -o "$BUILD_DIR/hppa-${name}.s"
+    hppa-linux-gnu-as -o "$BUILD_DIR/hppa-${name}.o" "$BUILD_DIR/hppa-${name}.s"
+  done
+  echo "the PA-RISC assembler accepted every parisc-gnu output."
+else
+  echo "no PA-RISC assembler found; skipped assembling the PA-RISC output."
+fi
+
 if command -v alpha-linux-gnu-as > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
@@ -645,6 +656,7 @@ run_exec_everywhere() {
   run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
   run_exec_case zarch       s390x-linux-gnu-as "" s390x-linux-gnu-ld "" qemu-s390x-static
   run_exec_case alpha-gnu   alpha-linux-gnu-as "" alpha-linux-gnu-ld "" qemu-alpha-static
+  run_exec_case parisc-gnu  hppa-linux-gnu-as "" hppa-linux-gnu-ld "" qemu-hppa-static
   run_exec_case nios2       nios2-linux-gnu-as "" nios2-linux-gnu-ld "" qemu-nios2-static
   run_exec_case loongarch64-gnu loongarch64-linux-gnu-as "" loongarch64-linux-gnu-ld ""                             qemu-loongarch64-static
 }
