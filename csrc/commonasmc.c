@@ -262,7 +262,8 @@ enum {
     TF_HAS_RBIT = 1u << 7,  /* ARMv6T2 and later */
     TF_RV_ZBB = 1u << 8,    /* RISC-V bit-manipulation extension */
     TF_64BIT = 1u << 9,     /* a 64-bit member of an otherwise 32-bit family */
-    TF_RV32 = 1u << 10      /* the 32-bit member of the RISC-V family */
+    TF_RV32 = 1u << 10,     /* the 32-bit member of the RISC-V family */
+    TF_LLSC = 1u << 11      /* has a linked load and conditional store */
 };
 
 /* Operations the language offers on every target but that only some machines
@@ -313,10 +314,12 @@ static const TargetDesc target_table[] = {
     {"ia64-gnu", CLASS_GENERIC, GROUP_GENERIC, TF_IA64},
     {"loongarch64-gnu", CLASS_LOONG, GROUP_GENERIC, TF_LOONG},
 
+    /* The linked load and conditional store arrived with MIPS II, so the
+       first of these has no way to change a word indivisibly. */
     {"mips1-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
-    {"mips32-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
-    {"mips64-gnu", CLASS_MIPS, GROUP_LEGACY, TF_64BIT},
-    {"micromips-gnu", CLASS_MIPS, GROUP_LEGACY, 0},
+    {"mips32-gnu", CLASS_MIPS, GROUP_LEGACY, TF_LLSC},
+    {"mips64-gnu", CLASS_MIPS, GROUP_LEGACY, TF_64BIT | TF_LLSC},
+    {"micromips-gnu", CLASS_MIPS, GROUP_LEGACY, TF_LLSC},
     {"power1-gnu", CLASS_PPC, GROUP_LEGACY, 0},
     {"power2-gnu", CLASS_PPC, GROUP_LEGACY, 0},
     {"ppc603-gnu", CLASS_PPC, GROUP_LEGACY, 0},
@@ -926,6 +929,7 @@ static unsigned target_caps(const char *target) {
            z/Architecture, cas.l on m68k. They have nothing else on this list,
            which is why they only appear here now. */
         case CLASS_MIPS:
+            return (desc->flags & TF_LLSC) ? CAP_ATOMIC : 0;
         case CLASS_PPC:
         case CLASS_S390:
         case CLASS_M68K:
@@ -4443,6 +4447,11 @@ static const char *mips_regs[] = {
    per instruction from the target, because the helpers below are shared. */
 static const char *mips_li_op = "li";
 
+/* Set when something needed the linked load and conditional store, so the
+   output says which instruction set it wants. The assembler assumes MIPS I
+   otherwise, where those do not exist. */
+static bool mips_llsc_used = false;
+
 static DeferredCompare mips_cmp = {CMP_NONE, {0}, {0}, false, "$t8", "$t9", "move", "li", false};
 
 static bool mips_is_64(const char *target) {
@@ -4683,7 +4692,11 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         compare_emit_branch(text, &mips_cmp, op, args[0], line_no);
         return;
     }
-    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  sync\n"); return; }
+    if (op_is(op, "fence") && argc == 0) {
+        mips_llsc_used = true;
+        buf_append(text, "  sync\n");
+        return;
+    }
     if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg") || op_is(op, "cas")) &&
         (argc == 2 || argc == 3)) {
         /* There is no read-modify-write instruction, only a linked load and
@@ -4699,6 +4712,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
         mips_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
         /* $at is normally left to the assembler's own macros. None of the
            instructions below need it, and nothing else here is free. */
+        mips_llsc_used = true;
         buf_append(text, "  .set noat\n");
         buf_appendf(text, "__cas_ext_%d:\n", again);
         buf_appendf(text, "  %s %s, %s\n", ll, MIPS_SCRATCH2, addr);
@@ -8564,6 +8578,10 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
                global is used, since the ABI leaves their role to the program. */
             if (is_sparc_target(target) && sparc_is_64(target)) {
                 buf_append(&out, ".register %g2, #scratch\n.register %g3, #scratch\n");
+            }
+            if (is_mips_target(target) && mips_llsc_used) {
+                buf_append(&out, target_word_bits(target) == 64 ? ".set mips3\n"
+                                                               : ".set mips2\n");
             }
             if (is_arm32_target(target) && arm_spill_used) {
                 buf_appendf(&out, ".lcomm %s, %d\n", X86_SPILL_SYMBOL, ARM_SPILL_COUNT * 4);
