@@ -225,9 +225,43 @@ $RegressRvText = Get-Content -Raw -Path $RegressRv
 if ($RegressX86Text -match "(?m)^  (mov|add|sub|xor|and|or|imul|neg|not|inc|dec|shl|shr|sar) (rsp|rbp)[,\r\n]") {
     throw "a virtual register was lowered onto rsp or rbp"
 }
-# Virtual registers past the machine register file need backing store.
-Assert-Contains $RegressX86 "__cas_spill: resq"
-Assert-Contains $RegressX86 "mov qword [rel __cas_spill+8], 111"
+# Registers past the machine register file need backing store. This program
+# names eight, which x86-64 has room for now that the slots go by use rather
+# than by number, so the machine to ask is the one with five.
+$RegressI386 = Join-Path $BuildPath "regress-pwsh-i386.asm"
+Invoke-NativeToFile $RegressI386 $CompilerExe @($RegressPath, "--target", "i386-nasm", "-o", "-")
+Assert-Contains $RegressI386 "__cas_spill: resd"
+
+# and a program that names more registers than any machine here has still
+# spills, wherever the slots are handed out from
+$AllSixteenPath = Join-Path $BuildPath "allsixteen-pwsh.cas"
+$AllSixteenAsm = Join-Path $BuildPath "allsixteen-pwsh.asm"
+@"
+.text
+global _start
+
+_start:
+  mov r0, 0
+  mov r1, 1
+  mov r2, 2
+  mov r3, 3
+  mov r4, 4
+  mov r5, 5
+  mov r6, 6
+  mov r7, 7
+  mov r8, 8
+  mov r9, 9
+  mov r10, 10
+  mov r11, 11
+  mov r12, 12
+  mov r13, 13
+  mov r14, 14
+  mov r15, 111
+  syscall exit, 0
+"@ | Set-Content -Path $AllSixteenPath -Encoding ascii
+Invoke-NativeToFile $AllSixteenAsm $CompilerExe @($AllSixteenPath, "--target", "x86_64-nasm", "-o", "-")
+Assert-Contains $AllSixteenAsm "__cas_spill: resq"
+Assert-Contains $AllSixteenAsm "mov qword [rel __cas_spill+24], 111"
 # A variable shift count has to reach cl; "shl reg, reg" does not assemble.
 Assert-Contains $RegressX86 "shl rax, cl"
 # idiv overwrites rdx, which carries a virtual register.

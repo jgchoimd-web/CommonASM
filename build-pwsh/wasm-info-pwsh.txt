@@ -1,0 +1,8 @@
+﻿target: wasm
+support: VM/IR
+output: WebAssembly text
+note: Assembly an assembler accepts; the portable subset, not a complete ABI-level port.
+word: 64-bit
+extended native: popcnt clz ctz rol ror
+extended expanded: bswap min max abs sel fence atomic_add atomic_xchg cas
+atomics: a plain load, change and store; right for one thread only

@@ -1,0 +1,15 @@
+﻿usage: commonasmc input.cas|- --target TARGET [-o output|-] [-O0|-O1]
+                  [--emulate-extended] [--translate-asm]
+       commonasmc --list-targets
+       commonasmc --target-info TARGET
+       commonasmc --version
+       commonasmc --help
+
+Use --list-targets to print every supported target.
+Use --target-info TARGET to inspect one target.
+Use --version to print the compiler version.
+Use -O1, -O, or --optimize to enable peephole code optimization.
+Use --emulate-extended to expand popcnt, clz, ctz, bswap, rol and ror
+instead of using the target's instructions for them.
+Use --translate-asm to lift an inline asm block written for another
+machine back into CommonASM, instead of failing for want of an arm.

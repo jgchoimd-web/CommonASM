@@ -1,0 +1,135 @@
+﻿CommonASM targets
+
+Primary:
+  x86_64-nasm
+  riscv64-gnu
+  rv64i-gnu
+  riscv64-zbb
+
+i386 aliases:
+  i386-nasm
+  ia32-nasm
+
+Mainstream/generic assembly:
+  armv4-gnu
+  armv5-gnu
+  armv7a-gnu
+  aarch64-gnu
+  thumb-gnu
+  thumb2-gnu
+  rv32i-gnu
+  rv128i-gnu         pseudo assembly
+  ia64-gnu           pseudo assembly
+  loongarch64-gnu
+
+Other CPU families:
+  mips1-gnu
+  mips32-gnu
+  mips64-gnu
+  micromips-gnu
+  power1-gnu
+  power2-gnu
+  ppc603-gnu
+  ppcg4-gnu
+  ppcg5-gnu
+  power9-gnu
+  power10-gnu
+  sparcv8-gnu
+  sparcv9-gnu
+  alpha-gnu
+  parisc-gnu
+  m88k-gnu           pseudo assembly
+  m68k
+  coldfire
+  avr                pseudo assembly
+  i8051              pseudo assembly
+  msp430             pseudo assembly
+  xtensa             pseudo assembly
+  superh
+  rx                 pseudo assembly
+  nios2
+  microblaze         pseudo assembly
+  arc                pseudo assembly
+  ptx                pseudo assembly
+  amdgcn             pseudo assembly
+  rdna               pseudo assembly
+  intelgen           pseudo assembly
+  cell-spe           pseudo assembly
+  tms320             pseudo assembly
+  dsp56000           pseudo assembly
+  blackfin           pseudo assembly
+  hexagon            pseudo assembly
+  ebpf               pseudo assembly
+  zarch
+
+VM/IR:
+  wasm
+  llvm-ir            pseudo assembly
+  gcc-gimple         pseudo assembly
+  gcc-rtl            pseudo assembly
+  jvm-bytecode       pseudo assembly
+  cil                pseudo assembly
+  dalvik             pseudo assembly
+  lua-bytecode       pseudo assembly
+  python-bytecode    pseudo assembly
+  spirv              pseudo assembly
+  evm                pseudo assembly
+
+Encoding/pseudo:
+  mos6502            pseudo assembly
+  wdc65c02           pseudo assembly
+  wdc65816           pseudo assembly
+  mos6510            pseudo assembly
+  i8008              pseudo assembly
+  i8080              pseudo assembly
+  i8085              pseudo assembly
+  z80                pseudo assembly
+  ez80               pseudo assembly
+  m6800              pseudo assembly
+  m6809              pseudo assembly
+  pic16              pseudo assembly
+  pic32              pseudo assembly
+  propeller          pseudo assembly
+  pdp1               pseudo assembly
+  pdp8               pseudo assembly
+  pdp11              pseudo assembly
+  vax                pseudo assembly
+  system360          pseudo assembly
+  system370          pseudo assembly
+  cdc6600            pseudo assembly
+  univac1            pseudo assembly
+  cray1              pseudo assembly
+  mix                pseudo assembly
+  lc3                pseudo assembly
+  lmc                pseudo assembly
+  marie              pseudo assembly
+  chip8              pseudo assembly
+  schip8             pseudo assembly
+  redcode            pseudo assembly
+  subleq             pseudo assembly
+  iota               pseudo assembly
+  jot                pseudo assembly
+  malbolge-asm       pseudo assembly
+  brainfuck          pseudo assembly
+  urisc              pseudo assembly
+  tta                pseudo assembly
+  secd               pseudo assembly
+  pcode              pseudo assembly
+  zmachine           pseudo assembly
+  sweet16            pseudo assembly
+  befunge            pseudo assembly
+  bitblt-vm          pseudo assembly
+  turing-machine     pseudo assembly
+  unlambda           pseudo assembly
+
+Special assembly:
+  mmixal             pseudo assembly
+  dcpu16             pseudo assembly
+
+Source encoding:
+  fractran           pseudo assembly
+  cellular-automaton pseudo assembly
+
+A name on its own emits assembly for a real assembler. One marked
+pseudo assembly emits readable text in that machine's shape, meant
+for reading and for porting from, not for assembling.

@@ -1,0 +1,8 @@
+﻿target: brainfuck
+support: Encoding/pseudo
+output: pseudo assembly or toy-machine text output
+note: Experimental pseudo or encoding output for very different machine models.
+word: 64-bit
+extended native: none
+extended expanded: popcnt clz ctz bswap rol ror min max abs sel fence atomic_add atomic_xchg cas
+atomics: a plain load, change and store; right for one thread only
