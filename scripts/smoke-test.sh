@@ -453,9 +453,11 @@ fi
 # all of them to print the same thing. Assembling says the text was
 # well-formed; this says the arithmetic, the control flow, the memory and the
 # syscalls all do what they were supposed to.
+KERNEL_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 "
+SORT_EXPECTED="-8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4 "
 EXEC_PROGRAM=tests/exec-kernel.cas
 EXEC_NAME=kernel
-EXEC_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 "
+EXEC_EXPECTED="$KERNEL_EXPECTED"
 exec_failures=0
 exec_ran=0
 
@@ -544,7 +546,7 @@ run_exec_everywhere
 # that never reaches the awkward paths.
 EXEC_PROGRAM=demos/sort/sort.cas
 EXEC_NAME=sort
-EXEC_EXPECTED="-8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4 "
+EXEC_EXPECTED="$SORT_EXPECTED"
 run_exec_everywhere
 
 if [ "$exec_failures" -ne 0 ]; then
@@ -562,21 +564,30 @@ if command -v wat2wasm > /dev/null 2>&1; then
     wat2wasm "$BUILD_DIR/wasm-${name}.wat" -o "$BUILD_DIR/wasm-${name}.wasm"
   done
   echo "wat2wasm assembled and validated every wasm output."
-  # And then the same program the emulated machines run, run here too. wasm
+  # And then the same programs the emulated machines run, run here too. wasm
   # needs no emulator and no cross toolchain, so this works anywhere node and
-  # wat2wasm both are, Linux or not.
+  # wat2wasm both are, Linux or not. Each program is given its own expected
+  # line rather than reading whichever one was set last.
   if command -v node > /dev/null 2>&1; then
-    "$BUILD_DIR/commonasmc" "$ROOT_DIR/tests/exec-kernel.cas" --target wasm -O1 \
-      -o "$BUILD_DIR/exec-wasm.wat"
-    wat2wasm "$BUILD_DIR/exec-wasm.wat" -o "$BUILD_DIR/exec-wasm.wasm"
-    node "$ROOT_DIR/tests/wasm-run.js" "$BUILD_DIR/exec-wasm.wasm" > "$BUILD_DIR/exec-wasm.txt" 2>&1 || true
-    if [ "$(cat "$BUILD_DIR/exec-wasm.txt")" = "$EXEC_EXPECTED" ]; then
-      echo "  wasm: ran and printed the expected line"
-    else
-      echo "  wasm: printed [$(cat "$BUILD_DIR/exec-wasm.txt")]"
-      echo "        expected [$EXEC_EXPECTED]"
-      exit 1
-    fi
+    run_exec_wasm() {
+      wasm_name=$1
+      wasm_program=$2
+      wasm_expected=$3
+      "$BUILD_DIR/commonasmc" "$ROOT_DIR/$wasm_program" --target wasm -O1 \
+        -o "$BUILD_DIR/exec-$wasm_name-wasm.wat"
+      wat2wasm "$BUILD_DIR/exec-$wasm_name-wasm.wat" -o "$BUILD_DIR/exec-$wasm_name-wasm.wasm"
+      node "$ROOT_DIR/tests/wasm-run.js" "$BUILD_DIR/exec-$wasm_name-wasm.wasm" \
+        > "$BUILD_DIR/exec-$wasm_name-wasm.txt" 2>&1 || true
+      if [ "$(cat "$BUILD_DIR/exec-$wasm_name-wasm.txt")" = "$wasm_expected" ]; then
+        echo "  $wasm_name/wasm: ran and printed the expected line"
+      else
+        echo "  $wasm_name/wasm: printed [$(cat "$BUILD_DIR/exec-$wasm_name-wasm.txt")]"
+        echo "                   expected [$wasm_expected]"
+        exit 1
+      fi
+    }
+    run_exec_wasm kernel tests/exec-kernel.cas "$KERNEL_EXPECTED"
+    run_exec_wasm sort demos/sort/sort.cas "$SORT_EXPECTED"
   else
     echo "no node found; skipped running the wasm output."
   fi
