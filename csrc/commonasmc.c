@@ -120,6 +120,9 @@ static const char *arm_regs[] = {
 #define ARM_SCRATCH2 "r12"
 
 static unsigned arm_spill_used = 0;
+/* Numbers the labels an expansion or a retry loop branches over. Nothing in
+   the language can produce this spelling. */
+static int ext_label_serial = 0;
 /* Set when something divided, so the divide routine is written out. */
 static bool arm_divmod_used = false;
 
@@ -270,7 +273,8 @@ enum {
     CAP_ROT = 1u << 4,
     CAP_MINMAX = 1u << 5,
     CAP_ABS = 1u << 6,
-    CAP_SEL = 1u << 7
+    CAP_SEL = 1u << 7,
+    CAP_ATOMIC = 1u << 8
 };
 
 typedef struct {
@@ -870,7 +874,7 @@ static unsigned target_caps(const char *target) {
                reported by --target-info so the requirement is not hidden.
                min, max and sel are a compare and a cmov, which is 686. */
             return CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT |
-                   CAP_MINMAX | CAP_SEL;
+                   CAP_MINMAX | CAP_SEL | CAP_ATOMIC;
         case CLASS_I386:
             /* bswap is 486, and the rotates are 386. bsr and bsf could serve
                for clz and ctz but they leave the result undefined for a zero
@@ -879,8 +883,10 @@ static unsigned target_caps(const char *target) {
         case CLASS_RISCV:
             /* Zbb carries min and max themselves, as three-operand
                instructions, but nothing for abs or a select. */
-            return (desc->flags & TF_RV_ZBB)
-                 ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT | CAP_MINMAX) : 0;
+            /* The atomic memory operations are their own extension, which
+               every RISC-V Linux target has. */
+            return CAP_ATOMIC | ((desc->flags & TF_RV_ZBB)
+                 ? (CAP_POPCNT | CAP_CLZ | CAP_CTZ | CAP_BSWAP | CAP_ROT | CAP_MINMAX) : 0);
         case CLASS_LOONG:
             /* Counting leading and trailing zeros, reversing bytes and
                rotating are all single instructions; counting set bits is not,
@@ -951,7 +957,15 @@ static const ExtendedOp extended_ops[] = {
     {"min", CAP_MINMAX, 2},
     {"max", CAP_MINMAX, 2},
     {"abs", CAP_ABS, 1},
-    {"sel", CAP_SEL, 3}
+    {"sel", CAP_SEL, 3},
+    /* The atomic ones. A machine with a read-modify-write instruction gets
+       it; one without gets a plain load, change and store, which is what the
+       program would have done by hand and is right on a machine that only
+       ever runs one thread. --target-info says which a target is. */
+    {"fence", CAP_ATOMIC, 0},
+    {"atomic_add", CAP_ATOMIC, 2},
+    {"atomic_xchg", CAP_ATOMIC, 2},
+    {"cas", CAP_ATOMIC, 3}
 };
 
 #define EXTENDED_OP_COUNT (sizeof(extended_ops) / sizeof(extended_ops[0]))
@@ -1113,6 +1127,12 @@ static void print_target_info(const char *target) {
             }
         }
         printf("\n");
+        /* The atomic operations expand like the rest, but what the expansion
+           loses is not speed, it is indivisibility - so it is worth saying
+           outright rather than leaving to be read off the list above. */
+        printf("atomics: %s\n", (caps & CAP_ATOMIC)
+               ? "indivisible, using the machine's own instructions"
+               : "a plain load, change and store; right for one thread only");
         if (target_has_class(target, CLASS_X86_64) && caps != 0) {
             printf("requires: POPCNT for popcnt, LZCNT/BMI1 for clz and ctz;"
                    " use --emulate-extended for CPUs without them\n");
@@ -3494,6 +3514,43 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         }
         return;
     }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  mfence\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg")) && argc == 2) {
+        /* xadd answers with the old value in the register it was handed, and
+           xchg locks itself whether or not it is asked to. Both want that to
+           be a register, so a spilled one goes through the scratch. */
+        char addr[256];
+        bool spilled = x86_reg_is_spilled(args[0]);
+        const char *val = spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op);
+        if (spilled) buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+        x86_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        if (op_is(op, "atomic_add")) buf_appendf(text, "  lock xadd %s, %s\n", addr, val);
+        else buf_appendf(text, "  xchg %s, %s\n", val, addr);
+        if (spilled) buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        return;
+    }
+    if (op_is(op, "cas") && argc == 3) {
+        /* cmpxchg compares against rax and replaces from a register, so the
+           expected value goes to rax and a replacement with no register of
+           its own is borrowed into rcx and put back. */
+        char addr[256];
+        bool borrowed = virtual_reg_index(args[2]) < 0 || x86_reg_is_spilled(args[2]);
+        const char *newv = borrowed ? "rcx" : x86_reg(args[2], line_no, op);
+        buf_appendf(text, "  mov %s, %s\n", X86_SCRATCH, x86_reg(args[0], line_no, op));
+        if (borrowed) {
+            buf_append(text, "  push rcx\n");
+            buf_appendf(text, "  mov rcx, %s\n", x86_operand(args[2], line_no, op));
+        }
+        x86_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
+        buf_appendf(text, "  lock cmpxchg %s, %s\n", addr, newv);
+        if (borrowed) buf_append(text, "  pop rcx\n");
+        if (x86_reg_is_spilled(args[0])) {
+            buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        } else {
+            buf_appendf(text, "  mov %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
+        }
+        return;
+    }
     if (op_is(op, "bswap") && argc == 1) {
         /* bswap takes a register only. */
         if (x86_reg_is_spilled(args[0])) {
@@ -3851,6 +3908,55 @@ static void emit_rv_instruction(Buffer *text, const char *target, const char *op
         buf_appendf(text, "  %s %s, %s, %s\n", op, dst, dst, RV_SCRATCH);
         return;
     }
+    if (op_is(op, "fence") && argc == 0) { buf_append(text, "  fence rw, rw\n"); return; }
+    if ((op_is(op, "atomic_add") || op_is(op, "atomic_xchg")) && argc == 2) {
+        /* The atomic memory operations answer with the old value and want
+           the address in a register with no displacement on it. */
+        long long off = 0;
+        const char *base;
+        const char *dst = rv_reg(args[0], line_no, op);
+        const char *native = op_is(op, "atomic_add")
+                           ? (wide ? "amoadd.d" : "amoadd.w") : (wide ? "amoswap.d" : "amoswap.w");
+        rv_emit_address_setup(text, args[1], RV_SCRATCH, line_no, op);
+        base = rv_address_base(args[1], RV_SCRATCH, line_no, op, &off);
+        if (off != 0) {
+            buf_appendf(text, "  addi %s, %s, %lld\n", RV_SCRATCH, base, off);
+            base = RV_SCRATCH;
+        }
+        buf_appendf(text, "  %s %s, %s, (%s)\n", native, dst, dst, base);
+        return;
+    }
+    if (op_is(op, "cas") && argc == 3) {
+        /* There is no compare-and-swap instruction, so this is the reserve
+           and store-conditional pair it is built from, retried until the
+           store sticks. */
+        int taken = ++ext_label_serial;
+        int done = ++ext_label_serial;
+        long long off = 0;
+        const char *base;
+        const char *dst = rv_reg(args[0], line_no, op);
+        const char *newv = rv_reg(args[2], line_no, op);
+        const char *lr = wide ? "lr.d" : "lr.w";
+        const char *sc = wide ? "sc.d" : "sc.w";
+        rv_emit_address_setup(text, args[1], RV_SCRATCH, line_no, op);
+        base = rv_address_base(args[1], RV_SCRATCH, line_no, op, &off);
+        if (off != 0) {
+            buf_appendf(text, "  addi %s, %s, %lld\n", RV_SCRATCH, base, off);
+        } else if (strcmp(base, RV_SCRATCH) != 0) {
+            buf_appendf(text, "  mv %s, %s\n", RV_SCRATCH, base);
+        }
+        buf_appendf(text, "__cas_ext_%d:\n", taken);
+        buf_appendf(text, "  %s a7, (%s)\n", lr, RV_SCRATCH);
+        buf_appendf(text, "  bne a7, %s, __cas_ext_%d\n", dst, done);
+        /* a5 carries the store-conditional's answer. No virtual register
+           lives in an argument register, so borrowing one costs nothing;
+           t0 would have been virtual r0. */
+        buf_appendf(text, "  %s a5, %s, (%s)\n", sc, newv, RV_SCRATCH);
+        buf_appendf(text, "  bnez a5, __cas_ext_%d\n", taken);
+        buf_appendf(text, "__cas_ext_%d:\n", done);
+        buf_appendf(text, "  mv %s, a7\n", dst);
+        return;
+    }
     if ((op_is(op, "popcnt") || op_is(op, "clz") || op_is(op, "ctz") || op_is(op, "bswap")) && argc == 1) {
         /* Only reached on a target whose capabilities include these, which
            today means the bit-manipulation extension. */
@@ -4117,10 +4223,6 @@ static void ext_expand_rotate(Buffer *text, const char *target, int line_no,
     emit_cas(text, target, line_no, "pop r%d", s1);
 }
 
-/* Labels the expansions below branch over. Nothing in the language can
-   produce this spelling, since a source label cannot start with a digit and
-   these are only ever emitted here. */
-static int ext_label_serial = 0;
 
 static void ext_expand_abs(Buffer *text, const char *target, int line_no, const char *dst) {
     int bits = target_word_bits(target);
@@ -4164,6 +4266,41 @@ static void ext_expand_sel(Buffer *text, const char *target, int line_no,
     emit_cas(text, target, line_no, "__cas_ext_%d:", done);
 }
 
+/* A read-modify-write on a machine with nothing to make it indivisible: read
+   the old value, put the new one back, and answer with the old. That is right
+   as long as nothing else is touching the word at the same time, which on a
+   machine with no atomic instruction is the only case there is. */
+static void ext_expand_atomic_rmw(Buffer *text, const char *target, int line_no,
+                                  const char *dst, const char *addr, bool adding) {
+    int s1, s2;
+    ext_pick_scratch(target, dst, NULL, &s1, &s2);
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "load.q r%d, %s", s1, addr);
+    if (adding) {
+        emit_cas(text, target, line_no, "add %s, r%d", dst, s1);
+    }
+    emit_cas(text, target, line_no, "store.q %s, %s", addr, dst);
+    emit_cas(text, target, line_no, "mov %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
+static void ext_expand_cas(Buffer *text, const char *target, int line_no,
+                           const char *dst, const char *addr, const char *replacement) {
+    int serial = ++ext_label_serial;
+    int s1, s2;
+    ext_pick_scratch(target, dst, replacement, &s1, &s2);
+    emit_cas(text, target, line_no, "push r%d", s1);
+    emit_cas(text, target, line_no, "load.q r%d, %s", s1, addr);
+    emit_cas(text, target, line_no, "cmp r%d, %s", s1, dst);
+    emit_cas(text, target, line_no, "jne __cas_ext_%d", serial);
+    emit_cas(text, target, line_no, "store.q %s, %s", addr, replacement);
+    emit_cas(text, target, line_no, "__cas_ext_%d:", serial);
+    emit_cas(text, target, line_no, "mov %s, r%d", dst, s1);
+    emit_cas(text, target, line_no, "pop r%d", s1);
+    (void)s2;
+}
+
 /* True when the operation was handled here, either because the target has no
    instruction for it or because it is not an extended operation at all. */
 static bool emit_extended_fallback(Buffer *text, const char *target, const char *op,
@@ -4173,7 +4310,7 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
     if (argc != ext->argc) {
         line_error(line_no, op, "wrong argument count for extended operation");
     }
-    if (virtual_reg_index(args[0]) < 0) {
+    if (ext->argc > 0 && virtual_reg_index(args[0]) < 0) {
         line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
     }
     if ((target_caps(target) & ext->cap) != 0) {
@@ -4188,6 +4325,14 @@ static bool emit_extended_fallback(Buffer *text, const char *target, const char 
         ext_expand_minmax(text, target, line_no, args[0], args[1], strcmp(op, "min") == 0);
     } else if (strcmp(op, "sel") == 0) {
         ext_expand_sel(text, target, line_no, args[0], args[1], args[2]);
+    } else if (strcmp(op, "fence") == 0) {
+        /* Nothing. A machine with no barrier instruction is one with nothing
+           to stop it doing. */
+    } else if (strcmp(op, "atomic_add") == 0 || strcmp(op, "atomic_xchg") == 0) {
+        ext_expand_atomic_rmw(text, target, line_no, args[0], args[1],
+                              strcmp(op, "atomic_add") == 0);
+    } else if (strcmp(op, "cas") == 0) {
+        ext_expand_cas(text, target, line_no, args[0], args[1], args[2]);
     } else ext_expand_rotate(text, target, line_no, args[0], args[1], strcmp(op, "rol") == 0);
     return true;
 }

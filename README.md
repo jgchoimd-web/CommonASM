@@ -340,6 +340,35 @@ and for `min`:
 | `x86_64-nasm` | `cmp`, `cmovg` |
 | everything else | a compare and a branch over one move |
 
+### Atomics
+
+Four more, which follow the same rule with one difference worth stating
+plainly: what a machine without the instruction loses is not speed, it is
+indivisibility.
+
+- `fence`: a full memory barrier
+- `atomic_add rD, [addr]`: adds `rD` to the word at `addr` and answers with
+  what was there before
+- `atomic_xchg rD, [addr]`: puts `rD` there and answers with what was there
+- `cas rD, [addr], rNew`: replaces the word with `rNew` if it still equals
+  `rD`, and answers with what was there either way, so comparing `rD` against
+  what it was says whether the swap happened
+
+| target | `atomic_add` |
+| --- | --- |
+| `x86_64-nasm` | `lock xadd` |
+| `riscv64-gnu` | `amoadd.d` |
+| everything else | a load, an add and a store |
+
+That last row is a real difference, not a slower way of doing the same thing.
+It is correct for a program with one thread and wrong for one with two, so
+`--target-info` says which a target is in as many words:
+
+```text
+atomics: indivisible, using the machine's own instructions
+atomics: a plain load, change and store; right for one thread only
+```
+
 An extended operation may leave the flags in any state, so a `cmp` does not
 survive across one. That has always been true — the expansions are arithmetic,
 and arithmetic sets flags — and it is worth saying out loud now that some of

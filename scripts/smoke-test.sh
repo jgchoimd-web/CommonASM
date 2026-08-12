@@ -427,7 +427,7 @@ if command -v riscv64-linux-gnu-as > /dev/null 2>&1; then
     # multiply and divide are the M extension, which the target has always
     # emitted and which the bare name rv32i does not promise.
     "$BUILD_DIR/commonasmc" "$example" --target rv32i-gnu -o "$BUILD_DIR/rv-rv32i-${name}.s"
-    riscv64-linux-gnu-as -march=rv32im -mabi=ilp32 \
+    riscv64-linux-gnu-as -march=rv32ima -mabi=ilp32 \
       -o "$BUILD_DIR/rv-rv32i-${name}.o" "$BUILD_DIR/rv-rv32i-${name}.s"
   done
   echo "the RISC-V assembler accepted every riscv64-gnu, riscv64-zbb and rv32i-gnu output."
@@ -541,7 +541,7 @@ fi
 # all of them to print the same thing. Assembling says the text was
 # well-formed; this says the arithmetic, the control flow, the memory and the
 # syscalls all do what they were supposed to.
-KERNEL_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 "
+KERNEL_EXPECTED="67 6 60 61 15 96 64 25 8 8 64 45 7 100 105 105 7 9 9 9 "
 SORT_EXPECTED="-8 3 4 7 12 15 23 41 55 62 88 91 | min -8 max 91 sum 393 spread 99 over50 4 "
 EXEC_PROGRAM=tests/exec-kernel.cas
 EXEC_NAME=kernel
@@ -614,7 +614,7 @@ run_exec_everywhere() {
   run_exec_case aarch64-gnu aarch64-linux-gnu-as "" aarch64-linux-gnu-ld "" qemu-aarch64-static
   run_exec_case armv7a-gnu  arm-linux-gnueabi-as "" arm-linux-gnueabi-ld "" qemu-arm-static
   run_exec_case riscv64-gnu riscv64-linux-gnu-as "" riscv64-linux-gnu-ld "" qemu-riscv64-static
-  run_exec_case rv32i-gnu   riscv64-linux-gnu-as "-march=rv32im -mabi=ilp32" \
+  run_exec_case rv32i-gnu   riscv64-linux-gnu-as "-march=rv32ima -mabi=ilp32" \
                             riscv64-linux-gnu-ld "-m elf32lriscv" qemu-riscv32-static
   # A MIPS linker looks for __start rather than _start, so it is told the name.
   run_exec_case mips32-gnu  mips-linux-gnu-as "" mips-linux-gnu-ld "-e _start" qemu-mips-static
