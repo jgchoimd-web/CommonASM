@@ -514,6 +514,17 @@ else
   echo "no m68k assembler found; skipped assembling the m68k output."
 fi
 
+if command -v loongarch64-linux-gnu-as > /dev/null 2>&1; then
+  for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
+    name=$(basename "$example" .cas)
+    "$BUILD_DIR/commonasmc" "$example" --target loongarch64-gnu -o "$BUILD_DIR/loong-${name}.s"
+    loongarch64-linux-gnu-as -o "$BUILD_DIR/loong-${name}.o" "$BUILD_DIR/loong-${name}.s"
+  done
+  echo "the LoongArch assembler accepted every loongarch64-gnu output."
+else
+  echo "no LoongArch assembler found; skipped assembling the LoongArch output."
+fi
+
 if command -v s390x-linux-gnu-as > /dev/null 2>&1; then
   for example in "$ROOT_DIR"/examples/*.cas "$BUILD_DIR/regress.cas"; do
     name=$(basename "$example" .cas)
@@ -611,6 +622,7 @@ run_exec_everywhere() {
   run_exec_case sparcv8-gnu sparc64-linux-gnu-as "-32" sparc64-linux-gnu-ld "-m elf32_sparc" qemu-sparc-static
   run_exec_case m68k        m68k-linux-gnu-as "" m68k-linux-gnu-ld "" qemu-m68k-static
   run_exec_case zarch       s390x-linux-gnu-as "" s390x-linux-gnu-ld "" qemu-s390x-static
+  run_exec_case loongarch64-gnu loongarch64-linux-gnu-as "" loongarch64-linux-gnu-ld ""                             qemu-loongarch64-static
 }
 
 if [ "$exec_skipped" = "0" ]; then

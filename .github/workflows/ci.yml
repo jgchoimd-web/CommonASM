@@ -28,6 +28,10 @@ jobs:
             binutils-s390x-linux-gnu binutils-aarch64-linux-gnu \
             binutils-arm-linux-gnueabi wabt qemu-user-static gcc-multilib
 
+      - name: Install the LoongArch assembler, if this image has one
+        run: |
+          sudo apt-get install -y binutils-loongarch64-linux-gnu             || echo "no LoongArch assembler in this image; that step will skip"
+
       - name: Run POSIX smoke tests
         run: make smoke
 
