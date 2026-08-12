@@ -47,22 +47,31 @@ The rest is assembly-shaped text rather than assembly, and says so under
 freestanding multiboot kernel and a guessing game on raw syscalls. What
 writing them changed is recorded in `demos/README.md`.
 
-Primary:
+Executed on every commit — built, linked, and run under emulation, all
+required to print the same thing:
 
-- `x86_64-nasm`
-- `riscv64-gnu`
+- `x86_64-nasm`, `i386-nasm`
+- `aarch64-gnu`, `armv7a-gnu`
+- `riscv64-gnu`, `rv32i-gnu`
+- `mips32-gnu`, `ppcg4-gnu`, `sparcv8-gnu`, `m68k`, `zarch`
+- `wasm`, through node
 
-Experimental assembly/IR:
+Assembled on every commit — real assembly a real assembler accepts, sharing
+the emitters above, but with nothing here to run them on:
 
-- `i386-nasm`, `ia32-nasm`
-- `armv4-gnu`, `armv5-gnu`, `armv7a-gnu`, `aarch64-gnu`, `thumb-gnu`, `thumb2-gnu`
-- `rv32i-gnu`, `rv64i-gnu`, `rv128i-gnu`, `ia64-gnu`, `loongarch64-gnu`
-- `mips1-gnu`, `mips32-gnu`, `mips64-gnu`, `micromips-gnu`
-- `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg4-gnu`, `ppcg5-gnu`, `power9-gnu`, `power10-gnu`
-- `sparcv8-gnu`, `sparcv9-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
-- `m68k`, `coldfire`, `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
-- `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`, `zarch`
-- `wasm`, `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
+- `ia32-nasm`, `rv64i-gnu`, `riscv64-zbb`
+- `armv4-gnu`, `armv5-gnu`, `thumb-gnu`, `thumb2-gnu`
+- `mips1-gnu`, `mips64-gnu`, `micromips-gnu`
+- `power1-gnu`, `power2-gnu`, `ppc603-gnu`, `ppcg5-gnu`, `power9-gnu`, `power10-gnu`
+- `sparcv9-gnu`, `coldfire`
+
+Pseudo assembly — readable text in that machine's shape, for reading and for
+porting from, not for assembling:
+
+- `rv128i-gnu`, `ia64-gnu`, `loongarch64-gnu`, `alpha-gnu`, `parisc-gnu`, `m88k-gnu`
+- `avr`, `i8051`, `msp430`, `xtensa`, `superh`, `rx`, `nios2`, `microblaze`, `arc`
+- `ptx`, `amdgcn`, `rdna`, `intelgen`, `cell-spe`, `tms320`, `dsp56000`, `blackfin`, `hexagon`, `ebpf`
+- `llvm-ir`, `gcc-gimple`, `gcc-rtl`, `jvm-bytecode`, `cil`, `dalvik`, `lua-bytecode`, `python-bytecode`, `spirv`, `evm`
 - `mmixal`, `dcpu16`
 
 Encoding/pseudo:
@@ -73,9 +82,14 @@ Encoding/pseudo:
 - `mix`, `lc3`, `lmc`, `marie`, `chip8`, `schip8`, `redcode`, `subleq`, `urisc`, `tta`
 - `fractran`, `iota`, `jot`, `malbolge-asm`, `brainfuck`, `secd`, `pcode`, `zmachine`, `sweet16`, `befunge`, `bitblt-vm`, `turing-machine`, `cellular-automaton`, `unlambda`
 
-The experimental targets are portable-subset outputs, not complete ABI-level ports.
-Pseudo and encoding targets use comments, toy assembly, or source encodings when the
-machine model does not match Linux syscalls or random-access memory.
+Everything above the pseudo line is portable-subset output, not a complete
+ABI-level port. Pseudo and encoding targets use comments, toy assembly, or
+source encodings when the machine model does not match Linux syscalls or
+random-access memory.
+
+`--list-targets` marks the pseudo ones, and `--target-info TARGET` says which
+of the three a target is in. Both ask the target rather than consulting a
+list, so neither can go stale when a backend is added.
 
 ## Compiler implementations
 

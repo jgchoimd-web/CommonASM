@@ -953,7 +953,7 @@ static const char *group_title(TargetGroup group) {
         case GROUP_PRIMARY: return "Primary";
         case GROUP_I386: return "i386 aliases";
         case GROUP_GENERIC: return "Mainstream/generic assembly";
-        case GROUP_LEGACY: return "Experimental assembly/IR";
+        case GROUP_LEGACY: return "Other CPU families";
         case GROUP_VM_IR: return "VM/IR";
         case GROUP_TOY: return "Encoding/pseudo";
         case GROUP_SPECIAL: return "Special assembly";
@@ -962,33 +962,42 @@ static const char *group_title(TargetGroup group) {
     }
 }
 
+static bool target_emits_assembly(const TargetDesc *desc);
+
+/* The groups are families - every MIPS together, every PowerPC together - and
+   say nothing about how far a target has got. Whether one has a backend of
+   its own is asked of the target rather than looked up in a second list,
+   which is what let this listing go on calling machines experimental for
+   months after they had been assembling and running on every commit. */
 static void print_target_list(void) {
     puts("CommonASM targets\n");
     for (int group = 0; group < GROUP_COUNT; group++) {
         printf("%s:\n", group_title((TargetGroup)group));
         for (size_t i = 0; i < TARGET_COUNT; i++) {
-            if (target_table[i].group == (TargetGroup)group) {
+            if (target_table[i].group != (TargetGroup)group) continue;
+            if (target_emits_assembly(&target_table[i])) {
                 printf("  %s\n", target_table[i].name);
+            } else {
+                printf("  %-18s pseudo assembly\n", target_table[i].name);
             }
         }
         printf("\n");
     }
+    puts("A name on its own emits assembly for a real assembler. One marked");
+    puts("pseudo assembly emits readable text in that machine's shape, meant");
+    puts("for reading and for porting from, not for assembling.");
 }
 
 static const char *target_support_level(const char *target) {
     const TargetDesc *desc = target_lookup(target);
     if (!desc) return "Unknown";
-    switch (desc->group) {
-        case GROUP_PRIMARY: return "Primary";
-        case GROUP_I386:
-        case GROUP_GENERIC:
-        case GROUP_LEGACY:
-        case GROUP_SPECIAL: return "Experimental assembly/IR";
-        case GROUP_VM_IR: return "VM/IR";
-        case GROUP_TOY:
-        case GROUP_ENCODING: return "Encoding/pseudo";
-        default: return "Unknown";
-    }
+    if (desc->group == GROUP_PRIMARY) return "Primary";
+    if (desc->group == GROUP_VM_IR) return "VM/IR";
+    if (desc->group == GROUP_TOY || desc->group == GROUP_ENCODING) return "Encoding/pseudo";
+    /* Everything else answers for itself rather than inheriting its family's
+       reputation: mips32-gnu assembles and runs, msp430 does not, and they
+       are in the same group. */
+    return target_emits_assembly(desc) ? "Assembly" : "Pseudo assembly";
 }
 
 /* True when the target has a backend of its own rather than sharing the
