@@ -106,6 +106,31 @@ for pair in "aarch64-gnu@str x30" "armv7a-gnu@push {lr}" "riscv64-gnu@sd ra, 0(s
 done
 echo "a nested call keeps its return address, and a leaf does not pay for it."
 
+# i386 has ebp to allocate unless the program asks for a stack frame.
+printf '.text
+global _start
+_start:
+  mov r4, 7
+  syscall exit, 0
+' > "$BUILD_DIR/noframe.cas"
+printf '.text
+global _start
+_start:
+  enter 0
+  mov r4, 7
+  leave
+  syscall exit, 0
+'   > "$BUILD_DIR/withframe.cas"
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/noframe.cas" --target i386-nasm -O1 -o "$BUILD_DIR/noframe.asm"
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/withframe.cas" --target i386-nasm -O1 -o "$BUILD_DIR/withframe.asm"
+grep -q "mov ebp, 7" "$BUILD_DIR/noframe.asm"
+if grep -q "mov ebp, 7" "$BUILD_DIR/withframe.asm"; then
+  echo "i386 handed out ebp to a program that wanted a frame pointer"
+  exit 1
+fi
+grep -q "__cas_spill" "$BUILD_DIR/withframe.asm"
+echo "i386 allocates ebp, except where a frame needs it."
+
 # Multiplying a value the compiler cannot see by a power of two is a shift.
 cat > "$BUILD_DIR/strength.cas" <<'CAS'
 .bss

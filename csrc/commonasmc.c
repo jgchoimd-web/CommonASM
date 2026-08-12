@@ -81,19 +81,27 @@ static const char *dcpu_regs[] = {
    twelve virtual registers get spill slots. Reserving edx also means the
    division sequence has it free without saving anything. */
 static const char *i386_regs[] = {
-    "ebx", "ecx", "esi", "edi"
+    "ebx", "ecx", "esi", "edi", "ebp"
 };
 static const char *i386_regs_w[] = {
-    "bx", "cx", "si", "di"
+    "bx", "cx", "si", "di", "bp"
 };
-/* 32-bit x86 has no 8-bit view of esi or edi, so a byte store from one of
-   those has to go through the scratch; ebx and ecx do not. */
+/* 32-bit x86 has no 8-bit view of esi, edi or ebp, so a byte store from one
+   of those has to go through the scratch; ebx and ecx do not. */
 static const char *i386_regs_b[] = {
-    "bl", "cl", NULL, NULL
+    "bl", "cl", NULL, NULL, NULL
 };
 
-#define I386_MAPPED_COUNT ((int)(sizeof(i386_regs) / sizeof(i386_regs[0])))
-#define I386_SPILL_COUNT (16 - I386_MAPPED_COUNT)
+/* ebp is the frame pointer only for a program that asks for a frame, which
+   is what enter and leave do. Nothing else here needs it: the 32-bit syscall
+   convention stops at edi, and a spill slot is reached through the spill
+   symbol rather than through a frame. A program that never says enter gets a
+   fifth machine register out of it, which on a machine with four is worth
+   having. Set to four when the source does use a frame. */
+static int i386_mapped_count = 5;
+
+#define I386_MAPPED_COUNT i386_mapped_count
+#define I386_SPILL_COUNT (16 - i386_mapped_count)
 #define I386_SCRATCH "eax"
 #define I386_ADDR_SCRATCH "edx"
 
@@ -1445,6 +1453,26 @@ static void scan_functions_that_call(const char *source) {
         if (!end) break;
         p = end + 1;
     }
+}
+
+/* True when the source asks for a stack frame anywhere, which is the only
+   thing that needs a frame pointer. */
+static bool source_uses_frame(const char *source) {
+    const char *p = source;
+    while (*p) {
+        const char *line = p;
+        const char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        while (len > 0 && isspace((unsigned char)*line)) { line++; len--; }
+        while (len > 0 && isspace((unsigned char)line[len - 1])) len--;
+        if ((len > 6 && strncmp(line, "enter ", 6) == 0) ||
+            (len == 5 && strncmp(line, "leave", 5) == 0)) {
+            return true;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return false;
 }
 
 /* Whether this function has to preserve the link register, answered at the
@@ -7418,6 +7446,7 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     /* Scanned before the loop starts chopping the source into lines. */
     mentioned_vregs = scan_mentioned_vregs(source);
     scan_functions_that_call(source);
+    if (source_uses_frame(source)) i386_mapped_count = 4;
     if (is_wasm_target(target)) wasm_begin();
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;
