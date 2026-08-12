@@ -305,6 +305,14 @@ Virtual registers keep their values across everything the compiler emits,
 including `syscall`, which saves and restores whatever the call would
 otherwise overwrite.
 
+A load narrower than the register sign-extends: `load.b`, `load.w` and
+`load.d` all read a signed value. This is the only rule under which a 32-bit
+machine and a 64-bit one agree, since `load.d` fills the register on the first
+and leaves half of it to fill on the second. Everything else in the language
+is signed too — `mul`, `div`, `cmp` and `sar` all are — so this is the rule
+that matches them. Read an unsigned byte with `load.b` followed by
+`and rD, 0xff`.
+
 ## Extended operations
 
 A portable assembly that can only reach the instructions every machine shares

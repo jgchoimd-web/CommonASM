@@ -2283,7 +2283,7 @@ static void emit_i386_instruction(Buffer *text, const char *op, const char *size
         bool spilled = i386_reg_is_spilled(args[0]);
         i386_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
         if (strcmp(size, "b") == 0 || strcmp(size, "w") == 0) {
-            buf_appendf(text, "  movzx %s, %s %s\n", spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op),
+            buf_appendf(text, "  movsx %s, %s %s\n", spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op),
                         i386_size_word(size), addr);
         } else {
             buf_appendf(text, "  mov %s, dword %s\n", spilled ? I386_SCRATCH : i386_reg(args[0], line_no, op), addr);
@@ -2589,7 +2589,7 @@ static void emit_arm_instruction(Buffer *text, const char *op, const char *size,
     if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = arm_reg_is_spilled(args[0]) ? ARM_SCRATCH2 : arm_regs[virtual_reg_index(args[0])];
-        const char *mnemonic = strcmp(size, "b") == 0 ? "ldrb" : strcmp(size, "w") == 0 ? "ldrh" : "ldr";
+        const char *mnemonic = strcmp(size, "b") == 0 ? "ldrsb" : strcmp(size, "w") == 0 ? "ldrsh" : "ldr";
         if (virtual_reg_index(args[0]) < 0) line_error_token(line_no, args[0], op, "expected virtual register r0-r15");
         arm_emit_address(text, args[1], addr, sizeof(addr), ARM_SCRATCH, line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
@@ -2908,9 +2908,9 @@ static void emit_a64_instruction(Buffer *text, const char *op, const char *size,
         char addr[256];
         const char *dst = a64_reg(args[0], line_no, op);
         a64_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
-        if (strcmp(size, "b") == 0) buf_appendf(text, "  ldrb %s, %s\n", a64_reg_w(dst), addr);
-        else if (strcmp(size, "w") == 0) buf_appendf(text, "  ldrh %s, %s\n", a64_reg_w(dst), addr);
-        else if (strcmp(size, "d") == 0) buf_appendf(text, "  ldr %s, %s\n", a64_reg_w(dst), addr);
+        if (strcmp(size, "b") == 0) buf_appendf(text, "  ldrsb %s, %s\n", dst, addr);
+        else if (strcmp(size, "w") == 0) buf_appendf(text, "  ldrsh %s, %s\n", dst, addr);
+        else if (strcmp(size, "d") == 0) buf_appendf(text, "  ldrsw %s, %s\n", dst, addr);
         else buf_appendf(text, "  ldr %s, %s\n", dst, addr);
         return;
     }
@@ -3217,11 +3217,11 @@ static void emit_x86_instruction(Buffer *text, const char *op, const char *size,
         if (strcmp(size, "q") == 0) {
             buf_appendf(text, "  mov %s, qword %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), addr);
         } else if (strcmp(size, "d") == 0) {
-            /* A 32-bit destination zero-extends, which is what the spilled
-               path relies on before storing the full quadword back. */
-            buf_appendf(text, "  mov %s, dword %s\n", spilled ? "eax" : x86_reg_sized(args[0], size, line_no, op), addr);
+            /* movsxd is the only one of these that reads four bytes; the
+               plain mov into a 32-bit register would zero-extend. */
+            buf_appendf(text, "  movsxd %s, dword %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), addr);
         } else {
-            buf_appendf(text, "  movzx %s, %s %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), x86_size_word(size), addr);
+            buf_appendf(text, "  movsx %s, %s %s\n", spilled ? X86_SCRATCH : x86_reg(args[0], line_no, op), x86_size_word(size), addr);
         }
         if (spilled) buf_appendf(text, "  mov qword %s, %s\n", x86_reg(args[0], line_no, op), X86_SCRATCH);
         return;
@@ -4141,7 +4141,7 @@ static void emit_mips_instruction(Buffer *text, const char *target, const char *
     if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = mips_reg(args[0], line_no, op);
-        const char *mnemonic = size[0] == 'b' ? "lbu" : size[0] == 'w' ? "lhu" :
+        const char *mnemonic = size[0] == 'b' ? "lb" : size[0] == 'w' ? "lh" :
                                size[0] == 'd' ? "lw" : word_load;
         mips_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
@@ -4411,10 +4411,15 @@ static void emit_ppc_instruction(Buffer *text, const char *target, const char *o
     if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = ppc_reg(args[0], line_no, op);
-        const char *mnemonic = size[0] == 'b' ? "lbz" : size[0] == 'w' ? "lhz" :
-                               size[0] == 'd' ? "lwz" : word_load;
+        /* lha is the sign-extending halfword load and lwa the word one, but
+           there is no such byte load: that one is zero-extended and then
+           spread out afterwards. On a 32-bit member a word fills the register
+           and lwz is already the whole of it. */
+        const char *mnemonic = size[0] == 'b' ? "lbz" : size[0] == 'w' ? "lha" :
+                               size[0] == 'd' ? (wide ? "lwa" : "lwz") : word_load;
         ppc_emit_address(text, args[1], addr, sizeof(addr), PPC_SCRATCH, line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
+        if (size[0] == 'b') buf_appendf(text, "  extsb %s, %s\n", dst, dst);
         return;
     }
     if (op_is(op, "store") && argc == 2) {
@@ -4691,7 +4696,7 @@ static void emit_sparc_instruction(Buffer *text, const char *target, const char 
     if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = sparc_reg(args[0], line_no, op);
-        const char *mnemonic = size[0] == 'b' ? "ldub" : size[0] == 'w' ? "lduh" :
+        const char *mnemonic = size[0] == 'b' ? "ldsb" : size[0] == 'w' ? "ldsh" :
                                size[0] == 'd' ? "ld" : word_load;
         sparc_emit_address(text, args[1], addr, sizeof(addr), SPARC_SCRATCH, line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, addr, dst);
@@ -4983,10 +4988,11 @@ static void emit_m68k_instruction(Buffer *text, const char *op, const char *size
         bool spilled = m68k_reg_is_spilled(args[0]);
         m68k_emit_address(text, args[1], addr, sizeof(addr), line_no, op);
         if (size[0] == 'b' || size[0] == 'w') {
-            /* Sub-word loads leave the rest of the register alone, so it is
-               cleared first. */
-            buf_appendf(text, "  moveq #0, %s\n", M68K_SCRATCH);
+            /* Sub-word loads leave the rest of the register alone, so what
+               arrived is spread over the whole of it afterwards: extb.l from
+               a byte, ext.l from a halfword. */
             buf_appendf(text, "  move%s %s, %s\n", suffix, addr, M68K_SCRATCH);
+            buf_appendf(text, "  %s %s\n", size[0] == 'b' ? "extb.l" : "ext.l", M68K_SCRATCH);
             buf_appendf(text, "  move.l %s, %s\n", M68K_SCRATCH, m68k_reg(args[0], line_no, op));
         } else {
             buf_appendf(text, "  move.l %s, %s\n", addr,
@@ -5315,8 +5321,8 @@ static void emit_s390_instruction(Buffer *text, const char *op, const char *size
     if (op_is(op, "load") && argc == 2) {
         char addr[256];
         const char *dst = s390_dst_reg(args[0], line_no, op);
-        const char *mnemonic = size[0] == 'b' ? "llgc" : size[0] == 'w' ? "llgh" :
-                               size[0] == 'd' ? "llgf" : "lg";
+        const char *mnemonic = size[0] == 'b' ? "lgb" : size[0] == 'w' ? "lgh" :
+                               size[0] == 'd' ? "lgf" : "lg";
         s390_emit_address(text, args[1], addr, sizeof(addr), S390_SCRATCH, line_no, op);
         buf_appendf(text, "  %s %s, %s\n", mnemonic, dst, addr);
         s390_store_back(text, args[0], dst, S390_SCRATCH);
@@ -5686,8 +5692,8 @@ static void emit_wasm_instruction(const char *op, const char *size, char **args,
         return;
     }
     if (op_is(op, "load") && argc == 2) {
-        const char *kind = size[0] == 'b' ? "i64.load8_u" : size[0] == 'w' ? "i64.load16_u" :
-                           size[0] == 'd' ? "i64.load32_u" : "i64.load";
+        const char *kind = size[0] == 'b' ? "i64.load8_s" : size[0] == 'w' ? "i64.load16_s" :
+                           size[0] == 'd' ? "i64.load32_s" : "i64.load";
         wasm_push_address(out, args[1], line_no, op);
         buf_appendf(out, "    %s\n", kind);
         wasm_store_reg(out, args[0], line_no, op);

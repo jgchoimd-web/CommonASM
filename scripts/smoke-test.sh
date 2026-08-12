@@ -449,10 +449,14 @@ run_exec_case() {
   fi
   $case_ld $case_ldflags "$BUILD_DIR/exec-$EXEC_NAME-$case_target.o" -o "$BUILD_DIR/exec-$EXEC_NAME-$case_target" \
     || { echo "  $EXEC_NAME/$case_target: did not link"; exec_failures=$((exec_failures+1)); return 0; }
+  # Under a timeout, because a backend that gets a loop wrong does not print
+  # the wrong answer, it prints nothing for six hours.
   if [ -n "$case_qemu" ]; then
-    "$case_qemu" "$BUILD_DIR/exec-$EXEC_NAME-$case_target" > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
+    timeout 30 "$case_qemu" "$BUILD_DIR/exec-$EXEC_NAME-$case_target" \
+      > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
   else
-    "$BUILD_DIR/exec-$EXEC_NAME-$case_target" > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
+    timeout 30 "$BUILD_DIR/exec-$EXEC_NAME-$case_target" \
+      > "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt" 2>&1 || true
   fi
   exec_ran=$((exec_ran+1))
   if [ "$(cat "$BUILD_DIR/exec-$EXEC_NAME-$case_target.txt")" = "$EXEC_EXPECTED" ]; then
