@@ -6999,20 +6999,28 @@ static bool opt_compute_binary(const char *op, long long lhs, long long rhs, lon
         else *result = lhs ^ rhs;
         return true;
     }
-    if (op_is(op, "shl") || op_is(op, "shr") || op_is(op, "sar")) {
+    if (op_is(op, "shl")) {
+        /* A negative value shifts left as well as a positive one - it is the
+           same bits either way - so long as nothing significant falls off the
+           end. This matters because a multiply by a power of two arrives here
+           as a shift, and the value being multiplied is often negative. */
+        if (rhs < 0 || rhs >= bits - 1) return false;
+        if (lhs >= 0 ? (lhs > (LLONG_MAX >> rhs)) : (lhs < (LLONG_MIN >> rhs))) return false;
+        *result = (long long)((unsigned long long)lhs << rhs);
+        return true;
+    }
+    if (op_is(op, "shr") || op_is(op, "sar")) {
+        /* shr is a logical shift on the target and an arithmetic one here, so
+           a negative value is left for the machine to do. */
         if (lhs < 0 || rhs < 0 || rhs >= bits - 1) return false;
-        if (op_is(op, "shl")) {
-            if (lhs > (LLONG_MAX >> rhs)) return false;
-            *result = lhs << rhs;
-        } else {
-            *result = lhs >> rhs;
-        }
+        *result = lhs >> rhs;
         return true;
     }
     return false;
 }
 
-static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_t line_out_size, bool *skip) {
+static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_t line_out_size,
+                                bool *skip, int bits) {
     long long value;
     int dst;
     int src;
@@ -7064,6 +7072,20 @@ static bool opt_rewrite_current(const OptInstruction *ins, char *line_out, size_
         snprintf(line_out, line_out_size, "mov %s, 0", ins->args[0]);
         return true;
     }
+    /* Multiplying by a power of two is a shift, and the bits it produces are
+       the same whether the value is read as signed or unsigned. Worth doing
+       even where the multiply is one instruction, and worth much more on the
+       machines where it is a call or a loop. Division is not the mirror of
+       this: a signed divide rounds towards zero and an arithmetic shift
+       rounds down, so it is left alone. */
+    if (op_is(ins->base_op, "mul") && value > 1 && (value & (value - 1)) == 0) {
+        int shift = 0;
+        while ((value >> shift) != 1) shift++;
+        if (shift < bits) {
+            snprintf(line_out, line_out_size, "shl %s, %d", ins->args[0], shift);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -7107,7 +7129,7 @@ static void emit_text_line_optimized(Buffer *text, const char *line, int line_no
         emit_text_line_copy(text, line, line_no, target);
         return;
     }
-    if (opt_rewrite_current(&parsed, rewritten, sizeof(rewritten), &skip)) {
+    if (opt_rewrite_current(&parsed, rewritten, sizeof(rewritten), &skip, target_word_bits(target))) {
         if (skip) return;
         candidate = rewritten;
         if (!opt_parse_instruction(candidate, &current)) {

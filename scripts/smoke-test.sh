@@ -69,6 +69,36 @@ if grep -q "add rbx, 0" "$BUILD_DIR/optimize-O1.asm" ||
   exit 1
 fi
 
+# Multiplying a value the compiler cannot see by a power of two is a shift.
+cat > "$BUILD_DIR/strength.cas" <<'CAS'
+.bss
+v: zero 8
+.text
+global _start
+_start:
+  load.q r0, [v]
+  mul r0, 16
+  store.q [v], r0
+  load.q r1, [v]
+  mul r1, 24
+  store.q [v], r1
+  syscall exit, 0
+CAS
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/strength.cas" --target x86_64-nasm -O1 -o "$BUILD_DIR/strength.asm"
+grep -q "shl rbx, 4" "$BUILD_DIR/strength.asm"
+# and one that is not a power of two stays a multiply
+grep -q "imul rcx, 24" "$BUILD_DIR/strength.asm"
+if grep -q "imul rbx, 16" "$BUILD_DIR/strength.asm"; then
+  echo "optimizer left a multiply by a power of two in -O1 output"
+  exit 1
+fi
+# Folding a constant still reaches through the shift the multiply became,
+# including when the constant is negative.
+printf '.text\nglobal _start\n_start:\n  mov r0, -7\n  mul r0, 8\n  syscall exit, 0\n' \
+  > "$BUILD_DIR/foldneg.cas"
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/foldneg.cas" --target x86_64-nasm -O1 -o "$BUILD_DIR/foldneg.asm"
+grep -q "mov rbx, -56" "$BUILD_DIR/foldneg.asm"
+
 # Each check below covers a lowering that used to produce silently wrong or
 # unassemblable code.
 cat > "$BUILD_DIR/regress.cas" <<'CAS'
