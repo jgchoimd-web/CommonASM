@@ -316,19 +316,28 @@ promises, the surplus live in spill slots the compiler reserves, so `r15`
 behaves the same everywhere instead of aliasing whatever happened to be
 sixteenth in a table.
 
-| target | in registers | in spill slots |
+| target | in machine registers | in spill slots |
 | --- | --- | --- |
-| `aarch64-gnu` | `r0`-`r15` | none |
-| `riscv64-gnu` | `r0`-`r15` | none |
-| `x86_64-nasm` | `r0`-`r11` | `r12`-`r15` |
-| `armv7a-gnu` | `r0`-`r9` | `r10`-`r15` |
-| `superh` | `r0`-`r9` | `r10`-`r15` |
-| `i386-nasm` | `r0`-`r4` | `r5`-`r15` |
+| `aarch64-gnu` | all sixteen | none |
+| `riscv64-gnu` | all sixteen | none |
+| `x86_64-nasm` | twelve | four |
+| `armv7a-gnu` | ten | six |
+| `superh` | ten | six |
+| `i386-nasm` | five | eleven |
+
+*Which* of them go to memory is decided by how much the program uses them,
+not by the number in the name. The compiler counts how often the source
+mentions each register and hands out the machine registers busiest first, so
+a program that touches `r0` once and `r12` every turn of a loop keeps `r12`
+in a register and pays for `r0` instead. A register the source never names
+goes to memory ahead of all of them, since it cannot be holding anything.
+Two registers used the same amount keep their order by number, so the same
+source always compiles to the same assembly.
 
 32-bit x86 is the tightest of them, and it gets one more register out of a
 program that never says `enter`: `ebp` is the frame pointer only for a
 program that asks for a frame, and nothing else in the lowering needs it. A
-program that does use a frame gets `r0`-`r3` in registers instead.
+program that does use a frame has four to hand out instead of five.
 
 Virtual registers keep their values across everything the compiler emits,
 including `syscall`, which saves and restores whatever the call would

@@ -1308,6 +1308,17 @@ static bool is_known_constant(const char *name) {
 
 /* Runs on every operand of every instruction, so it reads the digits directly
    rather than going through strtoll. */
+/* Which slot each virtual register the source names is allocated to. A
+   machine with fewer registers than the sixteen the language promises puts
+   the surplus in memory, and which ones went there used to be decided by
+   the number in the name alone: a program that touched r0 once and r12
+   every turn of a loop paid for the loop. Slots are handed out by how
+   often the source mentions a register, busiest first, so the registers a
+   program actually works with are the ones in machine registers. It stays
+   the identity on a machine that maps all sixteen, where there is nothing
+   to gain and moving them would only change the output. */
+static int vreg_home[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+
 static int virtual_reg_index(const char *name) {
     const char *p = name + 1;
     int value = 0;
@@ -1323,7 +1334,7 @@ static int virtual_reg_index(const char *name) {
             return -1;
         }
     }
-    return *p == '\0' ? value : -1;
+    return *p == '\0' ? vreg_home[value] : -1;
 }
 
 /* The operand naming virtual register idx at the given size. A mapped
@@ -1491,6 +1502,24 @@ static unsigned scan_mentioned_vregs(const char *source) {
         }
     }
     return mask;
+}
+
+/* How many times the source names each virtual register. Not weighted by
+   loop depth: this compiler does not know where the loops are, and a count
+   that is honest about being a count beats a guess dressed up as one. */
+static void scan_vreg_usage(const char *source, int counts[16]) {
+    int i;
+    for (i = 0; i < 16; i++) counts[i] = 0;
+    for (const char *p = source; *p; p++) {
+        char *end = NULL;
+        long long value;
+        if (*p != 'r' || !isdigit((unsigned char)p[1])) continue;
+        if (p != source && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.')) continue;
+        value = strtoll(p + 1, &end, 10);
+        if (end && value >= 0 && value <= 15 && !is_symbol_char(*end)) {
+            counts[value]++;
+        }
+    }
 }
 
 /* The functions whose bodies contain a call. On a machine where the call
@@ -8755,6 +8784,48 @@ static Buffer wasm_finish(void) {
 
 /* ---------------------------------------------------------- inline assembly */
 
+/* How many virtual registers this target keeps in machine registers. The
+   rest live in spill slots, and a target with nothing to spill answers
+   sixteen. */
+static int target_mapped_count(const char *target) {
+    const TargetDesc *desc = target_lookup(target);
+    if (!desc) return 16;
+    switch (desc->cls) {
+        case CLASS_X86_64: return X86_MAPPED_COUNT;
+        case CLASS_I386: return I386_MAPPED_COUNT;
+        case CLASS_DCPU: return DCPU_MAPPED_COUNT;
+        case CLASS_LOONG: return LOONG_MAPPED_COUNT;
+        case CLASS_NIOS2: return NIOS2_MAPPED_COUNT;
+        case CLASS_ALPHA: return ALPHA_MAPPED_COUNT;
+        case CLASS_SH: return SH_MAPPED_COUNT;
+        case CLASS_M68K: return M68K_MAPPED_COUNT;
+        case CLASS_S390: return S390_MAPPED_COUNT;
+        case CLASS_GENERIC: return (desc->flags & TF_ARM32) ? ARM_MAPPED_COUNT : 16;
+        default: return 16;
+    }
+}
+
+/* Builds the permutation above. Registers the source never names count
+   zero and sort to the end, so they are the ones that end up in spill
+   slots -- which is the whole point, since a register nobody names cannot
+   be holding anything. Two registers used the same amount keep their order
+   by number, so the same source always compiles to the same assembly. */
+static void build_vreg_homes(const char *source, int mapped) {
+    int counts[16];
+    int order[16];
+    int i, j;
+    for (i = 0; i < 16; i++) vreg_home[i] = i;
+    if (mapped >= 16) return;
+    scan_vreg_usage(source, counts);
+    for (i = 0; i < 16; i++) order[i] = i;
+    for (i = 1; i < 16; i++) {
+        int pick = order[i];
+        for (j = i; j > 0 && counts[order[j - 1]] < counts[pick]; j--) order[j] = order[j - 1];
+        order[j] = pick;
+    }
+    for (i = 0; i < 16; i++) vreg_home[order[i]] = i;
+}
+
 /* The operand text a backend uses for a virtual register, which is what an
    inline block interpolates so its assembly can reach the surrounding code.
    NULL when the register has no name on this target - a spilled ARM register,
@@ -10068,11 +10139,24 @@ static Buffer compile_source(char *source, const char *target, int opt_level) {
     if (target_has_class(target, CLASS_ENCODING)) {
         return compile_encoded_esolang(source, target);
     }
-    /* Scanned before the loop starts chopping the source into lines. */
-    mentioned_vregs = scan_mentioned_vregs(source);
+    /* Scanned before the loop starts chopping the source into lines. The
+       frame goes first because it settles how many registers 32-bit x86 has
+       left to hand out, and the slots have to be settled before anything is
+       numbered in terms of them. The mask is remapped into slot numbering,
+       because what reads it is a machine register, which is a slot. */
+    if (source_uses_frame(source)) i386_mapped_count = 4;
+    build_vreg_homes(source, target_mapped_count(target));
+    {
+        unsigned named = scan_mentioned_vregs(source);
+        unsigned slots = 0;
+        int i;
+        for (i = 0; i < 16; i++) {
+            if (named & (1u << (unsigned)i)) slots |= 1u << (unsigned)vreg_home[i];
+        }
+        mentioned_vregs = slots;
+    }
     scan_functions_that_call(source);
     scan_single_use_compares(source);
-    if (source_uses_frame(source)) i386_mapped_count = 4;
     if (is_wasm_target(target)) wasm_begin();
     optimizer.enabled = opt_level > 0;
     optimizer.has_pending = false;

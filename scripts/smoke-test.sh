@@ -158,10 +158,16 @@ for cmp_pair in "riscv64-gnu@  mv s10," "mips32-gnu@  move \$t8,"; do
 done
 echo "a comparison is kept alive only for a branch that is still coming."
 
-# i386 has ebp to allocate unless the program asks for a stack frame.
+# i386 has ebp to allocate unless the program asks for a stack frame. The
+# program has to want five registers for that to show: a program naming one
+# register gets a machine register for it whether there are four or five.
 printf '.text
 global _start
 _start:
+  mov r0, 1
+  mov r1, 2
+  mov r2, 3
+  mov r3, 4
   mov r4, 7
   syscall exit, 0
 ' > "$BUILD_DIR/noframe.cas"
@@ -169,6 +175,10 @@ printf '.text
 global _start
 _start:
   enter 0
+  mov r0, 1
+  mov r1, 2
+  mov r2, 3
+  mov r3, 4
   mov r4, 7
   leave
   syscall exit, 0
@@ -182,6 +192,40 @@ if grep -q "mov ebp, 7" "$BUILD_DIR/withframe.asm"; then
 fi
 grep -q "__cas_spill" "$BUILD_DIR/withframe.asm"
 echo "i386 allocates ebp, except where a frame needs it."
+
+# Which registers end up in memory is decided by how much the program uses
+# them, not by the number in the name. This one names six on a machine that
+# keeps five: r15 is the one it works with, so r15 is the one that should be
+# in a register, and the number in its name should have nothing to do with it.
+cat > "$BUILD_DIR/pressure.cas" <<'CAS'
+.bss
+v: zero 8
+.text
+global _start
+_start:
+  mov r0, 1
+  mov r1, 2
+  mov r2, 3
+  mov r3, 4
+  mov r4, 5
+  load.d r15, [v]
+  add r15, 3
+  add r15, r0
+  store.d [v], r15
+  syscall exit, 0
+CAS
+"$BUILD_DIR/commonasmc" "$BUILD_DIR/pressure.cas" --target i386-nasm -O1 -o "$BUILD_DIR/pressure.asm"
+if ! grep -q "add ebx, 3" "$BUILD_DIR/pressure.asm"; then
+  echo "the register the program works with did not get a machine register"
+  exit 1
+fi
+if grep -q "add dword \[__cas_spill" "$BUILD_DIR/pressure.asm"; then
+  echo "the register the program works with was left in a spill slot"
+  exit 1
+fi
+# and the one it barely names is the one that went to memory
+grep -q "__cas_spill" "$BUILD_DIR/pressure.asm"
+echo "spill slots go to the registers a program hardly uses."
 
 # Multiplying a value the compiler cannot see by a power of two is a shift.
 cat > "$BUILD_DIR/strength.cas" <<'CAS'
